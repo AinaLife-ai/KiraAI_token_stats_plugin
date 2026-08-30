@@ -368,7 +368,7 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 - **来源标签支持多填**：`source_default` / `source_group` / `source_dm` 从 string 改为 list（兼容旧配置单个字符串），第一个为主标签（实际归类用），其余作为备选/别名
 - **WebUI 余额监测可视化编辑器**：侧边栏「余额监测」页新增「＋ 添加监测源」——点开后按类型（auto/custom/newapi/preset/daily/rolling）动态显示对应字段表单（网址/API Key/用户ID/换算比例/每日额度/刷新时刻/对表余额等），支持编辑/删除/启用开关，保存后自动热重载，无需再手写 JSON
 - **WebUI 分类名中文化**：后台日志 ERROR 卡片分类显示中文（XML解析/模型调用/工具执行/网络超时/异常堆栈/其他），与工具摘要一致
-- **轮转文件显式匹配**：`log.log` + `log.log.[0-9]*` 显式 glob（RotatingFileHandler 轮转命名），防未来轮转策略变化误扫无关文件；`get_data_path()` 返回值用 `Path()` 包裹防 str
+- **轮转文件显式匹配**：`log.log` + `log.log.[0-9]*` 显式 glob（RotatingFileHandler 轮转命名），防未来轮转策略变化误扫无关文件；`get_data_path()` 返回值用 `Path()` 包裹防 str；`st_ino` 为 0（FAT32 等文件系统）时退化为路径跟踪，避免共用游标 0 重复计数
 
 ### v1.2.5（2026-08-31）
 
