@@ -30,6 +30,7 @@
 import asyncio
 import json
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -141,17 +142,31 @@ def _url_loose_match(candidate: str, pattern: str) -> bool:
     return p in c or c in p
 
 
+# exact_match 全字匹配开关（插件 __init__ 时注入，默认 False=包含匹配）
+_EXACT_MATCH = False
+
+
 def _match_rule(rules: list, channel: str, model: str, url: str):
-    """URL > 模型 > 渠道名 加权匹配：4/2/1 分，取最高分"""
+    """URL > 模型 > 渠道名 加权匹配：4/2/1 分，取最高分。
+    _EXACT_MATCH=True 时匹配需全字相等（区分大小写），否则包含匹配"""
+    exact = _EXACT_MATCH
     best, best_score = None, 0
     for r in rules or []:
         score = 0
-        if r.get("url_match") and _url_loose_match(url or "", r.get("url_match") or ""):
-            score += 4
-        if r.get("model_match") and model and r["model_match"].lower() in str(model).lower():
-            score += 2
-        if r.get("channel_match") and channel and r["channel_match"].lower() in str(channel).lower():
-            score += 1
+        if exact:
+            if r.get("url_match") and str(url or "") == str(r.get("url_match") or ""):
+                score += 4
+            if r.get("model_match") and str(model or "") == str(r.get("model_match") or ""):
+                score += 2
+            if r.get("channel_match") and str(channel or "") == str(r.get("channel_match") or ""):
+                score += 1
+        else:
+            if r.get("url_match") and _url_loose_match(url or "", r.get("url_match") or ""):
+                score += 4
+            if r.get("model_match") and model and r["model_match"].lower() in str(model).lower():
+                score += 2
+            if r.get("channel_match") and channel and r["channel_match"].lower() in str(channel).lower():
+                score += 1
         if score > best_score:
             best_score, best = score, r
     return best
@@ -181,19 +196,24 @@ def _rule_cost(r: dict, input_t: int, output_t: int, cached_t: int, t: datetime)
     return amt
 
 
+# 文件 IO 线程锁（日志追加/裁剪/热读缓存并发保护）
+_IO_LOCK = threading.RLock()
+
+
 def _read_jsonl(path: Path):
     recs = []
     if not path.exists():
         return recs
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                recs.append(json.loads(line))
-            except Exception:
-                continue
+        with _IO_LOCK:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except Exception:
+                    continue
     except Exception:
         pass
     return recs
@@ -201,19 +221,55 @@ def _read_jsonl(path: Path):
 
 def _append_jsonl(path: Path, rec: dict, max_size: int = 0):
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with _IO_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            # 裁剪：超过 max_size 条时保留最新（0 = 不裁剪）
+            if max_size and max_size > 0:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                if len(lines) > max_size:
+                    path.write_text("\n".join(lines[-max_size:]) + "\n", encoding="utf-8")
     except Exception as e:
         logger.warning(f"[token_stats] 日志写入失败: {e}")
-        return
-    # 裁剪：超过 max_size 条时保留最新（0 = 不裁剪）
-    if max_size and max_size > 0:
+
+
+def _parse_ts(s: str):
+    """日志时间戳解析：兼容 3/6 位微秒（Python 3.10- 的 fromisoformat 只认 6 位）"""
+    if not s:
+        raise ValueError("empty timestamp")
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    if "." in s:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-            if len(lines) > max_size:
-                path.write_text("\n".join(lines[-max_size:]) + "\n", encoding="utf-8")
-        except Exception:
+            head, frac = s.split(".", 1)
+            frac = (frac + "000000")[:6]
+            return datetime.fromisoformat(f"{head}.{frac}")
+        except ValueError:
             pass
+    raise ValueError(f"bad timestamp: {s}")
+
+
+def _fmt_ts(dt: datetime) -> str:
+    """日志时间戳写入：统一 6 位微秒，避免低版本 Python 解析失败"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+
+def _err_scan(full_text: str, prev):
+    """errScanPos：位置游标错误计数。
+    传入 (prev_text, prev_end)；新文本若以旧文本为前缀（续写/追加），
+    只统计新增段，工具循环同一段「出错：」不重复计数；
+    全新响应（前缀不匹配）整段重数并重置游标。
+    返回 (新增计数, 新游标状态)。"""
+    if prev is None:
+        n = len(ERROR_TAG_RE.findall(full_text))
+        return n, (full_text, len(full_text))
+    prev_text, prev_end = prev
+    if len(full_text) >= prev_end and full_text[:prev_end] == prev_text[:prev_end]:
+        return len(ERROR_TAG_RE.findall(full_text[prev_end:])), (full_text, len(full_text))
+    n = len(ERROR_TAG_RE.findall(full_text))
+    return n, (full_text, len(full_text))
 
 
 def _clamp_ai_output(s: str) -> str:
@@ -280,7 +336,6 @@ class TokenStatsPlugin(BasePlugin):
         self.exact_match = bool(cmd.get("exact_match", False))
         self.denied_message = cmd.get("denied_message", "权限不足：您没有查询用量统计的权限")
         self.cmd_success_template = cmd.get("command_success_template", "📊 {provider}：{result}")
-        self.cmd_all_template = cmd.get("command_all_template", "📊 Token 用量统计：\n{results}")
 
         # ── Bot 工具 ──
         tool = cfg.get("section_tool", {})
@@ -307,6 +362,15 @@ class TokenStatsPlugin(BasePlugin):
         self.max_log_size = int(max_log) if max_log is not None else 100000
         idle = adv.get("session_idle_minutes", 30)
         self.session_idle_minutes = max(1, int(idle) if idle is not None else 30)
+
+        # ── 挂件（WebUI 悬浮小卡片，默认关闭）──
+        wid = cfg.get("section_widget", {})
+        self.enable_widget = bool(wid.get("enable_widget", False))
+        self.widget_compact = bool(wid.get("widget_compact", False))
+
+        # ── 余额探测 ssl ──
+        self.balance_ssl_verify = bool(bal.get("balance_ssl_verify", False))
+        self._ssl_connector = None
 
         # ── 运行时状态 ──
         self._data_dir: Path = None  # initialize 时赋值
@@ -344,10 +408,21 @@ class TokenStatsPlugin(BasePlugin):
         self._rec_cache = {"path": None, "mtime": None, "len": -1, "list": None}
         self._rec_cache_lock = asyncio.Lock()
 
+        # 出错统计游标（errScanPos）：{sid: (prev_text, prev_end)}，工具循环续轮不重复计数
+        self._err_cursor = {}
+
+        # exact_match 透传：模块级 flag（单实例插件可接受），匹配器全插件生效
+        global _EXACT_MATCH
+        _EXACT_MATCH = self.exact_match
+
     # ── 生命周期 ──
 
     async def initialize(self):
         self._data_dir = self.ctx.get_plugin_data_dir()
+        if self._data_dir is None:
+            # data_dir 不可用时兜底到插件包目录（只读退化，避免整个插件挂掉）
+            self._data_dir = Path(__file__).resolve().parent
+            logger.warning("[token_stats] get_plugin_data_dir() 返回 None，降级使用插件目录")
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._log_path = self._data_dir / "usage-log.jsonl"
         self._bal_state_path = self._data_dir / "balance_state.json"
@@ -411,7 +486,7 @@ class TokenStatsPlugin(BasePlugin):
 
     def _apply_rec(self, rec: dict):
         try:
-            t = datetime.fromisoformat(rec.get("t", ""))
+            t = _parse_ts(rec.get("t", ""))
         except Exception:
             return
         day = t.strftime("%Y-%m-%d")
@@ -473,7 +548,11 @@ class TokenStatsPlugin(BasePlugin):
         s["e"] += rec.get("e", 0)
         key = f"{rec.get('m', '')}\u001F{rec.get('ch', '')}\u001F{rec.get('h', '')}"
         slots = s["aggs"].setdefault(key, [None, None])
-        peak = _is_peak(datetime.fromisoformat(rec["t"]))
+        try:
+            rec_t = _parse_ts(rec["t"])
+        except Exception:
+            rec_t = datetime.now()
+        peak = _is_peak(rec_t)
         agg = slots[1 if peak else 0]
         if agg is None:
             agg = slots[1 if peak else 0] = {"i": 0, "o": 0, "c": 0}
@@ -612,12 +691,12 @@ class TokenStatsPlugin(BasePlugin):
 
         sid = self._sid(event)
 
-        # 错误统计
+        # 错误统计（errScanPos：位置游标，工具循环同一段「出错：」不重复计数）
         text = (resp.text_response or "") or ""
         pending = self._pending.get(sid)
         if pending is None:
             pending = self._pending[sid] = {"text": "", "source": None, "steps": 0, "at": time.time()}
-        errs = len(ERROR_TAG_RE.findall(text)) if text else 0
+        errs, self._err_cursor[sid] = _err_scan(text, self._err_cursor.get(sid))
         if errs > 0:
             self._last_err_text = self._err_snippet(text)
             self._last_err_at = datetime.now()
@@ -637,7 +716,7 @@ class TokenStatsPlugin(BasePlugin):
 
         now = datetime.now()
         rec = {
-            "t": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            "t": _fmt_ts(now),
             "v": inp + out,
             "i": inp, "o": out, "c": cached,
             "m": model, "s": src, "ch": channel, "h": host,
@@ -669,15 +748,12 @@ class TokenStatsPlugin(BasePlugin):
     # ── 聚合查询（双币种）──
 
     def _range_agg(self, from_date: str, to_date: str):
-        """按天键区间聚合 {v,i,o,c,r,e}（ISO 日期字符串可按序比较）"""
+        """按天键区间聚合 {v,i,o,c,r,e}（全遍历 + 区间判断，不依赖插入序）"""
         v = i = o = c = r = e = 0
         for key, ds in self._days.items():
-            if key < from_date:
-                continue
-            if key > to_date:
-                break
-            v += ds["v"]; i += ds["i"]; o += ds["o"]; c += ds["c"]
-            r += ds["r"]; e += ds["e"]
+            if from_date <= key <= to_date:
+                v += ds["v"]; i += ds["i"]; o += ds["o"]; c += ds["c"]
+                r += ds["r"]; e += ds["e"]
         return {"v": v, "i": i, "o": o, "c": c, "r": r, "e": e}
 
     def _aggs_cost_ex(self, aggs: dict):
@@ -759,7 +835,7 @@ class TokenStatsPlugin(BasePlugin):
         cny, pts, matched = 0.0, 0.0, False
         for r in self._read_records():
             try:
-                t = datetime.fromisoformat(r["t"])
+                t = _parse_ts(r["t"])
             except Exception:
                 continue
             if t < since:
@@ -816,7 +892,7 @@ class TokenStatsPlugin(BasePlugin):
             anchor = None
         anchor_at = src.get("anchor_at") or ""
         try:
-            anchor_dt = datetime.fromisoformat(anchor_at) if anchor_at else None
+            anchor_dt = _parse_ts(anchor_at) if anchor_at else None
         except Exception:
             anchor_dt = None
 
@@ -1124,7 +1200,9 @@ class TokenStatsPlugin(BasePlugin):
         return st
 
     async def _http_get(self, url: str, api_key: str, extra_headers: dict = None):
-        """GET 请求，返回解析后的 JSON；非 2xx 抛异常"""
+        """GET 请求，返回解析后的 JSON；非 2xx 抛异常。
+        ssl：balance_ssl_verify=True 时校验证书（https 默认行为）；
+        False（默认）时禁用校验——兼容自签证书中转站，注意中间人风险"""
         if aiohttp is None:
             raise RuntimeError("aiohttp 未安装")
         headers = {}
@@ -1133,8 +1211,12 @@ class TokenStatsPlugin(BasePlugin):
         if extra_headers:
             headers.update(extra_headers)
         timeout = aiohttp.ClientTimeout(total=10)
+        use_ssl = bool(self.balance_ssl_verify)
         try:
-            connector = aiohttp.TCPConnector(resolver=ThreadedResolver(), ssl=False)
+            if use_ssl:
+                connector = aiohttp.TCPConnector(resolver=ThreadedResolver())
+            else:
+                connector = aiohttp.TCPConnector(resolver=ThreadedResolver(), ssl=False)
         except Exception:
             connector = None
         try:
@@ -1331,7 +1413,7 @@ class TokenStatsPlugin(BasePlugin):
 
             for r in self._read_records():
                 try:
-                    t_dt = datetime.fromisoformat(r["t"])
+                    t_dt = _parse_ts(r["t"])
                 except Exception:
                     continue
                 day = t_dt.strftime("%Y-%m-%d")
@@ -1426,7 +1508,7 @@ class TokenStatsPlugin(BasePlugin):
                 if min_input is not None and int(r.get("i", 0) or 0) < min_input:
                     continue
                 try:
-                    t_dt = datetime.fromisoformat(r["t"])
+                    t_dt = _parse_ts(r["t"])
                 except Exception:
                     t_dt = None
                 rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
@@ -1629,7 +1711,7 @@ class TokenStatsPlugin(BasePlugin):
         out = []
         for r in reversed(recs[-n:]):
             try:
-                t = datetime.fromisoformat(r["t"])
+                t = _parse_ts(r["t"])
             except Exception:
                 continue
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
@@ -1665,7 +1747,7 @@ class TokenStatsPlugin(BasePlugin):
         total = {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "cny": 0.0, "pts": 0.0, "matched": False}
         for r in self._read_records():
             try:
-                t = datetime.fromisoformat(r["t"])
+                t = _parse_ts(r["t"])
             except Exception:
                 continue
             day = t.strftime("%Y-%m-%d")
@@ -1779,7 +1861,7 @@ class TokenStatsPlugin(BasePlugin):
         top_models = {}
         for r in self._read_records():
             try:
-                t = datetime.fromisoformat(r["t"])
+                t = _parse_ts(r["t"])
             except Exception:
                 continue
             d = t.strftime("%Y-%m-%d")
@@ -1836,7 +1918,7 @@ class TokenStatsPlugin(BasePlugin):
         top = {}
         for r in self._read_records():
             try:
-                t = datetime.fromisoformat(r["t"])
+                t = _parse_ts(r["t"])
             except Exception:
                 continue
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
@@ -1883,6 +1965,16 @@ class TokenStatsPlugin(BasePlugin):
     def page_stats(self):
         return PluginPage.from_html(_DASHBOARD_HTML)
 
+    @register.page("/stats-widget", auth=True, menu=PageMenu(label={"zh": "Token 挂件"}, icon="Desktop"))
+    def page_stats_widget(self):
+        if not self.enable_widget:
+            return PluginPage.from_html(
+                f"<!DOCTYPE html><html lang=\"zh-CN\"><body style=\"background:#0f172a;color:#94a3b8;font-family:sans-serif;padding:24px;font-size:13px\">"
+                f"<p style=\"color:#e2e8f0;font-weight:600;margin-bottom:8px\">Token 挂件未启用</p>"
+                f"<p>开启方式：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 启用挂件。<br>"
+                f"开启后此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球），适合浏览器小窗钉角落。</p>"
+                f"</body></html>")
+        return PluginPage.from_html(_WIDGET_HTML)
 _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2247,6 +2339,137 @@ $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent=
 
 loadOv();
 setInterval(loadOv, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+_WIDGET_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Token 挂件</title>
+<style>
+:root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+#w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
+#w.drag{cursor:move}
+#w.dragging{opacity:.85;border-color:var(--acc)}
+.head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}
+.head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none}
+.head .t{font-size:12px;font-weight:600;color:var(--fg);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.head .hbtn{width:22px;height:22px;border:none;background:rgba(51,65,85,.4);color:var(--dim);border-radius:6px;cursor:pointer;font-size:12px;line-height:1;flex:none}
+.head .hbtn:hover{color:var(--fg);background:var(--line)}
+.body{padding:10px 12px 12px}
+.row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:12px}
+.row .k{color:var(--dim)}
+.row .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--fg)}
+.row .v.cost{color:var(--ok)}.row .v.pts{color:var(--purple)}.row .v.in{color:var(--acc)}.row .v.out{color:var(--pink)}
+.sep{height:1px;background:rgba(51,65,85,.5);margin:6px 0}
+.bal{font-size:11.5px}
+.bal .bname{color:var(--dim);max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.foot{padding:8px 12px;border-top:1px solid rgba(51,65,85,.5);display:flex;gap:6px;align-items:center;justify-content:flex-end}
+.foot .st{font-size:10px;color:var(--dim)}
+.foot .go{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;text-decoration:none}
+.foot .go:hover{border-color:var(--acc)}
+/* 折叠小球 */
+#w.ball{width:auto;border-radius:999px;overflow:hidden}
+#w.ball .head{border-bottom:none;padding:8px 14px}
+#w.ball .body,#w.ball .foot{display:none}
+#w.ball .t{font-size:16px}
+/* 紧凑模式 */
+#w.compact{width:230px}
+#w.compact .row{font-size:11px;padding:2px 0}
+#w.compact .bal .bname{max-width:80px}
+</style>
+</head>
+<body>
+<div id="w">
+  <div class="head" id="hd">
+    <span class="dot" id="dot"></span>
+    <span class="t" id="title">Token 用量</span>
+    <button class="hbtn" id="fold" title="折叠/展开">–</button>
+  </div>
+  <div class="body" id="body">
+    <div class="row"><span class="k">会话</span><span class="v" id="sessV">—</span></div>
+    <div class="row"><span class="k">今日</span><span class="v" id="todayV">—</span></div>
+    <div class="row"><span class="k">费用(今日)</span><span class="v cost" id="costV">—</span></div>
+    <div class="row"><span class="k">输入 / 输出</span><span class="v" id="ioV">—</span></div>
+    <div class="row"><span class="k">模型</span><span class="v" id="modelV" style="font-size:11px;color:var(--dim)">—</span></div>
+    <div class="sep"></div>
+    <div id="balBox"></div>
+  </div>
+  <div class="foot" id="foot">
+    <span class="st" id="upd">—</span>
+    <a class="go" href="./stats" target="_blank">完整看板</a>
+  </div>
+</div>
+<script>
+const API = '/api/plugin/KiraAI_token_stats_plugin';
+const $ = s => document.querySelector(s);
+const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
+  if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1000)+'K';
+  if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
+  return Math.round(v/1e9)+'B'; };
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let collapsed = localStorage.getItem('tsWidgetCollapsed')==='1';
+let compact = localStorage.getItem('tsWidgetCompact')==='1';
+applyMode();
+$('#fold').onclick = ()=>{ collapsed=!collapsed; localStorage.setItem('tsWidgetCollapsed', collapsed?'1':'0'); applyMode(); };
+function applyMode(){
+  const w = $('#w');
+  w.classList.toggle('ball', collapsed);
+  w.classList.toggle('compact', !collapsed && compact);
+  $('#fold').textContent = collapsed ? '+' : '–';
+  $('#title').textContent = collapsed ? '☰' : 'Token 用量';
+}
+async function tick(){
+  try{
+    const d = await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());
+    const r = (d.ranges||{})||{}, co = (d.costs||{})||{};
+    const t = co.today||{};
+    $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
+    $('#sessV').textContent = fmt4(r.session?v0:0) + ' · ' + (d.rounds||0) + '轮';
+    $('#todayV').textContent = fmt4((r.today||{}).v||0);
+    const costBits=[]; if(t.matched&&t.cny)costBits.push('¥'+t.cny); if(t.matched&&t.pts)costBits.push(t.pts+'积分');
+    $('#costV').textContent = costBits.length?costBits.join(' + '):'—';
+    $('#ioV').textContent = fmt4((r.today||{}).i||0)+' / '+fmt4((r.today||{}).o||0);
+    $('#modelV').textContent = esc(d.model||'—');
+    // 余额
+    let balHtml='';
+    try{
+      const b = await fetch(API+'/balance',{cache:'no-store'}).then(r=>r.json());
+      (b.sources||[]).slice(0,3).forEach(x=>{
+        const unit = x.currency==='积分'?'积分':(b.unit||'元');
+        balHtml += '<div class="row bal"><span class="bname" title="'+esc(x.name)+'">'+esc(x.name)+'</span><span class="v '+(x.ok?'cost':'')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</span></div>';
+      });
+      if(!(b.sources||[]).length) balHtml = '<div class="row bal"><span class="bname">未配置余额源</span></div>';
+    }catch(e){ balHtml = '<div class="row bal"><span class="bname">余额加载失败</span></div>'; }
+    $('#balBox').innerHTML = balHtml;
+    $('#upd').textContent = new Date().toTimeString().slice(0,8);
+  }catch(e){ $('#upd').textContent = '连接失败'; }
+}
+/* 拖动 */
+(function(){
+  const w = $('#w'), hd = $('#hd');
+  let sx,sy,ox,oy,drag=false;
+  hd.addEventListener('mousedown',e=>{
+    if(e.target.tagName==='BUTTON') return;
+    drag=true; w.classList.add('dragging');
+    sx=e.clientX; sy=e.clientY;
+    const r=w.getBoundingClientRect(); ox=r.left; oy=r.top;
+  });
+  document.addEventListener('mousemove',e=>{
+    if(!drag) return;
+    w.style.left = Math.max(0,Math.min(window.innerWidth-40, ox+e.clientX-sx))+'px';
+    w.style.top = Math.max(0,Math.min(window.innerHeight-40, oy+e.clientY-sy))+'px';
+  });
+  document.addEventListener('mouseup',()=>{ drag=false; w.classList.remove('dragging'); });
+})();
+tick();
+setInterval(tick, 10000);
 </script>
 </body>
 </html>
