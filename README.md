@@ -357,6 +357,7 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 ### v1.2.6（2026-08-31）
 
 - **后台日志 ERROR 扫描**：新增对 KiraAI `data/log.log`（含轮转文件）的增量扫描（10s 间隔、字节游标不重复读），捕捉控制台/日志里的真实错误——重点：**LLM 输出错误 XML 格式导致解析失败**（`Error parsing message: mismatched tag` 等）。按天分类聚合近 7 天：XML解析 / 模型调用 / 工具执行 / 网络超时 / 异常堆栈 / 其他；工具/命令摘要与 WebUI 仪表盘新增「后台日志 ERROR」卡片。与原有「出错：」响应内扫描并存
+- **工具结果失败统计**：新增 `on.tool_result` 钩子，捕捉工具返回的失败结果——**error 返回 / 权限 denied（Permission denied、拒绝访问、403、Forbidden）/ 超时 / 调用失败 / 未实现**等，这些都属于 LLM 白烧 token 的典型场景。按天聚合近 7 天，工具/命令摘要与 WebUI 仪表盘新增「工具结果失败」卡片
 - **日志扫描不占用日志文件**：Windows 下用 `CreateFileW + FILE_SHARE_DELETE` 共享删除模式只读打开，句柄毫秒级释放，不阻塞 KiraAI 的 RotatingFileHandler 轮转 rename；修复 `f.tell()` 在文件关闭后调用导致游标不前进、重复计数的 bug
 - **来源标签支持多填**：`source_default` / `source_group` / `source_dm` 从 string 改为 list（兼容旧配置单个字符串），第一个为主标签（实际归类用），其余作为备选/别名
 - **WebUI 余额监测可视化编辑器**：侧边栏「余额监测」页新增「＋ 添加监测源」——点开后按类型（auto/custom/newapi/preset/daily/rolling）动态显示对应字段表单（网址/API Key/用户ID/换算比例/每日额度/刷新时刻/对表余额等），支持编辑/删除/启用开关，保存后自动热重载，无需再手写 JSON
