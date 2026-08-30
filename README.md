@@ -4,7 +4,7 @@
 
 为 KiraAI 提供完整的 **Token 用量统计看板**：逐轮记录输入/输出/缓存 tokens、按价格规则实时估算费用（峰谷价、双币种）、API 余额监测（探测 + 估算 + 对表校准）、出错统计——WebUI 侧边栏仪表盘 + 悬浮挂件 + bot 工具（概览/聚合/明细）+ 可选自定义命令，四大入口全覆盖。
 
-> 移植自 [Alife 的 TokenStats](https://github.com/1chuxin/1chuxin-Alife.TokenStats)（初心出品，参考其 4.9.x 打包版设计），并整合了 [KiraAI-plugin-api-balance](https://github.com/ChuXia2004/KiraAI-plugin-api-balance) 的查询模式与命令设计。
+> 移植自 [Alife 的 TokenStats](https://github.com/1chuxin/1chuxin-Alife.TokenStats)（初心出品，参考其设计），并整合了 [KiraAI-plugin-api-balance](https://github.com/ChuXia2004/KiraAI-plugin-api-balance) 的查询模式与命令设计。
 > **模型无关**：任何 Provider 只要在 LLMResponse 里上报 tokens 就能统计。
 
 ---
@@ -332,7 +332,7 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 
 ## 🙏 致谢
 
-- [1chuxin/1chuxin-Alife.TokenStats](https://github.com/1chuxin/1chuxin-Alife.TokenStats) — 原版 Alife 插件（功能设计参考，含 4.9.x 打包版）
+- [1chuxin/1chuxin-Alife.TokenStats](https://github.com/1chuxin/1chuxin-Alife.TokenStats) — 原版 Alife 插件（功能设计参考）
 - [ChuXia2004/KiraAI-plugin-api-balance](https://github.com/ChuXia2004/KiraAI-plugin-api-balance) — 余额查询模式参考
 
 ---
