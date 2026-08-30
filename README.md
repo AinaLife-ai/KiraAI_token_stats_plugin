@@ -285,10 +285,9 @@ bot 会自动调用对应工具返回结果。三个工具：
 | 自定义命令 | `enable_command` | `false` | 命令开关 |
 | 自定义命令 | `command_words` | `["/用量","/token"]` | 命令词列表 |
 | 自定义命令 | `allowed_users` | `[]` | 白名单（空=全部） |
-| 自定义命令 | `exact_match` | `false` | 参数全字匹配 |
+| 自定义命令 | `exact_match` | `false` | 价格规则 URL/模型名/渠道名全字匹配 |
 | 自定义命令 | `denied_message` | 权限不足… | 无权限提示 |
 | 自定义命令 | `command_success_template` | `📊 {provider}：{result}` | 单结果模板 |
-| 自定义命令 | `command_all_template` | `📊 Token 用量统计：\n{results}` | 汇总模板 |
 | Bot 工具 | `enable_tool` | `true` | 工具开关（含三个工具） |
 | Bot 工具 | `tool_include_balance` | `true` | 工具结果附带余额 |
 | 价格规则 | `rules` | DeepSeek 官方价 | 价格规则数组（含 `currency` 币种字段） |
@@ -363,7 +362,7 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 
 - **修复时间戳兼容**（姐姐审查 #1）：日志统一写 6 位微秒，解析走 `_parse_ts` 兼容 3/6 位——Python 3.10- 的 `fromisoformat` 不再炸，`_apply_session` 主采集路径不再可能崩
 - **修复错误统计重复计数**（姐姐审查 #2）：移植 errScanPos 位置游标（`_err_scan`），工具循环续轮同一段「出错：」只计一次，新响应自动重置
-- **exact_match 配置生效**（姐姐审查 #3）：原为死代码，现模块级开关全量接入匹配器（价格规则/渠道/来源全字匹配）
+- **exact_match 配置生效**（姐姐审查 #3）：原为死代码，现模块级开关全量接入价格规则匹配器（URL/模型名/渠道名全字相等）
 - **移除死代码**：`cmd_all_template`（从未使用）从 schema/代码删除
 - **HTTPS 证书校验开关**：新增 `balance_ssl_verify`（默认关，兼容自签证书中转站；官方端点可开）
 - **日志 IO 线程锁**：追加/裁剪/热读缓存统一走 `_IO_LOCK`，消除并发竞争面
