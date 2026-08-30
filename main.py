@@ -2426,9 +2426,9 @@ _WIDGET_HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
 body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
 #w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
-#w.drag{cursor:move}
 #w.dragging{opacity:.85;border-color:var(--acc)}
 .head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}
 .head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none}
@@ -2444,7 +2444,7 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 .bal{font-size:11.5px}
 .bal .bname{color:var(--dim);max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .foot{padding:8px 12px;border-top:1px solid rgba(51,65,85,.5);display:flex;gap:6px;align-items:center;justify-content:flex-end}
-.foot .st{font-size:10px;color:var(--dim)}
+.foot .st{font-size:10px;color:var(--dim);margin-right:auto}
 .foot .go{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;text-decoration:none}
 .foot .go:hover{border-color:var(--acc)}
 /* 折叠小球 */
@@ -2456,6 +2456,14 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 #w.compact{width:230px}
 #w.compact .row{font-size:11px;padding:2px 0}
 #w.compact .bal .bname{max-width:80px}
+/* 独立窗口（popup）模式：卡片填满窗口 */
+body.popup{background:#0f172a}
+body.popup #w{left:0;top:0;width:100%;height:100%;border:none;border-radius:0;box-shadow:none;display:flex;flex-direction:column}
+body.popup .body{flex:1;overflow:auto}
+body.popup .head{cursor:default}
+/* 提示条 */
+#toast{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);background:#0b1220;border:1px solid var(--line);color:var(--fg);font-size:11px;padding:6px 12px;border-radius:8px;opacity:0;transition:.2s;pointer-events:none;z-index:10000;white-space:nowrap}
+#toast.show{opacity:1}
 </style>
 </head>
 <body>
@@ -2463,7 +2471,9 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
     <span class="t" id="title">Token 用量</span>
+    <button class="hbtn" id="popout" title="弹出独立窗口">⧉</button>
     <button class="hbtn" id="fold" title="折叠/展开">–</button>
+    <button class="hbtn" id="close" title="关闭窗口" style="display:none">✕</button>
   </div>
   <div class="body" id="body">
     <div class="row"><span class="k">会话</span><span class="v" id="sessV">—</span></div>
@@ -2476,9 +2486,11 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
   </div>
   <div class="foot" id="foot">
     <span class="st" id="upd">—</span>
-    <a class="go" href="./stats" target="_blank">完整看板</a>
+    <a class="go" href="./stats" target="_blank" rel="noopener">完整看板</a>
+    <a class="go" href="stats-widget" target="_blank" rel="noopener" id="tabLink">新标签</a>
   </div>
 </div>
+<div id="toast"></div>
 <script>
 const API = '/api/plugin/KiraAI_token_stats_plugin';
 const $ = s => document.querySelector(s);
@@ -2487,16 +2499,34 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
   return Math.round(v/1e9)+'B'; };
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const isPopup = !!window.opener;
 let collapsed = localStorage.getItem('tsWidgetCollapsed')==='1';
 let compact = localStorage.getItem('tsWidgetCompact')==='1';
+let toastTimer = null;
+function toast(msg){
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.remove('show'), 2600);
+}
 applyMode();
 $('#fold').onclick = ()=>{ collapsed=!collapsed; localStorage.setItem('tsWidgetCollapsed', collapsed?'1':'0'); applyMode(); };
+$('#popout').onclick = ()=>{
+  const w = window.open(location.pathname, 'tsWidgetPopup', 'popup=yes,width=360,height=500,resizable=yes');
+  if(!w) toast('弹窗被拦截：请允许本站弹窗，或用底部「新标签」打开');
+};
+$('#close').onclick = ()=>{ try{ window.close(); }catch(e){ toast('无法自动关闭，请手动关闭窗口'); } };
 function applyMode(){
   const w = $('#w');
   w.classList.toggle('ball', collapsed);
   w.classList.toggle('compact', !collapsed && compact);
   $('#fold').textContent = collapsed ? '+' : '–';
   $('#title').textContent = collapsed ? '☰' : 'Token 用量';
+}
+if(isPopup){
+  document.body.classList.add('popup');
+  $('#close').style.display = '';
+  $('#popout').style.display = 'none';
+  $('#fold').style.display = 'none';
+  $('#tabLink').style.display = 'none';
 }
 async function tick(){
   try{
@@ -2510,7 +2540,6 @@ async function tick(){
     $('#costV').textContent = costBits.length?costBits.join(' + '):'—';
     $('#ioV').textContent = fmt4((r.today||{}).i||0)+' / '+fmt4((r.today||{}).o||0);
     $('#modelV').textContent = esc(d.model||'—');
-    // 余额
     let balHtml='';
     try{
       const b = await fetch(API+'/balance',{cache:'no-store'}).then(r=>r.json());
@@ -2524,26 +2553,38 @@ async function tick(){
     $('#upd').textContent = new Date().toTimeString().slice(0,8);
   }catch(e){ $('#upd').textContent = '连接失败'; }
 }
-/* 拖动 */
-(function(){
-  const w = $('#w'), hd = $('#hd');
-  let sx,sy,ox,oy,drag=false;
-  hd.addEventListener('mousedown',e=>{
-    if(e.target.tagName==='BUTTON') return;
-    drag=true; w.classList.add('dragging');
-    sx=e.clientX; sy=e.clientY;
-    const r=w.getBoundingClientRect(); ox=r.left; oy=r.top;
-  });
-  document.addEventListener('mousemove',e=>{
-    if(!drag) return;
-    w.style.left = Math.max(0,Math.min(window.innerWidth-40, ox+e.clientX-sx))+'px';
-    w.style.top = Math.max(0,Math.min(window.innerHeight-40, oy+e.clientY-sy))+'px';
-  });
-  document.addEventListener('mouseup',()=>{ drag=false; w.classList.remove('dragging'); });
-})();
+/* 拖动（仅 iframe 内嵌模式；独立窗口由浏览器标题栏拖动） */
+if(!isPopup){
+  (function(){
+    const w = $('#w'), hd = $('#hd');
+    let sx,sy,ox,oy,drag=false;
+    let pos=null; try{ pos=JSON.parse(localStorage.getItem('tsWidgetPos')||'null'); }catch(e){}
+    const cx = (pos && typeof pos.x==='number') ? pos.x : 16;
+    const cy = (pos && typeof pos.y==='number') ? pos.y : 16;
+    w.style.left = cx+'px'; w.style.top = cy+'px';
+    hd.addEventListener('mousedown',e=>{
+      if(e.target.tagName==='BUTTON') return;
+      drag=true; w.classList.add('dragging');
+      sx=e.clientX; sy=e.clientY;
+      const r=w.getBoundingClientRect(); ox=r.left; oy=r.top;
+    });
+    document.addEventListener('mousemove',e=>{
+      if(!drag) return;
+      const nx=Math.max(0,Math.min(window.innerWidth-40, ox+e.clientX-sx));
+      const ny=Math.max(0,Math.min(window.innerHeight-40, oy+e.clientY-sy));
+      w.style.left=nx+'px'; w.style.top=ny+'px';
+    });
+    document.addEventListener('mouseup',()=>{
+      if(!drag) return;
+      drag=false; w.classList.remove('dragging');
+      try{ localStorage.setItem('tsWidgetPos', JSON.stringify({x:parseInt(w.style.left,10),y:parseInt(w.style.top,10)})); }catch(e){}
+    });
+  })();
+}
 tick();
 setInterval(tick, 10000);
 </script>
 </body>
 </html>
 """
+
