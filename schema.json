@@ -1,0 +1,209 @@
+{
+  "info_intro": {
+    "type": "info",
+    "name": "说明",
+    "level": "info",
+    "hint": "Token 用量统计看板：逐轮记录用量，费用估算（按价格规则实时计算，改价全历史重定价），API 余额监测，错误统计，WebUI 侧边栏仪表盘 + bot 自然语言查询 + 可选自定义命令。"
+  },
+  "section_basic": {
+    "type": "section",
+    "name": "基础设置",
+    "collapsed": false,
+    "fields": {
+      "enabled": {
+        "type": "switch",
+        "name": "启用统计",
+        "default": true,
+        "hint": "关闭后不采集、不记录、工具与命令全部失效"
+      },
+      "debug_log": {
+        "type": "switch",
+        "name": "调试日志",
+        "default": false,
+        "hint": "打印采集/渠道识别/余额探测详情"
+      },
+      "source_rules": {
+        "type": "json",
+        "name": "自定义来源规则",
+        "default": {},
+        "hint": "格式 {\"关键词\": \"来源名\"}。用户消息文本包含关键词时，该轮用量归入对应来源（覆盖自动判定）。空对象时自动判定：群聊=qchat、私聊=dm、系统/工具续轮=继承上一轮（默认system）"
+      }
+    }
+  },
+  "section_source": {
+    "type": "section",
+    "name": "来源归类",
+    "collapsed": true,
+    "fields": {
+      "source_default": {
+        "type": "string",
+        "name": "默认来源名",
+        "default": "system",
+        "hint": "无法判定来源时的兜底标签"
+      },
+      "source_group": {
+        "type": "string",
+        "name": "群聊来源名",
+        "default": "qchat",
+        "hint": "群聊消息用量的来源标签"
+      },
+      "source_dm": {
+        "type": "string",
+        "name": "私聊来源名",
+        "default": "dm",
+        "hint": "私聊消息用量的来源标签"
+      }
+    }
+  },
+  "section_command": {
+    "type": "section",
+    "name": "自定义命令",
+    "collapsed": false,
+    "fields": {
+      "enable_command": {
+        "type": "switch",
+        "name": "启用命令",
+        "default": false,
+        "hint": "默认关闭。开启后用户可通过命令词直接查询用量/余额（不走 LLM）"
+      },
+      "command_words": {
+        "type": "list",
+        "name": "命令词",
+        "default": ["/用量", "/token"],
+        "hint": "每行一个命令词，支持前缀匹配（如 /用量 今天）"
+      },
+      "allowed_users": {
+        "type": "list",
+        "name": "允许的用户 QQ",
+        "default": [],
+        "hint": "留空 = 所有人可用；填写后仅这些 QQ 可用"
+      },
+      "exact_match": {
+        "type": "switch",
+        "name": "全字匹配",
+        "default": false,
+        "hint": "开启后来源/渠道/站点名匹配需全字相等，关闭则包含匹配"
+      },
+      "denied_message": {
+        "type": "string",
+        "name": "无权限提示",
+        "default": "权限不足：您没有查询用量统计的权限",
+        "hint": "白名单外用户触发命令时的回复"
+      },
+      "command_success_template": {
+        "type": "markdown",
+        "name": "单结果模板",
+        "default": "📊 {provider}：{result}",
+        "hint": "支持 {provider} {result} 占位符"
+      },
+      "command_all_template": {
+        "type": "markdown",
+        "name": "汇总模板",
+        "default": "📊 Token 用量统计：\n{results}",
+        "hint": "支持 {results} 占位符"
+      }
+    }
+  },
+  "section_tool": {
+    "type": "section",
+    "name": "Bot 工具",
+    "collapsed": true,
+    "fields": {
+      "enable_tool": {
+        "type": "switch",
+        "name": "启用工具",
+        "default": true,
+        "hint": "注册 query_token_stats 工具，用户自然语言问\"用了多少token/花了多少钱/余额多少\"时由 LLM 自动调用"
+      },
+      "tool_include_balance": {
+        "type": "switch",
+        "name": "工具返回余额",
+        "default": true,
+        "hint": "查询结果中附带已配置的余额监测源信息"
+      }
+    }
+  },
+  "section_pricing": {
+    "type": "section",
+    "name": "价格规则",
+    "collapsed": false,
+    "fields": {
+      "rules": {
+        "type": "json",
+        "name": "价格规则",
+        "default": [
+          {
+            "name": "DeepSeek V4-Flash（官方价）",
+            "model_match": "flash",
+            "peak_enabled": true,
+            "hit_peak": 0.10,
+            "hit_off": 0.05,
+            "miss_peak": 3.0,
+            "miss_off": 1.5,
+            "out_peak": 9.0,
+            "out_off": 4.5
+          },
+          {
+            "name": "DeepSeek V4-Pro（官方价）",
+            "model_match": "pro",
+            "peak_enabled": true,
+            "hit_peak": 0.30,
+            "hit_off": 0.15,
+            "miss_peak": 9.0,
+            "miss_off": 4.5,
+            "out_peak": 27.0,
+            "out_off": 13.5
+          }
+        ],
+        "hint": "每条规则 = {name, url_match(可选), channel_match(可选), model_match(可选), peak_enabled, hit_peak, hit_off, miss_peak, miss_off, out_peak, out_off}。价格单位：元/百万 tokens。匹配加权：URL命中=4分，模型=2分，渠道名=1分，取最高分规则。峰=工作日 9:00-12:00、14:00-18:00，其余谷。建议按 URL（endpoint 域名）配置"
+      }
+    }
+  },
+  "section_balance": {
+    "type": "section",
+    "name": "余额监测",
+    "collapsed": false,
+    "fields": {
+      "enable_balance": {
+        "type": "switch",
+        "name": "启用余额监测",
+        "default": false,
+        "hint": "开启后按间隔轮询余额源，工具/命令/页面可查余额"
+      },
+      "balance_interval": {
+        "type": "integer",
+        "name": "轮询间隔（分钟）",
+        "default": 60,
+        "minimum": 5,
+        "hint": "最小 5 分钟。页面/工具查询时也可手动刷新"
+      },
+      "balance_sources": {
+        "type": "json",
+        "name": "余额监测源",
+        "default": [],
+        "hint": "数组，每项 {name, type: auto/custom/preset, url, api_key, json_path(可选), initial(可选，初始额度元), currency, enabled}。auto=按 URL 自动探测（DeepSeek/Moonshot/硅基/智谱官方端点或 One-API 系中转站）；custom=填 Base 地址自动尝试常见余额接口，或直接填完整余额接口 URL+json_path；preset=无接口，填 initial 后按 初始额度−已计费用 估算。注意：api_key 为明文存储"
+      }
+    }
+  },
+  "section_advanced": {
+    "type": "section",
+    "name": "高级设置",
+    "collapsed": true,
+    "fields": {
+      "max_log_size": {
+        "type": "integer",
+        "name": "日志保留条数",
+        "default": 100000,
+        "minimum": 1000,
+        "hint": "usage-log.jsonl 超过此条数时自动裁剪（保留最新）。0=不裁剪"
+      },
+      "session_idle_minutes": {
+        "type": "integer",
+        "name": "会话窗口（分钟）",
+        "default": 30,
+        "minimum": 1,
+        "hint": "\"本次会话\"范围统计的滚动窗口：超过该分钟无新记录则重新计一轮会话"
+      }
+    }
+  }
+}
