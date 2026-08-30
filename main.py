@@ -1637,8 +1637,9 @@ class TokenStatsPlugin(BasePlugin):
                 except OSError:
                     continue
                 ino = getattr(st, "st_ino", None)
-                if ino is None:
-                    # 平台无 ino（如某些网络盘）：退化为路径跟踪
+                if ino is None or ino == 0:
+                    # 平台无 ino（如某些网络盘）或 ino 为 0（FAT32 等文件系统）：
+                    # 退化为路径跟踪，避免所有文件共用游标 0 导致重复计数
                     ino = str(path)
                 seen.add(ino)
                 pos = self._log_err_inodes.get(ino, 0)
