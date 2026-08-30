@@ -189,7 +189,20 @@
         "type": "json",
         "name": "余额监测源（高级/自定义）",
         "default": [],
-        "hint": "数组，每项公共字段 {name, type: auto/custom/newapi/preset/daily/rolling, url, api_key, json_path(可选), currency(可选：显示币种，daily/rolling 默认积分), enabled}。auto=按 URL 自动探测（DeepSeek/Moonshot/硅基/智谱官方端点或 One-API 系中转站）；custom=填 Base 地址自动尝试常见余额接口，或直接填完整余额接口 URL+json_path；newapi=New-API 站点专属（api_user 必填纯数字用户ID，quota_conversion 可选默认500000）；preset=预设扣减钱包型；daily=每日重置积分（daily_quota+refresh_time）；rolling=每日累计滚存积分（daily_quota+refresh_time+anchor_balance 对表基准）。估算型（preset/daily/rolling）核心字段：anchor_balance=当前在后台看到的真实余额（对表），anchor_at=对表时刻 ISO 格式（如 2026-08-31T10:00:00，填写 anchor_balance 时自动取当前时间），此后按价格规则自动扣减，改价即时重估；daily_quota=每日额度；refresh_time=每日刷新时刻 HH:mm 默认00:00。注意：api_key 为明文存储。常用官方平台（DeepSeek/Kimi/硅基/智谱）无需在此配置，直接填下方对应分区的 API Key 即可"
+        "hint": "数组，每项公共字段 {name, type: auto/custom/newapi/preset/daily/rolling, url, api_key, json_path(可选), currency(可选：显示币种，daily/rolling 默认积分), enabled}。auto=按 URL 自动探测（DeepSeek/Moonshot/硅基/智谱官方端点或 One-API 系中转站）；custom=填 Base 地址自动尝试常见余额接口，或直接填完整余额接口 URL+json_path；newapi=New-API 站点专属（api_user 必填纯数字用户ID，quota_conversion 可选默认500000）；preset=预设扣减钱包型；daily=每日重置积分（daily_quota+refresh_time）；rolling=每日累计滚存积分（daily_quota+refresh_time+anchor_balance 对表基准）。估算型（preset/daily/rolling）核心字段：anchor_balance=当前在后台看到的真实余额（对表），anchor_at=对表时刻 ISO 格式（如 2026-08-31T10:00:00，填写 anchor_balance 时自动取当前时间），此后按价格规则自动扣减，改价即时重估；daily_quota=每日额度；refresh_time=每日刷新时刻 HH:mm 默认00:00。注意：api_key 为明文存储。常用官方平台（DeepSeek/Kimi/硅基/智谱）无需在此配置，直接填下方对应分区的 API Key 即可；New-API 中转站也可用下方「简易文本格式」每行 名称;地址;令牌;用户ID;换算比例 快速添加"
+      }
+    }
+  },
+  "section_balance_newapi_simple": {
+    "type": "section",
+    "name": "New API 站点（简易文本格式）",
+    "collapsed": true,
+    "fields": {
+      "newapi_sites_simple": {
+        "type": "list",
+        "name": "简易站点列表（每行一个，分号分隔）",
+        "default": [],
+        "hint": "每行格式：名称;base_url;系统访问令牌;纯数字用户ID;换算比例（可选，默认500000）\n示例：我的站点1;https://api.example.com;sk-xxxxxxxx;123456;500000\n对齐 api-balance 插件的简易格式，自动并入余额监测（type=newapi）"
       }
     }
   },
