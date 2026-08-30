@@ -33,7 +33,7 @@ from core.plugin.plugin_registry import PluginPage, PageMenu
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import MessageChain
 from core.chat.message_elements import Text
-from core.provider import LLMRequest, LLMResponse
+from core.provider import LLMResponse
 
 try:
     import aiohttp
@@ -84,17 +84,6 @@ _ZP_HOSTS = ("bigmodel", "zhipu")
 # 工具函数
 # ────────────────────────────────────────────────────────────
 
-def _cfg_get(cfg: dict, section: str, key: str, default=None):
-    """从插件配置里取字段，兼容 section 嵌套与扁平两种存储布局"""
-    if not isinstance(cfg, dict):
-        return default
-    if section and isinstance(cfg.get(section), dict) and key in cfg[section]:
-        return cfg[section][key]
-    if key in cfg:
-        return cfg[key]
-    return default
-
-
 def _fmt_num(v):
     return f"{v:N0}" if v else "0"
 
@@ -118,13 +107,6 @@ def _fmt4(v):
     if v < 9950000000:
         return f"{v/1000000000:.1f}".replace(".0", "") + "B"
     return str(round(v / 1000000000)) + "B"
-
-
-def _json_escape(s: str) -> str:
-    if s is None:
-        return ""
-    return (str(s).replace("\\", "\\\\").replace('"', '\\"')
-            .replace("\n", "\\n").replace("\r", "").replace("\t", "\\t"))
 
 
 def _is_peak(t: datetime) -> bool:
@@ -190,7 +172,7 @@ def _append_jsonl(path: Path, rec: dict, max_size: int = 0):
     except Exception as e:
         logger.warning(f"[token_stats] 日志写入失败: {e}")
         return
-    # 裁剪：超过 max_size 条时保留最新
+    # 裁剪：超过 max_size 条时保留最新（0 = 不裁剪）
     if max_size and max_size > 0:
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
@@ -244,14 +226,17 @@ class TokenStatsPlugin(BasePlugin):
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
         self.enable_balance = bool(bal.get("enable_balance", False))
-        self.balance_interval = max(5, int(bal.get("balance_interval", 60) or 60))
+        interval = bal.get("balance_interval", 60)
+        self.balance_interval = max(5, int(interval) if interval is not None else 60)
         sources = bal.get("balance_sources", [])
         self.balance_sources = sources if isinstance(sources, list) else []
 
         # ── 高级 ──
         adv = cfg.get("section_advanced", {})
-        self.max_log_size = int(adv.get("max_log_size", 100000) or 100000)
-        self.session_idle_minutes = max(1, int(adv.get("session_idle_minutes", 30) or 30))
+        max_log = adv.get("max_log_size", 100000)
+        self.max_log_size = int(max_log) if max_log is not None else 100000
+        idle = adv.get("session_idle_minutes", 30)
+        self.session_idle_minutes = max(1, int(idle) if idle is not None else 30)
 
         # ── 运行时状态 ──
         self._data_dir: Path = None  # initialize 时赋值
@@ -268,7 +253,6 @@ class TokenStatsPlugin(BasePlugin):
             "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
             "aggs": {},
         }
-        self._session_err = 0
         self._last_err_text = ""
         self._last_err_at = None
         self._cur_source = self.source_default
@@ -323,10 +307,10 @@ class TokenStatsPlugin(BasePlugin):
         self._days.clear()
         self._hours.clear()
         for rec in _read_jsonl(self._log_path):
-            self._apply_rec(rec, load=True)
+            self._apply_rec(rec)
         logger.info(f"[token_stats] 已加载历史 {len(self._days)} 天 / {sum(d['v'] for d in self._days.values())} tokens")
 
-    def _apply_rec(self, rec: dict, load: bool = False):
+    def _apply_rec(self, rec: dict):
         try:
             t = datetime.fromisoformat(rec.get("t", ""))
         except Exception:
@@ -516,7 +500,6 @@ class TokenStatsPlugin(BasePlugin):
             pending = self._pending[sid] = {"text": "", "source": None, "steps": 0, "at": time.time()}
         errs = len(ERROR_TAG_RE.findall(text)) if text else 0
         if errs > 0:
-            self._session_err += errs
             self._last_err_text = self._err_snippet(text)
             self._last_err_at = datetime.now()
 
@@ -985,7 +968,7 @@ class TokenStatsPlugin(BasePlugin):
     async def _build_query_reply(self, arg: str) -> str:
         arg = arg.strip().lower()
         aliases = {"本次": "session", "今天": "today", "7天": "d7", "30天": "d30", "累计": "total",
-                   "余额": "balance", "价格": "pricing"}
+                   "余额": "balance"}
         key = aliases.get(arg, arg)
         if key in RANGES:
             text = self._build_summary_text(key)
@@ -1103,7 +1086,8 @@ class TokenStatsPlugin(BasePlugin):
         if day and re.match(r"^\d{4}-\d{2}-\d{2}$", day):
             hours = [{"h": i, **h} for i, h in enumerate(self._hours.get(day, []) or []) if h]
             return {"day": day, "hours": hours}
-        days = [{"d": k, **v} for k, v in sorted(self._days.items())]
+        days = [{"d": k, "r": v["r"], "v": v["v"], "i": v["i"], "o": v["o"], "c": v["c"], "e": v["e"]}
+                for k, v in sorted(self._days.items())]
         return {"days": days}
 
     @register.api(method="GET", path="/records", auth=True)
@@ -1342,6 +1326,8 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
   return Math.round(v/1e9)+'B'; };
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const localDate = () => { const d=new Date();
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
 
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
@@ -1388,8 +1374,7 @@ async function loadHist(){
     '<td><div class="bar"><i style="width:'+(x.v/max*100)+'%"></i></div></td></tr>').join('')+'</tbody></table>';
 }
 async function loadHours(){
-  const today = new Date().toISOString().slice(0,10);
-  const d = await jget('/history?day='+today);
+  const d = await jget('/history?day='+localDate());
   const hs = d.hours||[];
   const max = Math.max(...hs.map(x=>x.v),1);
   const cells = [];
