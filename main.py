@@ -104,7 +104,12 @@ _ZP_HOSTS = ("bigmodel", "zhipu")
 # ────────────────────────────────────────────────────────────
 
 def _fmt_num(v):
-    return f"{v:N0}" if v else "0"
+    """千分位格式化（兼容 Python <3.10：N 格式符 3.10+ 才有）"""
+    try:
+        v = int(v or 0)
+    except (TypeError, ValueError):
+        return "0"
+    return f"{v:,}"
 
 
 def _fmt4(v):
@@ -351,10 +356,25 @@ class TokenStatsPlugin(BasePlugin):
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
         self.enable_balance = bool(bal.get("enable_balance", False))
-        interval = bal.get("balance_interval", 60)
-        self.balance_interval = max(5, int(interval) if interval is not None else 60)
+        interval = bal.get("balance_interval", 5)
+        self.balance_interval = max(1, int(interval) if interval is not None else 5)
         sources = bal.get("balance_sources", [])
         self.balance_sources = sources if isinstance(sources, list) else []
+        # 固定平台快捷配置（对齐 api-balance 插件风格）：启用 + 填 key 即自动并入余额源
+        for key, dname, durl in (
+                ("deepseek", "DeepSeek", "https://api.deepseek.com"),
+                ("moonshot", "月之暗面 Kimi", "https://api.moonshot.cn/v1"),
+                ("siliconflow", "硅基流动", "https://api.siliconflow.cn"),
+                ("zhipu", "智谱", "https://open.bigmodel.cn/api/paas/v4")):
+            sec = cfg.get(f"section_balance_{key}", {}) or {}
+            if sec.get("enabled") and sec.get("api_key"):
+                self.balance_sources.insert(0, {
+                    "name": (sec.get("name") or dname).strip(),
+                    "type": "auto",
+                    "url": (sec.get("base_url") or durl).strip(),
+                    "api_key": sec.get("api_key"),
+                    "enabled": True,
+                })
         self.balance_unit = (bal.get("balance_unit", "元") or "元").strip() or "元"
 
         # ── 高级 ──
@@ -600,23 +620,42 @@ class TokenStatsPlugin(BasePlugin):
         return self.source_default
 
     def _resolve_channel_model(self):
-        """尽力从默认 LLM 客户端取 provider/model/host（防御式，失败回退默认值）"""
+        """从默认 LLM 客户端取 provider 名/模型名/host（KiraAI 结构：client.model = ModelInfo）
+        防御式，失败回退默认值"""
         channel, model, host = "默认渠道", "未知", ""
         try:
             client = self.ctx.get_default_llm_client()
-            model = (getattr(client, "model_id", None)
-                     or getattr(client, "model_name", None) or "未知")
-            mcfg = getattr(client, "model_config", None) or {}
-            if not isinstance(mcfg, dict):
-                mcfg = {}
-            base_url = (mcfg.get("base_url") or mcfg.get("baseUrl")
-                        or mcfg.get("url") or mcfg.get("endpoint") or "")
-            if base_url:
-                try:
-                    host = urlparse(base_url).hostname or ""
-                except Exception:
-                    host = ""
-            channel = host or getattr(client, "provider_id", None) or "默认渠道"
+            mi = getattr(client, "model", None)
+            if mi is not None:
+                model = getattr(mi, "model_id", None) or "未知"
+                pname = getattr(mi, "provider_name", None) or ""
+                pcfg = getattr(mi, "provider_config", None) or {}
+                if not isinstance(pcfg, dict):
+                    pcfg = {}
+                base_url = (pcfg.get("base_url") or pcfg.get("baseUrl")
+                            or pcfg.get("url") or pcfg.get("endpoint") or "")
+                if base_url:
+                    try:
+                        host = urlparse(base_url).hostname or ""
+                    except Exception:
+                        host = ""
+                channel = pname or host or "默认渠道"
+            else:
+                # 兜底：直接属性
+                model = (getattr(client, "model_id", None)
+                         or getattr(client, "model_name", None) or "未知")
+                mcfg = getattr(client, "model_config", None) or {}
+                if not isinstance(mcfg, dict):
+                    mcfg = {}
+                base_url = (mcfg.get("base_url") or mcfg.get("baseUrl")
+                            or mcfg.get("url") or mcfg.get("endpoint") or "")
+                if base_url:
+                    try:
+                        host = urlparse(base_url).hostname or ""
+                    except Exception:
+                        host = ""
+                channel = (getattr(client, "provider_id", None)
+                           or getattr(client, "provider_name", None) or host or "默认渠道")
         except Exception:
             pass
         return channel, model, host
@@ -1284,7 +1323,7 @@ class TokenStatsPlugin(BasePlugin):
         try:
             while True:
                 await self._probe_all()
-                await asyncio.sleep(max(300, self.balance_interval * 60))
+                await asyncio.sleep(max(60, self.balance_interval * 60))
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1578,6 +1617,9 @@ class TokenStatsPlugin(BasePlugin):
         if not self.enabled:
             return "Token 统计未启用（插件配置页 → 基础设置）"
         try:
+            # 工具查询余额时先即时探测，保证拿到最新值（与 api-balance 插件行为一致）
+            if self.tool_include_balance and self.enable_balance and self.balance_sources:
+                await self._probe_all()
             return self._build_summary_text(range or "")
         except Exception as e:
             logger.exception("[token_stats] tool query failed")
