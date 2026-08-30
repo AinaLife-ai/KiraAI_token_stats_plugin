@@ -9,7 +9,9 @@
   峰谷价（工作日 9:00-12:00 / 14:00-18:00 为峰，其余谷）；
   费用一律在展示时计算，改价后全历史即时重定价
 - 余额监测：auto（按 URL 自动分流官方端点 / One-API 中转站）、
-  custom（自定义接口多端点尝试 + json_path 取数）、preset（初始额度 − 已计费用）
+  custom（自定义接口多端点尝试 + json_path 取数）、
+  newapi（New-API 站点：New-Api-User 头 + /api/user/self + quota 换算）、
+  preset（初始额度 − 已计费用）；余额显示单位可配置（默认"元"）
 - 来源归类：自定义关键词规则优先 → 群聊/私聊自动判定 → 工具续轮继承上一轮
 - 多入口查询：WebUI 侧边栏仪表盘 / bot 工具（自然语言）/ 可选自定义命令
 - 错误统计：「出错：」正则扫描，按范围聚合
@@ -230,6 +232,7 @@ class TokenStatsPlugin(BasePlugin):
         self.balance_interval = max(5, int(interval) if interval is not None else 60)
         sources = bal.get("balance_sources", [])
         self.balance_sources = sources if isinstance(sources, list) else []
+        self.balance_unit = (bal.get("balance_unit", "元") or "元").strip() or "元"
 
         # ── 高级 ──
         adv = cfg.get("section_advanced", {})
@@ -721,14 +724,76 @@ class TokenStatsPlugin(BasePlugin):
             raise ValueError("balance_infos[0] 缺少 total_balance")
         return v, currency
 
+    @staticmethod
+    def _newapi_extract(data: dict):
+        """New-API /api/user/self 风格：多字段自动提取 quota，返回 (quota, 是否找到)"""
+        candidates = [
+            "quota", "balance", "remaining", "points",
+            "totalBalance", "total_balance", "amount", "credit", "available",
+        ]
+        if isinstance(data, dict):
+            inner = data.get("data")
+            if isinstance(inner, dict):
+                for key in candidates:
+                    v = TokenStatsPlugin._read_num(inner, key)
+                    if v is not None:
+                        return v, True
+            if "error" in data and isinstance(data.get("error"), dict):
+                err = data["error"]
+                if isinstance(err, dict) and err.get("message"):
+                    raise ValueError(f"NewAPI 返回错误: {err.get('message')}")
+            for key in candidates:
+                v = TokenStatsPlugin._read_num(data, key)
+                if v is not None:
+                    return v, True
+            # balance_infos 风格兜底
+            infos = data.get("balance_infos") or (inner or {}).get("balance_infos") or []
+            if infos:
+                v = TokenStatsPlugin._read_num(infos[0], "total_balance")
+                if v is not None:
+                    return v, True
+        return None, False
+
     async def _probe_one(self, src: dict) -> dict:
-        """探测单个余额源（auto/custom），失败返回 Ok=false + 原因"""
+        """探测单个余额源（auto/custom/newapi），失败返回 Ok=false + 原因"""
         st = {"balance": 0, "currency": src.get("currency", "CNY"),
               "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ok": False, "msg": ""}
         try:
             s_type = (src.get("type") or "auto").strip().lower()
             api_key = src.get("api_key", "") or ""
             jpath = (src.get("json_path") or "").strip()
+
+            if s_type == "newapi":
+                # New-API 专属模式：New-Api-User 头 + /api/user/self + quota_conversion 换算
+                cu = (src.get("url") or "").strip()
+                if not cu:
+                    st["msg"] = "newapi 源缺少站点地址"
+                    return st
+                if not cu.startswith("http"):
+                    cu = "https://" + cu
+                croot = cu[:-3].rstrip("/") if cu.endswith("/v1") else cu.rstrip("/")
+                api_user = str(src.get("api_user", "") or "").strip()
+                conversion = src.get("quota_conversion", 500000)
+                try:
+                    conversion = float(conversion) if conversion not in (None, "") else 500000
+                except (TypeError, ValueError):
+                    conversion = 500000
+                if not api_user:
+                    st["msg"] = "newapi 源缺少 api_user（站点后台用户ID）"
+                    return st
+                try:
+                    body = await self._http_get(croot + "/api/user/self", api_key, extra_headers={"New-Api-User": api_user})
+                    quota, found = self._newapi_extract(body)
+                    if not found:
+                        raise ValueError("返回数据中未找到 quota/balance 等字段")
+                    st["balance"] = quota / conversion
+                    st["currency"] = src.get("currency", "CNY")
+                    st["ok"] = True
+                    st["msg"] = f"New-API 站点：quota {quota:,.0f} ÷ {conversion:g} = {quota / conversion:.4f}"
+                    return st
+                except Exception as ex:
+                    st["msg"] = f"New-API 接口失败: {str(ex)[:160]}"
+                    return st
 
             if s_type == "custom":
                 cu = (src.get("url") or "").strip()
@@ -844,13 +909,15 @@ class TokenStatsPlugin(BasePlugin):
             st["msg"] = str(ex)[:160]
         return st
 
-    async def _http_get(self, url: str, api_key: str):
+    async def _http_get(self, url: str, api_key: str, extra_headers: dict = None):
         """GET 请求，返回解析后的 JSON；非 2xx 抛异常"""
         if aiohttp is None:
             raise RuntimeError("aiohttp 未安装")
         headers = {}
         if api_key:
             headers["Authorization"] = "Bearer " + api_key
+        if extra_headers:
+            headers.update(extra_headers)
         timeout = aiohttp.ClientTimeout(total=10)
         try:
             connector = aiohttp.TCPConnector(resolver=ThreadedResolver(), ssl=False)
@@ -955,9 +1022,9 @@ class TokenStatsPlugin(BasePlugin):
                 st = self._resolve_balance_state(src)
                 name = src.get("name", "")
                 if src.get("initial"):
-                    sb.append(f"- {name}：{st['balance']:.4f} {st['currency']}（初始额度 − 已用）")
+                    sb.append(f"- {name}：{st['balance']:.4f} {self.balance_unit}（初始额度 − 已用）")
                 elif st["ok"]:
-                    sb.append(f"- {name}：{st['balance']:.4f} {st['currency']}（{st.get('at', '')[:16]} 更新）")
+                    sb.append(f"- {name}：{st['balance']:.4f} {self.balance_unit}（{st.get('at', '')[:16]} 更新）")
                 else:
                     sb.append(f"- {name}：探测失败（{st['msg']}）")
 
@@ -984,9 +1051,9 @@ class TokenStatsPlugin(BasePlugin):
                 st = self._resolve_balance_state(src)
                 name = src.get("name", "")
                 if src.get("initial"):
-                    lines.append(f"- {name}：{st['balance']:.4f} {st['currency']}（初始额度 − 已用）")
+                    lines.append(f"- {name}：{st['balance']:.4f} {self.balance_unit}（初始额度 − 已用）")
                 elif st["ok"]:
-                    lines.append(f"- {name}：{st['balance']:.4f} {st['currency']}（{st.get('at', '')[:16]} 更新）")
+                    lines.append(f"- {name}：{st['balance']:.4f} {self.balance_unit}（{st.get('at', '')[:16]} 更新）")
                 else:
                     lines.append(f"- {name}：探测失败（{st['msg']}）")
             return "\n".join(lines)
@@ -1059,7 +1126,7 @@ class TokenStatsPlugin(BasePlugin):
             if st["ok"]:
                 bal_summary["ok"] += 1
                 if not bal_summary["current"]:
-                    bal_summary["current"] = f"{src.get('name', '')} {st['balance']:.2f} {st['currency']}"
+                    bal_summary["current"] = f"{src.get('name', '')} {st['balance']:.2f} {self.balance_unit}"
 
         return {
             "model": model,
@@ -1198,7 +1265,7 @@ class TokenStatsPlugin(BasePlugin):
                 "at": st.get("at", ""),
                 "msg": st.get("msg", ""),
             })
-        return {"interval": max(5, self.balance_interval), "sources": sources}
+        return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
 
     @register.api(method="GET", path="/pricing", auth=True)
     async def api_pricing(self):
@@ -1416,8 +1483,9 @@ async function loadPrice(){
 async function loadBal(refresh){
   const d = await jget('/balance'+(refresh?'?refresh=1':''));
   $('#balInfo').textContent = '轮询间隔 ' + d.interval + ' 分钟';
+  const unit = d.unit || '元';
   $('#balBody').innerHTML = (d.sources||[]).map(x=>
-    '<tr><td>'+esc(x.name)+'</td><td>'+esc(x.type)+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?('¥'+x.balance+' '+esc(x.currency)):'失败')+'</td>'+
+    '<tr><td>'+esc(x.name)+'</td><td>'+esc(x.type)+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</td>'+
     '<td>'+esc(x.at||'—')+'</td><td>'+esc(x.msg||'—')+'</td></tr>').join('') ||
     '<tr><td colspan="5" class="note">未配置余额监测源（插件配置页 → 余额监测）</td></tr>';
 }
