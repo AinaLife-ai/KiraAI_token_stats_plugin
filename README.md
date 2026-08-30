@@ -340,6 +340,18 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 <details>
 <summary>点击展开</summary>
 
+### v1.2.1（2026-08-31）
+
+- **修复时间戳兼容**（姐姐审查 #1）：日志统一写 6 位微秒，解析走 `_parse_ts` 兼容 3/6 位——Python 3.10- 的 `fromisoformat` 不再炸，`_apply_session` 主采集路径不再可能崩
+- **修复错误统计重复计数**（姐姐审查 #2）：移植 errScanPos 位置游标（`_err_scan`），工具循环续轮同一段「出错：」只计一次，新响应自动重置
+- **exact_match 配置生效**（姐姐审查 #3）：原为死代码，现模块级开关全量接入匹配器（价格规则/渠道/来源全字匹配）
+- **移除死代码**：`cmd_all_template`（从未使用）从 schema/代码删除
+- **HTTPS 证书校验开关**：新增 `balance_ssl_verify`（默认关，兼容自签证书中转站；官方端点可开）
+- **日志 IO 线程锁**：追加/裁剪/热读缓存统一走 `_IO_LOCK`，消除并发竞争面
+- **`_range_agg` 统一遍历写法**：不再依赖 dict 插入序，与 `_range_cost_ex` 一致
+- **data_dir 兜底**：`get_plugin_data_dir()` 返回 None 时降级插件目录，不再裸崩
+- **新增 WebUI 悬浮挂件**（默认关闭）：侧边栏「Token 挂件」页——迷你卡片实时显示会话/今日 tokens、费用、余额，可拖动、可折叠成小球、紧凑模式，适合浏览器小窗钉角落；配置页「挂件」区开启
+
 ### v1.2.0（2026-08-31）
 
 - **AI 查询函数扩容**：新增 `query_token_usage`（维度聚合：channel/model/source/day + 时间区间 + 关键字过滤 + top 上限）与 `query_token_records`（逐轮明细 + minInput 定位大上下文），输出带 4000 字符 ClampAiOutput 硬上限防回注撑爆上下文
