@@ -21,7 +21,7 @@
 - AI 查询函数：query_token_usage（维度聚合）与 query_token_records（逐轮明细），
   输出带 4000 字符硬上限防止回注结果撑爆上下文
 - 热读缓存：按 mtime+length 判失效，大日志下轮询/查询不重复全量读盘
-- 错误统计：LLM 响应内「出错：」正则扫描 + **后台日志（log.log）ERROR 行增量扫描**（分类聚合：XML解析/模型调用/工具执行/网络超时/异常堆栈），按范围聚合
+- 错误统计：LLM 响应内「出错：」正则扫描 + **后台日志（log.log）ERROR 行增量扫描**（分类聚合：XML解析/模型调用/工具执行/网络超时/异常堆栈）+ **工具结果失败钩子**（error/权限denied/超时/调用失败——LLM 白烧 token 的典型），按范围聚合
 
 模型无关：统计基于 LLMResponse 的 input_tokens/output_tokens/cached_tokens 字段，
 任何 Provider 只要上报 tokens 即可统计。
@@ -49,7 +49,7 @@ from core.plugin.plugin_registry import PluginPage, PageMenu
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import MessageChain
 from core.chat.message_elements import Text
-from core.provider import LLMResponse
+from core.provider import LLMResponse, ToolResult
 
 try:
     from core.utils.path_utils import get_data_path
@@ -84,13 +84,22 @@ LOG_ERR_XML_RE = re.compile(r"Error parsing message|Failed to fix xml|mismatched
 # 分类：模型调用失败（Provider 层）
 LOG_ERR_MODEL_RE = re.compile(r"Model .* failed|ProviderError|All models in the group failed")
 # 分类：工具执行失败
-LOG_ERR_TOOL_RE = re.compile(r"Tool '.*' timed out|Tool .* failed|tool execution failed")
+LOG_ERR_TOOL_RE = re.compile(r"Tool '.*' timed out|Tool .* failed|tool execution failed|Permission denied|Access denied|权限不足|无权限|拒绝访问|Forbidden|not allowed")
 # 分类：网络/超时
 LOG_ERR_NET_RE = re.compile(r"超时|timed out|timeout|Connection error|Connection reset")
 # 分类：Traceback（未分类异常堆栈）
 LOG_ERR_TB_RE = re.compile(r"Traceback \(most recent call last\)")
 LOG_ERR_CATS = ("xml", "model", "tool", "net", "traceback", "other")
 LOG_ERR_LABELS = {"xml": "XML解析", "model": "模型调用", "tool": "工具执行", "net": "网络/超时", "traceback": "异常堆栈", "other": "其他"}
+
+# ── 工具结果失败判定（on.tool_result 钩子）──
+# tool 返回 error / 权限 denied / 超时 / 调用失败等——LLM 白烧 token 的典型
+TOOL_ERR_RE = re.compile(
+    r"\{['\"]?error['\"]?\s*:|Error\s*:|Permission denied|Access denied|权限不足|无权限|拒绝访问|"
+    r"Forbidden|403|not allowed|timed out|超时|Failed to call tool|not implemented|"
+    r"调用失败|执行失败|查询失败|获取失败|生成失败|发送失败|上传失败|下载失败|删除失败|保存失败|"
+    r"失败[：:，。]|失败$",
+    re.IGNORECASE)
 
 # AI 回注文本硬上限（正常结果 1-2K 字符，防御性兜底防 Poke 回注撑爆上下文）
 AI_OUTPUT_LIMIT = 4000
@@ -503,6 +512,10 @@ class TokenStatsPlugin(BasePlugin):
         self._log_err_task: asyncio.Task = None
         self._log_err_lock = asyncio.Lock()
 
+        # 工具结果失败统计（on.tool_result 钩子）：{day: count}
+        self._tool_err_hist = {}
+        self._tool_err_last = {"at": "", "tool": "", "text": ""}
+
         # exact_match 透传：模块级 flag（单实例插件可接受），匹配器全插件生效
         global _EXACT_MATCH
         _EXACT_MATCH = self.exact_match
@@ -891,6 +904,26 @@ class TokenStatsPlugin(BasePlugin):
         if self.debug_log:
             logger.info(f"[token_stats] rec: +{inp}in/{out}out/{cached}cache "
                         f"src={src} ch={channel} model={model}")
+
+    @on.tool_result(priority=Priority.LOW)
+    async def on_tool_result(self, event, result: ToolResult, *_):
+        """工具结果失败统计：error/权限denied/超时/调用失败等——LLM 白烧 token 的典型"""
+        if not self.enabled:
+            return
+        text = (getattr(result, "text", "") or "") or ""
+        if not text:
+            return
+        if not TOOL_ERR_RE.search(text):
+            return
+        day = datetime.now().strftime("%Y-%m-%d")
+        self._tool_err_hist[day] = self._tool_err_hist.get(day, 0) + 1
+        self._tool_err_last = {
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "tool": "",
+            "text": text.replace("\r", " ").replace("\n", " ").strip()[:160],
+        }
+        if self.debug_log:
+            logger.info(f"[token_stats] 工具结果失败 +1: {self._tool_err_last['text'][:60]}")
 
     @staticmethod
     def _err_snippet(text: str) -> str:
@@ -1625,6 +1658,24 @@ class TokenStatsPlugin(BasePlugin):
             s += f"（最近：{self._log_err_last['text'][:60]}）"
         return s
 
+    def _tool_err_summary(self, days: int = 7) -> str:
+        """近 N 天工具结果失败摘要（error/权限denied/超时等）"""
+        if not self._tool_err_hist:
+            return ""
+        today = datetime.now().strftime("%Y-%m-%d")
+        cutoff = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        total = 0
+        for day, n in self._tool_err_hist.items():
+            if day < cutoff or day > today:
+                continue
+            total += n
+        if not total:
+            return ""
+        s = f"工具结果失败：{total} 次"
+        if self._tool_err_last and self._tool_err_last.get("text"):
+            s += f"（最近：{self._tool_err_last['text'][:60]}）"
+        return s
+
     # ── 查询回复构建（命令 / 工具共用）──
 
     def _fmt_cost_part(self, cny, pts, matched):
@@ -1698,6 +1749,9 @@ class TokenStatsPlugin(BasePlugin):
         log_err = self._log_err_summary(7)
         if log_err:
             sb.append(log_err)
+        tool_err = self._tool_err_summary(7)
+        if tool_err:
+            sb.append(tool_err)
         return "\n".join(sb)
 
     async def _build_query_reply(self, arg: str) -> str:
@@ -2035,6 +2089,14 @@ class TokenStatsPlugin(BasePlugin):
                 log_err[cat] = log_err.get(cat, 0) + n
         errors["log"] = log_err
         errors["logLast"] = self._log_err_last
+        # 工具结果失败（近7天）
+        tool_err_total = 0
+        for day, n in self._tool_err_hist.items():
+            if day < cutoff or day > today:
+                continue
+            tool_err_total += n
+        errors["tool"] = tool_err_total
+        errors["toolLast"] = self._tool_err_last
         # 余额摘要：当前渠道匹配的源
         bal_summary = {"sources": len(self.balance_sources), "ok": 0, "current": ""}
         for src in self.balance_sources:
@@ -2635,6 +2697,11 @@ async function loadOv(){
     let lgTxt = '后台日志错误（近7天）：'+lgBits.join(' · ');
     if (er.logLast && er.logLast.text) lgTxt += '｜最近：'+esc(er.logLast.text.slice(0,60));
     cards.push('<div class="card errbox"><div class="k">后台日志 ERROR</div><div class="d">'+lgTxt+'</div></div>');
+  }
+  if (er.tool){
+    let tt = '工具结果失败（近7天）：'+er.tool+' 次';
+    if (er.toolLast && er.toolLast.text) tt += '｜最近：'+esc(er.toolLast.text.slice(0,60));
+    cards.push('<div class="card errbox"><div class="k">工具结果失败</div><div class="d">'+tt+'</div></div>');
   }
   $('#cards').innerHTML = cards.join('');
   loadHist(hist); loadHours();
