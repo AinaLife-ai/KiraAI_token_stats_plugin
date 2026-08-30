@@ -21,7 +21,7 @@
 - AI 查询函数：query_token_usage（维度聚合）与 query_token_records（逐轮明细），
   输出带 4000 字符硬上限防止回注结果撑爆上下文
 - 热读缓存：按 mtime+length 判失效，大日志下轮询/查询不重复全量读盘
-- 错误统计：「出错：」正则扫描，按范围聚合
+- 错误统计：LLM 响应内「出错：」正则扫描 + **后台日志（log.log）ERROR 行增量扫描**（分类聚合：XML解析/模型调用/工具执行/网络超时/异常堆栈），按范围聚合
 
 模型无关：统计基于 LLMResponse 的 input_tokens/output_tokens/cached_tokens 字段，
 任何 Provider 只要上报 tokens 即可统计。
@@ -29,12 +29,18 @@
 
 import asyncio
 import json
+import os
 import re
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:
+    import msvcrt  # Windows 共享删除模式打开日志（仅 NT 使用）
+except Exception:  # pragma: no cover
+    msvcrt = None
 
 from fastapi import Request
 
@@ -44,6 +50,13 @@ from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import MessageChain
 from core.chat.message_elements import Text
 from core.provider import LLMResponse
+
+try:
+    from core.utils.path_utils import get_data_path
+    _HAS_DATA_PATH = True
+except Exception:  # pragma: no cover
+    get_data_path = None
+    _HAS_DATA_PATH = False
 
 try:
     import aiohttp
@@ -62,6 +75,22 @@ RANGES = ("session", "today", "d7", "d30", "total")
 RANGE_LABELS = {"session": "本次", "today": "今天", "d7": "近7天", "d30": "近30天", "total": "累计"}
 
 ERROR_TAG_RE = re.compile(r"出错[：:]")
+
+# ── 后台日志（log.log）ERROR 行扫描 ──
+# 捕捉 KiraAI 控制台/日志文件里的真实错误，重点：LLM 输出错误 XML 格式导致解析失败
+LOG_ERROR_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+ERROR\s+\[([^\]]+)\]\s*(.*)$")
+# 分类：XML 解析失败（LLM 输出错误格式）→ 最关心的
+LOG_ERR_XML_RE = re.compile(r"Error parsing message|Failed to fix xml|mismatched tag|unclosed token|no element found|unexpected end|junk after document")
+# 分类：模型调用失败（Provider 层）
+LOG_ERR_MODEL_RE = re.compile(r"Model .* failed|ProviderError|All models in the group failed")
+# 分类：工具执行失败
+LOG_ERR_TOOL_RE = re.compile(r"Tool '.*' timed out|Tool .* failed|tool execution failed")
+# 分类：网络/超时
+LOG_ERR_NET_RE = re.compile(r"超时|timed out|timeout|Connection error|Connection reset")
+# 分类：Traceback（未分类异常堆栈）
+LOG_ERR_TB_RE = re.compile(r"Traceback \(most recent call last\)")
+LOG_ERR_CATS = ("xml", "model", "tool", "net", "traceback", "other")
+LOG_ERR_LABELS = {"xml": "XML解析", "model": "模型调用", "tool": "工具执行", "net": "网络/超时", "traceback": "异常堆栈", "other": "其他"}
 
 # AI 回注文本硬上限（正常结果 1-2K 字符，防御性兜底防 Poke 回注撑爆上下文）
 AI_OUTPUT_LIMIT = 4000
@@ -329,10 +358,11 @@ class TokenStatsPlugin(BasePlugin):
 
         # ── 来源归类 ──
         src = cfg.get("section_source", {})
-        self.source_default = src.get("source_default", "system") or "system"
+        # 默认来源：支持 string（旧配置兼容）或 list（多标签，取第一个为主标签）
+        self.source_default = self._src_label(src.get("source_default", "system"), "system")
         # 群聊默认标签对齐 KiraAI 会话类型（qq:gm:xxx），而非自定义的 qchat
-        self.source_group = src.get("source_group", "gm") or "gm"
-        self.source_dm = src.get("source_dm", "dm") or "dm"
+        self.source_group = self._src_label(src.get("source_group", "gm"), "gm")
+        self.source_dm = self._src_label(src.get("source_dm", "dm"), "dm")
 
         # ── 自定义命令 ──
         cmd = cfg.get("section_command", {})
@@ -465,6 +495,14 @@ class TokenStatsPlugin(BasePlugin):
         # 出错统计游标（errScanPos）：{sid: (prev_text, prev_end)}，工具循环续轮不重复计数
         self._err_cursor = {}
 
+        # 后台日志（log.log）ERROR 扫描状态
+        self._log_err_path = None          # 当前扫描的日志文件（含轮转）
+        self._log_err_pos = 0              # 文件内字节游标
+        self._log_err_hist = {}            # {day: {cat: count}} 按天分类聚合
+        self._log_err_last = {"at": "", "cat": "", "text": ""}  # 最近一条 ERROR
+        self._log_err_task: asyncio.Task = None
+        self._log_err_lock = asyncio.Lock()
+
         # exact_match 透传：模块级 flag（单实例插件可接受），匹配器全插件生效
         global _EXACT_MATCH
         _EXACT_MATCH = self.exact_match
@@ -483,6 +521,14 @@ class TokenStatsPlugin(BasePlugin):
 
         self._load_history()
         self._load_bal_states()
+
+        # 后台日志 ERROR 扫描：定位 KiraAI 的 log.log（含轮转文件）
+        self._log_err_path = self._resolve_log_err_path()
+        if self._log_err_path is not None:
+            self._log_err_task = asyncio.create_task(self._log_err_loop())
+            logger.info(f"[token_stats] 后台日志 ERROR 扫描已启动：{self._log_err_path}")
+        else:
+            logger.warning("[token_stats] 未找到 KiraAI 日志文件（log.log），后台错误统计不可用")
 
         if self.debug_log:
             logger.info(f"[token_stats] init: rules={len(self.rules)} balance_sources={len(self.balance_sources)} "
@@ -505,6 +551,13 @@ class TokenStatsPlugin(BasePlugin):
             except asyncio.CancelledError:
                 pass
             self._bal_task = None
+        if self._log_err_task and not self._log_err_task.done():
+            self._log_err_task.cancel()
+            try:
+                await self._log_err_task
+            except asyncio.CancelledError:
+                pass
+            self._log_err_task = None
 
     # ── 历史加载 ──
 
@@ -631,6 +684,19 @@ class TokenStatsPlugin(BasePlugin):
             pass
 
     # ── 来源 / 渠道识别 ──
+
+    @staticmethod
+    def _src_label(v, fallback: str) -> str:
+        """来源标签归一化：string 直接用；list 取第一个非空项（多标签时主标签）；
+        空/非法回退默认。"""
+        if isinstance(v, list):
+            for item in v:
+                s = str(item or "").strip()
+                if s:
+                    return s
+            return fallback
+        s = str(v or "").strip()
+        return s or fallback
 
     def _classify_source(self, sid: str, event) -> str:
         pending = self._pending.get(sid)
@@ -1400,6 +1466,165 @@ class TokenStatsPlugin(BasePlugin):
             return
         except Exception:
             logger.exception("[token_stats] 余额轮询循环退出")
+
+    # ── 后台日志（log.log）ERROR 扫描 ──
+
+    def _resolve_log_err_path(self) -> Path:
+        """定位 KiraAI 日志文件：优先 data/log.log，找不到则扫 data 目录下 log.log*"""
+        try:
+            if _HAS_DATA_PATH and get_data_path is not None:
+                p = get_data_path() / "log.log"
+                if p.exists():
+                    return p
+        except Exception:
+            pass
+        try:
+            if _HAS_DATA_PATH and get_data_path is not None:
+                d = get_data_path()
+                if d.is_dir():
+                    for f in sorted(d.glob("log.log*")):
+                        if f.is_file():
+                            return f
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _log_err_classify(text: str) -> str:
+        """按内容分类 ERROR 行：xml/model/tool/net/traceback/other"""
+        if LOG_ERR_XML_RE.search(text):
+            return "xml"
+        if LOG_ERR_MODEL_RE.search(text):
+            return "model"
+        if LOG_ERR_TOOL_RE.search(text):
+            return "tool"
+        if LOG_ERR_NET_RE.search(text):
+            return "net"
+        if LOG_ERR_TB_RE.search(text):
+            return "traceback"
+        return "other"
+
+    def _log_err_scan_file(self, path: Path, pos: int):
+        """增量扫描单个日志文件：返回 (新游标, 新增计数, 最新一条)
+
+        只读打开 + FILE_SHARE_DELETE 共享模式（Windows）：
+        不独占文件，不阻塞 KiraAI 的 RotatingFileHandler 轮转 rename。
+        句柄生命周期仅限本次扫描（毫秒级），读完立即关闭。
+        """
+        count = 0
+        last = None
+        new_pos = pos
+        try:
+            size = path.stat().st_size
+            if size < pos:
+                # 文件被轮转/截断：从头扫
+                pos = 0
+            f = self._open_log_shared(path)
+            if f is None:
+                return pos, count, last
+            try:
+                f.seek(pos)
+                for line in f:
+                    m = LOG_ERROR_RE.match(line)
+                    if m:
+                        count += 1
+                        cat = self._log_err_classify(m.group(2))
+                        day = line[:10]
+                        d = self._log_err_hist.setdefault(day, {})
+                        d[cat] = d.get(cat, 0) + 1
+                        last = {"at": line[:19], "cat": cat, "text": m.group(2).strip()[:160]}
+                new_pos = f.tell()
+            finally:
+                f.close()
+            return new_pos, count, last
+        except Exception as e:
+            logger.warning(f"[token_stats] 日志扫描失败 {path}: {e}")
+            return pos, count, last
+
+    @staticmethod
+    def _open_log_shared(path: Path):
+        """以共享删除模式打开日志文件（Windows 用 CreateFileW + FILE_SHARE_DELETE，
+        避免阻塞 RotatingFileHandler 轮转；其他平台普通只读打开）。"""
+        try:
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+                GENERIC_READ = 0x80000000
+                FILE_SHARE_READ = 0x00000001
+                FILE_SHARE_WRITE = 0x00000002
+                FILE_SHARE_DELETE = 0x00000004
+                OPEN_EXISTING = 3
+                FILE_ATTRIBUTE_NORMAL = 0x80
+                CreateFileW = ctypes.windll.kernel32.CreateFileW
+                CreateFileW.restype = wintypes.HANDLE
+                CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+                handle = CreateFileW(str(path), GENERIC_READ,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+                if not handle or handle == wintypes.HANDLE(-1).value:
+                    return None
+                fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+                if fd < 0:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    return None
+                return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+            return open(path, "r", encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+
+    async def _log_err_loop(self):
+        """后台循环：每 10s 增量扫描 log.log，轮转时自动切到新文件"""
+        try:
+            while True:
+                try:
+                    async with self._log_err_lock:
+                        path = self._log_err_path
+                        if path is None or not path.exists():
+                            # 轮转后主文件可能消失，重新定位
+                            path = self._resolve_log_err_path()
+                            self._log_err_path = path
+                            if path is None:
+                                await asyncio.sleep(10)
+                                continue
+                            self._log_err_pos = 0
+                        pos, count, last = self._log_err_scan_file(path, self._log_err_pos)
+                        self._log_err_pos = pos
+                        if last:
+                            self._log_err_last = last
+                        if count and self.debug_log:
+                            logger.info(f"[token_stats] 日志扫描 +{count} 条 ERROR")
+                except Exception as e:
+                    logger.warning(f"[token_stats] 日志扫描循环异常: {e}")
+                await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("[token_stats] 日志扫描循环退出")
+
+    def _log_err_summary(self, days: int = 7) -> str:
+        """近 N 天分类聚合摘要（含最近一条）"""
+        if not self._log_err_hist:
+            return ""
+        today = datetime.now().strftime("%Y-%m-%d")
+        cutoff = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        agg = {}
+        for day, cats in self._log_err_hist.items():
+            if day < cutoff or day > today:
+                continue
+            for cat, n in cats.items():
+                agg[cat] = agg.get(cat, 0) + n
+        if not agg:
+            return ""
+        parts = []
+        for cat in LOG_ERR_CATS:
+            if agg.get(cat):
+                parts.append(f"{LOG_ERR_LABELS[cat]} {agg[cat]}")
+        s = "后台日志错误：" + " · ".join(parts)
+        if self._log_err_last and self._log_err_last.get("text"):
+            s += f"（最近：{self._log_err_last['text'][:60]}）"
+        return s
+
     # ── 查询回复构建（命令 / 工具共用）──
 
     def _fmt_cost_part(self, cny, pts, matched):
@@ -1470,6 +1695,9 @@ class TokenStatsPlugin(BasePlugin):
 
         if self._last_err_text:
             sb.append(f"最近出错：{self._last_err_text}")
+        log_err = self._log_err_summary(7)
+        if log_err:
+            sb.append(log_err)
         return "\n".join(sb)
 
     async def _build_query_reply(self, arg: str) -> str:
@@ -1797,6 +2025,16 @@ class TokenStatsPlugin(BasePlugin):
             "total": self._range_agg("0000-01-01", "9999-12-31")["e"],
             "last": self._last_err_text,
         }
+        # 后台日志 ERROR 分类聚合（近7天）
+        log_err = {}
+        cutoff = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+        for day, cats in self._log_err_hist.items():
+            if day < cutoff or day > today:
+                continue
+            for cat, n in cats.items():
+                log_err[cat] = log_err.get(cat, 0) + n
+        errors["log"] = log_err
+        errors["logLast"] = self._log_err_last
         # 余额摘要：当前渠道匹配的源
         bal_summary = {"sources": len(self.balance_sources), "ok": 0, "current": ""}
         for src in self.balance_sources:
@@ -2094,6 +2332,56 @@ class TokenStatsPlugin(BasePlugin):
             })
         return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
 
+    @register.api(method="POST", path="/balance-config", auth=True)
+    async def api_balance_config(self, request: Request):
+        """保存余额监测源（WebUI 可视化编辑器）：整体替换 balance_sources 并热重载"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        new_sources = body.get("sources")
+        if not isinstance(new_sources, list):
+            return {"ok": False, "msg": "sources 必须是数组"}
+        # 清洗：只保留合法字段，剔除空项
+        cleaned = []
+        for s in new_sources:
+            if not isinstance(s, dict):
+                continue
+            name = str(s.get("name") or "").strip()
+            if not name:
+                continue
+            item = {"name": name, "type": (str(s.get("type") or "auto").strip().lower() or "auto"),
+                    "enabled": bool(s.get("enabled", True))}
+            for k in ("url", "api_key", "api_user", "json_path", "currency"):
+                v = s.get(k)
+                if v not in (None, ""):
+                    item[k] = str(v).strip()
+            for k in ("quota_conversion", "daily_quota", "anchor_balance"):
+                v = s.get(k)
+                if v not in (None, ""):
+                    try:
+                        item[k] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+            if s.get("refresh_time"):
+                item["refresh_time"] = str(s["refresh_time"]).strip()
+            if s.get("anchor_at"):
+                item["anchor_at"] = str(s["anchor_at"]).strip()
+            cleaned.append(item)
+        try:
+            pm = self.ctx.plugin_mgr
+            if pm is None:
+                return {"ok": False, "msg": "plugin_mgr 不可用"}
+            cfg = pm.get_plugin_config("KiraAI_token_stats_plugin")
+            sec = dict(cfg.get("section_balance") or {})
+            sec["balance_sources"] = cleaned
+            cfg["section_balance"] = sec
+            await pm.update_plugin_config("KiraAI_token_stats_plugin", cfg)
+            return {"ok": True, "count": len(cleaned)}
+        except Exception as e:
+            logger.warning(f"[token_stats] 保存余额配置失败: {e}")
+            return {"ok": False, "msg": f"保存失败: {e}"}
+
     @register.api(method="GET", path="/pricing", auth=True)
     async def api_pricing(self):
         return {"rules": self.rules}
@@ -2255,12 +2543,23 @@ tr.cur td{background:rgba(52,211,153,.07)}
 
 <div class="panel" id="p-bal">
   <div class="box">
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
       <button class="btn" id="balRefresh">立即探测</button>
+      <button class="btn" id="balEdit">＋ 添加监测源</button>
       <span style="color:var(--dim);font-size:12px" id="balInfo"></span>
     </div>
-    <table><thead><tr><th>名称</th><th>类型</th><th>余额</th><th>更新时间</th><th>状态</th></tr></thead><tbody id="balBody"></tbody></table>
-    <div class="note">配置入口：插件管理 → KiraAI_token_stats_plugin → 配置 → 「余额监测」。类型说明：auto=按 URL 自动探测官方端点或 One-API 中转站；custom=自定义接口多端点尝试；newapi=New-API 站点；preset=预设扣减（钱包型，填初始额度或当前余额对表）；daily=每日重置积分；rolling=每日累计滚存积分（积分制渠道可把单位切到「积分」）。估算型填「当前余额(对表)」即以上游实际余额校准，此后按价格规则自动扣减。</div>
+    <table><thead><tr><th>名称</th><th>类型</th><th>余额</th><th>更新时间</th><th>状态</th><th style="width:110px">操作</th></tr></thead><tbody id="balBody"></tbody></table>
+    <div class="note">点击「＋ 添加监测源」可视化配置，保存后自动热重载。类型说明：auto=按 URL 自动探测官方端点或 One-API 中转站；custom=自定义接口多端点尝试；newapi=New-API 站点；preset=预设扣减（钱包型）；daily=每日重置积分；rolling=每日累计滚存积分。估算型填「当前余额(对表)」即以上游实际余额校准，此后按价格规则自动扣减。</div>
+  </div>
+</div>
+
+<div id="balEditor" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,.7);z-index:99;align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;width:560px;max-width:94vw;max-height:88vh;overflow:auto">
+    <div style="display:flex;align-items:center;margin-bottom:14px">
+      <h3 style="margin:0;flex:1" id="balEditTitle">添加监测源</h3>
+      <button class="btn" id="balEditClose">✕</button>
+    </div>
+    <div id="balEditForm"></div>
   </div>
 </div>
 
@@ -2327,6 +2626,16 @@ async function loadOv(){
   }
   const er = d.errors||{};
   if (er.last) cards.push('<div class="card errbox"><div class="k">最近出错</div><div class="d">'+esc(er.last)+'</div></div>');
+  const lg = er.log||{};
+  const lgBits = [];
+  for (const c of ['xml','model','tool','net','traceback','other']){
+    if (lg[c]) lgBits.push(c+' '+lg[c]);
+  }
+  if (lgBits.length){
+    let lgTxt = '后台日志错误（近7天）：'+lgBits.join(' · ');
+    if (er.logLast && er.logLast.text) lgTxt += '｜最近：'+esc(er.logLast.text.slice(0,60));
+    cards.push('<div class="card errbox"><div class="k">后台日志 ERROR</div><div class="d">'+lgTxt+'</div></div>');
+  }
   $('#cards').innerHTML = cards.join('');
   loadHist(hist); loadHours();
 }
@@ -2469,17 +2778,89 @@ async function loadPrice(){
     '<div class="note">编辑入口：插件管理 → 配置 → 「价格规则」。匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；峰=工作日 9:00-12:00、14:00-18:00。双币种分别累计，不与 ¥ 混算。</div>'
     : '<div class="note">暂无价格规则，费用显示「—」</div>';
 }
+let balSources = [];
+let balEditIdx = -1;
 async function loadBal(refresh){
   const d = await jget('/balance'+(refresh?'?refresh=1':''));
+  balSources = d.sources||[];
   $('#balInfo').textContent = '轮询间隔 ' + d.interval + ' 分钟';
-  $('#balBody').innerHTML = (d.sources||[]).map(x=>{
+  $('#balBody').innerHTML = balSources.map((x,i)=>{
     const unit = x.currency==='积分' ? '积分' : (d.unit||'元');
     return '<tr><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</td>'+
-    '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td></tr>';
+    '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
+    '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+')">删除</button></td></tr>';
   }).join('') ||
-    '<tr><td colspan="5" class="note">未配置余额监测源（插件配置页 → 余额监测）</td></tr>';
+    '<tr><td colspan="6" class="note">未配置余额监测源，点「＋ 添加监测源」开始</td></tr>';
+}
+const BAL_TYPES = [
+  ['auto','auto · 自动探测（官方端点/One-API 中转站）'],
+  ['custom','custom · 自定义接口'],
+  ['newapi','newapi · New-API 站点'],
+  ['preset','preset · 预设扣减（钱包型）'],
+  ['daily','daily · 每日重置积分'],
+  ['rolling','rolling · 每日累计滚存积分']
+];
+const BAL_FIELDS = {
+  auto: [['url','站点/接口地址','https://api.deepseek.com'],['api_key','API Key','']],
+  custom: [['url','接口地址','https://myproxy.example.com'],['api_key','API Key',''],['json_path','余额字段路径(可选)','balance_infos.0.total_balance']],
+  newapi: [['url','站点地址','https://newapi.example.com'],['api_key','系统访问令牌',''],['api_user','用户ID(纯数字)',''],['quota_conversion','换算比例(默认500000)','500000']],
+  preset: [['anchor_balance','当前余额(对表)',''],['currency','币种(CNY/积分)','CNY']],
+  daily: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表,可选)',''],['currency','币种','积分']],
+  rolling: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表)',''],['currency','币种','积分']]
+};
+function balFieldHtml(f){
+  return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
+    '<input id="bf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
+}
+function balEditOpen(i){
+  balEditIdx = i;
+  const src = (i>=0 && balSources[i]) ? balSources[i] : {name:'',type:'auto',enabled:true};
+  $('#balEditTitle').textContent = i>=0 ? '编辑监测源' : '添加监测源';
+  let html = balFieldHtml(['name','名称',src.name||'']);
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">类型</label><select id="bf_type" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+    BAL_TYPES.map(t=>'<option value="'+t[0]+'"'+(src.type===t[0]?' selected':'')+'>'+esc(t[1])+'</option>').join('')+'</select></div>';
+  html += '<div id="bf_dyn"></div>';
+  html += '<div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim)"><input type="checkbox" id="bf_enabled"'+(src.enabled===false?'':' checked')+'> 启用</label></div>';
+  html += '<div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn" id="bf_cancel">取消</button><button class="btn on" id="bf_save">保存</button></div>';
+  $('#balEditForm').innerHTML = html;
+  $('#bf_name').value = src.name||'';
+  const renderDyn = ()=>{
+    const t = $('#bf_type').value;
+    $('#bf_dyn').innerHTML = (BAL_FIELDS[t]||[]).map(f=>balFieldHtml(f)).join('');
+    (BAL_FIELDS[t]||[]).forEach(f=>{
+      const v = src[f[0]];
+      if(v!=null && v!=='') $('#bf_'+f[0]).value = v;
+    });
+  };
+  renderDyn();
+  $('#bf_type').onchange = renderDyn;
+  $('#bf_cancel').onclick = ()=>{ $('#balEditor').style.display='none'; };
+  $('#bf_save').onclick = async ()=>{
+    const t = $('#bf_type').value;
+    const item = {name:$('#bf_name').value.trim(), type:t, enabled:$('#bf_enabled').checked};
+    if(!item.name){ alert('请填写名称'); return; }
+    (BAL_FIELDS[t]||[]).forEach(f=>{
+      const el = $('#bf_'+f[0]);
+      if(el && el.value.trim()!=='') item[f[0]] = el.value.trim();
+    });
+    if(balEditIdx>=0 && balSources[balEditIdx]) balSources[balEditIdx] = item;
+    else balSources.push(item);
+    const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
+    if(r.ok){ $('#balEditor').style.display='none'; loadBal(false); }
+    else alert('保存失败：'+(r.msg||'未知错误'));
+  };
+  $('#balEditor').style.display='flex';
+}
+async function balDel(i){
+  if(!confirm('删除监测源「'+(balSources[i]?balSources[i].name:'')+'」？')) return;
+  balSources.splice(i,1);
+  const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
+  if(r.ok) loadBal(false);
+  else alert('删除失败：'+(r.msg||'未知错误'));
 }
 $('#balRefresh').onclick = ()=>{ $('#balRefresh').disabled=true; loadBal(true).finally(()=>$('#balRefresh').disabled=false); };
+$('#balEdit').onclick = ()=>balEditOpen(-1);
+$('#balEditClose').onclick = ()=>{ $('#balEditor').style.display='none'; };
 $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent='15'; loadRec(); };
 
 loadOv();
