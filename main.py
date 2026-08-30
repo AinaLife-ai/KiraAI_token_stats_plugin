@@ -104,7 +104,12 @@ _ZP_HOSTS = ("bigmodel", "zhipu")
 # ────────────────────────────────────────────────────────────
 
 def _fmt_num(v):
-    return f"{v:N0}" if v else "0"
+    """千分位格式化（兼容 Python <3.10：N 格式符 3.10+ 才有）"""
+    try:
+        v = int(v or 0)
+    except (TypeError, ValueError):
+        return "0"
+    return f"{v:,}"
 
 
 def _fmt4(v):
@@ -351,10 +356,56 @@ class TokenStatsPlugin(BasePlugin):
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
         self.enable_balance = bool(bal.get("enable_balance", False))
-        interval = bal.get("balance_interval", 60)
-        self.balance_interval = max(5, int(interval) if interval is not None else 60)
+        interval = bal.get("balance_interval", 5)
+        self.balance_interval = max(1, int(interval) if interval is not None else 5)
         sources = bal.get("balance_sources", [])
-        self.balance_sources = sources if isinstance(sources, list) else []
+        # 复制一份再 append，避免直接引用 cfg 原始 list（热重载时重复追加）
+        self.balance_sources = list(sources) if isinstance(sources, list) else []
+        # New-API 站点简易文本格式（对齐 api-balance 插件）：每行 名称;base_url;令牌;用户ID;换算比例(可选)
+        simple_sec = cfg.get("section_balance_newapi_simple", {}) or {}
+        simple_list = simple_sec.get("newapi_sites_simple", [])
+        if isinstance(simple_list, list):
+            for line in simple_list:
+                if not line or not str(line).strip():
+                    continue
+                parts = [p.strip() for p in str(line).split(";")]
+                if len(parts) < 4:
+                    continue
+                name = parts[0] or "未命名站点"
+                base_url = parts[1].rstrip("/")
+                api_key = parts[2]
+                api_user = parts[3]
+                conversion = parts[4] if len(parts) >= 5 and parts[4].strip() else "500000"
+                try:
+                    conversion = float(conversion)
+                except (TypeError, ValueError):
+                    conversion = 500000
+                if not base_url or not api_key or not api_user:
+                    continue
+                self.balance_sources.append({
+                    "name": name,
+                    "type": "newapi",
+                    "url": base_url,
+                    "api_key": api_key,
+                    "api_user": api_user,
+                    "quota_conversion": conversion,
+                    "enabled": True,
+                })
+        # 固定平台快捷配置（对齐 api-balance 插件风格）：启用 + 填 key 即自动并入余额源
+        for key, dname, durl in (
+                ("deepseek", "DeepSeek", "https://api.deepseek.com"),
+                ("moonshot", "月之暗面 Kimi", "https://api.moonshot.cn/v1"),
+                ("siliconflow", "硅基流动", "https://api.siliconflow.cn"),
+                ("zhipu", "智谱", "https://open.bigmodel.cn/api/paas/v4")):
+            sec = cfg.get(f"section_balance_{key}", {}) or {}
+            if sec.get("enabled") and sec.get("api_key"):
+                self.balance_sources.append({
+                    "name": (sec.get("name") or dname).strip(),
+                    "type": "auto",
+                    "url": (sec.get("base_url") or durl).strip(),
+                    "api_key": sec.get("api_key"),
+                    "enabled": True,
+                })
         self.balance_unit = (bal.get("balance_unit", "元") or "元").strip() or "元"
 
         # ── 高级 ──
@@ -600,23 +651,42 @@ class TokenStatsPlugin(BasePlugin):
         return self.source_default
 
     def _resolve_channel_model(self):
-        """尽力从默认 LLM 客户端取 provider/model/host（防御式，失败回退默认值）"""
+        """从默认 LLM 客户端取 provider 名/模型名/host（KiraAI 结构：client.model = ModelInfo）
+        防御式，失败回退默认值"""
         channel, model, host = "默认渠道", "未知", ""
         try:
             client = self.ctx.get_default_llm_client()
-            model = (getattr(client, "model_id", None)
-                     or getattr(client, "model_name", None) or "未知")
-            mcfg = getattr(client, "model_config", None) or {}
-            if not isinstance(mcfg, dict):
-                mcfg = {}
-            base_url = (mcfg.get("base_url") or mcfg.get("baseUrl")
-                        or mcfg.get("url") or mcfg.get("endpoint") or "")
-            if base_url:
-                try:
-                    host = urlparse(base_url).hostname or ""
-                except Exception:
-                    host = ""
-            channel = host or getattr(client, "provider_id", None) or "默认渠道"
+            mi = getattr(client, "model", None)
+            if mi is not None:
+                model = getattr(mi, "model_id", None) or "未知"
+                pname = getattr(mi, "provider_name", None) or ""
+                pcfg = getattr(mi, "provider_config", None) or {}
+                if not isinstance(pcfg, dict):
+                    pcfg = {}
+                base_url = (pcfg.get("base_url") or pcfg.get("baseUrl")
+                            or pcfg.get("url") or pcfg.get("endpoint") or "")
+                if base_url:
+                    try:
+                        host = urlparse(base_url).hostname or ""
+                    except Exception:
+                        host = ""
+                channel = pname or host or "默认渠道"
+            else:
+                # 兜底：直接属性
+                model = (getattr(client, "model_id", None)
+                         or getattr(client, "model_name", None) or "未知")
+                mcfg = getattr(client, "model_config", None) or {}
+                if not isinstance(mcfg, dict):
+                    mcfg = {}
+                base_url = (mcfg.get("base_url") or mcfg.get("baseUrl")
+                            or mcfg.get("url") or mcfg.get("endpoint") or "")
+                if base_url:
+                    try:
+                        host = urlparse(base_url).hostname or ""
+                    except Exception:
+                        host = ""
+                channel = (getattr(client, "provider_id", None)
+                           or getattr(client, "provider_name", None) or host or "默认渠道")
         except Exception:
             pass
         return channel, model, host
@@ -1258,22 +1328,63 @@ class TokenStatsPlugin(BasePlugin):
         except aiohttp.ClientError as e:
             raise RuntimeError(f"网络请求失败: {e}")
 
-    async def _probe_all(self):
+    async def _probe_all(self, wait: bool = False):
+        """探测全部余额源。
+
+        wait=True：若后台轮询正忙，等待其完成（最多 20s）再返回最新状态，
+        避免工具/命令查询拿到旧值；等待超时则返回现有状态不阻塞。
+        网络型源并行探测：单源 8s 超时、整体 15s 超时，防止串行 N×10s 拖住查询。
+        """
         if self._bal_busy:
+            if not wait:
+                return
+            for _ in range(40):
+                if not self._bal_busy:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                logger.warning("[token_stats] 等待余额探测完成超时(20s)，返回现有状态")
             return
         self._bal_busy = True
         try:
-            for src in self.balance_sources:
-                if not src.get("enabled", True):
-                    continue
-                name = src.get("name", "")
-                if not name:
-                    continue
-                if self._is_est(src):
-                    st = self._resolve_balance_state(src)
-                else:
-                    st = await self._probe_one(src)
-                self._bal_states[name] = st
+            est_srcs = [s for s in self.balance_sources
+                        if s.get("enabled", True) and s.get("name") and self._is_est(s)]
+            net_srcs = [s for s in self.balance_sources
+                        if s.get("enabled", True) and s.get("name") and not self._is_est(s)]
+            # 估算型本地推算，不走网络
+            for src in est_srcs:
+                self._bal_states[src.get("name")] = self._resolve_balance_state(src)
+
+            if net_srcs:
+                async def _safe_probe(src):
+                    try:
+                        st = await asyncio.wait_for(self._probe_one(src), timeout=8)
+                    except asyncio.TimeoutError:
+                        st = {"balance": 0, "currency": self._src_currency(src),
+                              "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                              "ok": False, "msg": "探测超时(8s)"}
+                    except Exception as e:
+                        st = {"balance": 0, "currency": self._src_currency(src),
+                              "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                              "ok": False, "msg": str(e)[:160]}
+                    return src.get("name"), st
+
+                tasks = [asyncio.create_task(_safe_probe(s)) for s in net_srcs]
+                done, pending = await asyncio.wait(tasks, timeout=15)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    # 等取消完成，避免事件循环关闭时 Task was destroyed 警告
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for t in done:
+                    try:
+                        name, st = t.result()
+                        if name:
+                            self._bal_states[name] = st
+                    except Exception:
+                        pass
+                if pending:
+                    logger.warning(f"[token_stats] 余额并行探测整体超时(15s)，{len(pending)} 个源未完成")
             self._save_bal_states()
         except Exception as e:
             logger.warning(f"[token_stats] 余额探测异常: {e}")
@@ -1284,7 +1395,7 @@ class TokenStatsPlugin(BasePlugin):
         try:
             while True:
                 await self._probe_all()
-                await asyncio.sleep(max(300, self.balance_interval * 60))
+                await asyncio.sleep(max(60, self.balance_interval * 60))
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1372,7 +1483,7 @@ class TokenStatsPlugin(BasePlugin):
         if key == "balance":
             if not self.enable_balance or not self.balance_sources:
                 return "未启用余额监测或未配置余额源（插件配置页 → 余额监测）"
-            await self._probe_all()
+            await self._probe_all(wait=True)
             lines = ["💳 账户余额："]
             for src in self.balance_sources:
                 if not src.get("enabled", True):
@@ -1578,6 +1689,9 @@ class TokenStatsPlugin(BasePlugin):
         if not self.enabled:
             return "Token 统计未启用（插件配置页 → 基础设置）"
         try:
+            # 工具查询余额时先即时探测，保证拿到最新值（与 api-balance 插件行为一致）
+            if self.tool_include_balance and self.enable_balance and self.balance_sources:
+                await self._probe_all(wait=True)
             return self._build_summary_text(range or "")
         except Exception as e:
             logger.exception("[token_stats] tool query failed")
@@ -1962,7 +2076,7 @@ class TokenStatsPlugin(BasePlugin):
     async def api_balance(self, request: Request):
         """/balance?refresh=1 → 先强制即时探测再返回"""
         if (request.query_params.get("refresh") or "") == "1":
-            await self._probe_all()
+            await self._probe_all(wait=True)
         sources = []
         for src in self.balance_sources:
             if not src.get("enabled", True):
@@ -2384,9 +2498,9 @@ _WIDGET_HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
 body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
 #w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
-#w.drag{cursor:move}
 #w.dragging{opacity:.85;border-color:var(--acc)}
 .head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}
 .head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none}
@@ -2402,7 +2516,7 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 .bal{font-size:11.5px}
 .bal .bname{color:var(--dim);max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .foot{padding:8px 12px;border-top:1px solid rgba(51,65,85,.5);display:flex;gap:6px;align-items:center;justify-content:flex-end}
-.foot .st{font-size:10px;color:var(--dim)}
+.foot .st{font-size:10px;color:var(--dim);margin-right:auto}
 .foot .go{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;text-decoration:none}
 .foot .go:hover{border-color:var(--acc)}
 /* 折叠小球 */
@@ -2414,6 +2528,14 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 #w.compact{width:230px}
 #w.compact .row{font-size:11px;padding:2px 0}
 #w.compact .bal .bname{max-width:80px}
+/* 独立窗口（popup）模式：卡片填满窗口 */
+body.popup{background:#0f172a}
+body.popup #w{left:0;top:0;width:100%;height:100%;border:none;border-radius:0;box-shadow:none;display:flex;flex-direction:column}
+body.popup .body{flex:1;overflow:auto}
+body.popup .head{cursor:default}
+/* 提示条 */
+#toast{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);background:#0b1220;border:1px solid var(--line);color:var(--fg);font-size:11px;padding:6px 12px;border-radius:8px;opacity:0;transition:.2s;pointer-events:none;z-index:10000;white-space:nowrap}
+#toast.show{opacity:1}
 </style>
 </head>
 <body>
@@ -2421,7 +2543,9 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
     <span class="t" id="title">Token 用量</span>
+    <button class="hbtn" id="popout" title="弹出独立窗口">⧉</button>
     <button class="hbtn" id="fold" title="折叠/展开">–</button>
+    <button class="hbtn" id="close" title="关闭窗口" style="display:none">✕</button>
   </div>
   <div class="body" id="body">
     <div class="row"><span class="k">会话</span><span class="v" id="sessV">—</span></div>
@@ -2434,9 +2558,11 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
   </div>
   <div class="foot" id="foot">
     <span class="st" id="upd">—</span>
-    <a class="go" href="./stats" target="_blank">完整看板</a>
+    <a class="go" href="./stats" target="_blank" rel="noopener">完整看板</a>
+    <a class="go" href="stats-widget" target="_blank" rel="noopener" id="tabLink">新标签</a>
   </div>
 </div>
+<div id="toast"></div>
 <script>
 const API = '/api/plugin/KiraAI_token_stats_plugin';
 const $ = s => document.querySelector(s);
@@ -2445,16 +2571,34 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
   return Math.round(v/1e9)+'B'; };
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const isPopup = !!window.opener;
 let collapsed = localStorage.getItem('tsWidgetCollapsed')==='1';
 let compact = localStorage.getItem('tsWidgetCompact')==='1';
+let toastTimer = null;
+function toast(msg){
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.remove('show'), 2600);
+}
 applyMode();
 $('#fold').onclick = ()=>{ collapsed=!collapsed; localStorage.setItem('tsWidgetCollapsed', collapsed?'1':'0'); applyMode(); };
+$('#popout').onclick = ()=>{
+  const w = window.open(location.pathname, 'tsWidgetPopup', 'popup=yes,width=360,height=500,resizable=yes');
+  if(!w) toast('弹窗被拦截：请允许本站弹窗，或用底部「新标签」打开');
+};
+$('#close').onclick = ()=>{ try{ window.close(); }catch(e){ toast('无法自动关闭，请手动关闭窗口'); } };
 function applyMode(){
   const w = $('#w');
   w.classList.toggle('ball', collapsed);
   w.classList.toggle('compact', !collapsed && compact);
   $('#fold').textContent = collapsed ? '+' : '–';
   $('#title').textContent = collapsed ? '☰' : 'Token 用量';
+}
+if(isPopup){
+  document.body.classList.add('popup');
+  $('#close').style.display = '';
+  $('#popout').style.display = 'none';
+  $('#fold').style.display = 'none';
+  $('#tabLink').style.display = 'none';
 }
 async function tick(){
   try{
@@ -2468,7 +2612,6 @@ async function tick(){
     $('#costV').textContent = costBits.length?costBits.join(' + '):'—';
     $('#ioV').textContent = fmt4((r.today||{}).i||0)+' / '+fmt4((r.today||{}).o||0);
     $('#modelV').textContent = esc(d.model||'—');
-    // 余额
     let balHtml='';
     try{
       const b = await fetch(API+'/balance',{cache:'no-store'}).then(r=>r.json());
@@ -2482,26 +2625,38 @@ async function tick(){
     $('#upd').textContent = new Date().toTimeString().slice(0,8);
   }catch(e){ $('#upd').textContent = '连接失败'; }
 }
-/* 拖动 */
-(function(){
-  const w = $('#w'), hd = $('#hd');
-  let sx,sy,ox,oy,drag=false;
-  hd.addEventListener('mousedown',e=>{
-    if(e.target.tagName==='BUTTON') return;
-    drag=true; w.classList.add('dragging');
-    sx=e.clientX; sy=e.clientY;
-    const r=w.getBoundingClientRect(); ox=r.left; oy=r.top;
-  });
-  document.addEventListener('mousemove',e=>{
-    if(!drag) return;
-    w.style.left = Math.max(0,Math.min(window.innerWidth-40, ox+e.clientX-sx))+'px';
-    w.style.top = Math.max(0,Math.min(window.innerHeight-40, oy+e.clientY-sy))+'px';
-  });
-  document.addEventListener('mouseup',()=>{ drag=false; w.classList.remove('dragging'); });
-})();
+/* 拖动（仅 iframe 内嵌模式；独立窗口由浏览器标题栏拖动） */
+if(!isPopup){
+  (function(){
+    const w = $('#w'), hd = $('#hd');
+    let sx,sy,ox,oy,drag=false;
+    let pos=null; try{ pos=JSON.parse(localStorage.getItem('tsWidgetPos')||'null'); }catch(e){}
+    const cx = (pos && typeof pos.x==='number') ? pos.x : 16;
+    const cy = (pos && typeof pos.y==='number') ? pos.y : 16;
+    w.style.left = cx+'px'; w.style.top = cy+'px';
+    hd.addEventListener('mousedown',e=>{
+      if(e.target.tagName==='BUTTON') return;
+      drag=true; w.classList.add('dragging');
+      sx=e.clientX; sy=e.clientY;
+      const r=w.getBoundingClientRect(); ox=r.left; oy=r.top;
+    });
+    document.addEventListener('mousemove',e=>{
+      if(!drag) return;
+      const nx=Math.max(0,Math.min(window.innerWidth-40, ox+e.clientX-sx));
+      const ny=Math.max(0,Math.min(window.innerHeight-40, oy+e.clientY-sy));
+      w.style.left=nx+'px'; w.style.top=ny+'px';
+    });
+    document.addEventListener('mouseup',()=>{
+      if(!drag) return;
+      drag=false; w.classList.remove('dragging');
+      try{ localStorage.setItem('tsWidgetPos', JSON.stringify({x:parseInt(w.style.left,10),y:parseInt(w.style.top,10)})); }catch(e){}
+    });
+  })();
+}
 tick();
 setInterval(tick, 10000);
 </script>
 </body>
 </html>
 """
+
