@@ -342,6 +342,13 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 <details>
 <summary>点击展开</summary>
 
+### v1.2.5（2026-08-31）
+
+- **修复查询崩溃**：`_fmt_num` 千分位格式符 `N0` 需 Python 3.10+，低版本直接 ValueError 导致工具查询全挂，改为 `f"{v:,}"` 全版本兼容
+- **修复渠道/模型显示未知**：`_resolve_channel_model` 读错层级（KiraAI 的 LLMModelClient 结构是 `client.model = ModelInfo`），改为正确读取 `model.model_id` / `model.provider_name` / `provider_config.base_url`，自动显示真实模型名与渠道名
+- **余额轮询默认 5 分钟**（最小 1 分钟）；工具/命令查询余额时先即时探测，保证返回最新值（与 api-balance 插件行为一致）
+- **余额配置模板化**：新增 DeepSeek / Kimi / 硅基流动 / 智谱四个官方平台快捷分区，填 API Key 即自动并入余额监测（对齐 api-balance 插件风格）；自定义/中转站仍走「余额监测源」高级 JSON
+
 ### v1.2.4（2026-08-31）
 
 - **群聊默认来源标签 qchat → gm**：`source_group` 默认值对齐 KiraAI 框架会话类型标准（`qq:gm:xxx`），避免来源标签与 sid 命名不一致；schema/README/工具描述同步更新。已配置过 source_group 的用户不受影响（仅默认值变更）
