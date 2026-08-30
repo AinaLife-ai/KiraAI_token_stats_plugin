@@ -95,12 +95,6 @@
         "name": "单结果模板",
         "default": "📊 {provider}：{result}",
         "hint": "支持 {provider} {result} 占位符"
-      },
-      "command_all_template": {
-        "type": "markdown",
-        "name": "汇总模板",
-        "default": "📊 Token 用量统计：\n{results}",
-        "hint": "支持 {results} 占位符"
       }
     }
   },
@@ -172,6 +166,12 @@
         "default": false,
         "hint": "开启后按间隔轮询余额源，工具/命令/页面可查余额"
       },
+      "balance_ssl_verify": {
+        "type": "switch",
+        "name": "校验 HTTPS 证书",
+        "default": false,
+        "hint": "默认关闭（兼容自签证书中转站，注意中间人风险）。开启后余额探测请求校验 TLS 证书，官方端点建议开启，自签证书的自建中转站请保持关闭"
+      },
       "balance_interval": {
         "type": "integer",
         "name": "轮询间隔（分钟）",
@@ -190,6 +190,25 @@
         "name": "余额监测源",
         "default": [],
         "hint": "数组，每项公共字段 {name, type: auto/custom/newapi/preset/daily/rolling, url, api_key, json_path(可选), currency(可选：显示币种，daily/rolling 默认积分), enabled}。auto=按 URL 自动探测（DeepSeek/Moonshot/硅基/智谱官方端点或 One-API 系中转站）；custom=填 Base 地址自动尝试常见余额接口，或直接填完整余额接口 URL+json_path；newapi=New-API 站点专属（api_user 必填纯数字用户ID，quota_conversion 可选默认500000）；preset=预设扣减钱包型；daily=每日重置积分（daily_quota+refresh_time）；rolling=每日累计滚存积分（daily_quota+refresh_time+anchor_balance 对表基准）。估算型（preset/daily/rolling）核心字段：anchor_balance=当前在后台看到的真实余额（对表），anchor_at=对表时刻 ISO 格式（如 2026-08-31T10:00:00，填写 anchor_balance 时自动取当前时间），此后按价格规则自动扣减，改价即时重估；daily_quota=每日额度；refresh_time=每日刷新时刻 HH:mm 默认00:00。注意：api_key 为明文存储"
+      }
+    }
+  },
+  "section_widget": {
+    "type": "section",
+    "name": "挂件",
+    "collapsed": true,
+    "fields": {
+      "enable_widget": {
+        "type": "switch",
+        "name": "启用挂件",
+        "default": false,
+        "hint": "默认关闭。开启后侧边栏出现「Token 挂件」页：迷你悬浮卡片（实时会话/今日 tokens、费用、余额），可拖动、可折叠成小球，适合浏览器小窗钉角落常驻"
+      },
+      "widget_compact": {
+        "type": "switch",
+        "name": "紧凑模式",
+        "default": false,
+        "hint": "挂件卡片更窄、字号更小，减少遮挡"
       }
     }
   },
