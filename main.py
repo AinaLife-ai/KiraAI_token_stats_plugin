@@ -362,6 +362,9 @@ class TokenStatsPlugin(BasePlugin):
         self.max_log_size = int(max_log) if max_log is not None else 100000
         idle = adv.get("session_idle_minutes", 30)
         self.session_idle_minutes = max(1, int(idle) if idle is not None else 30)
+        expire = adv.get("session_expire_minutes", 30)
+        # 会话内临时状态（来源继承/错误游标）无活动清理时间，秒
+        self.session_expire_seconds = max(60, int(expire) if expire is not None else 30) * 60
 
         # ── 挂件（WebUI 悬浮小卡片，默认关闭）──
         wid = cfg.get("section_widget", {})
@@ -370,7 +373,6 @@ class TokenStatsPlugin(BasePlugin):
 
         # ── 余额探测 ssl ──
         self.balance_ssl_verify = bool(bal.get("balance_ssl_verify", False))
-        self._ssl_connector = None
 
         # ── 运行时状态 ──
         self._data_dir: Path = None  # initialize 时赋值
@@ -630,6 +632,17 @@ class TokenStatsPlugin(BasePlugin):
             return True
         return user_id in self.allowed_users
 
+    def _sweep_stale_sessions(self):
+        """清理长期无活动的会话临时状态（来源继承/错误游标），防内存缓慢增长"""
+        try:
+            cutoff = time.time() - self.session_expire_seconds
+            stale = [sid for sid, p in self._pending.items() if p.get("at", 0) < cutoff]
+            for sid in stale:
+                self._pending.pop(sid, None)
+                self._err_cursor.pop(sid, None)
+        except Exception:
+            pass
+
     # ── 事件钩子 ──
 
     @on.im_message(priority=Priority.HIGH)
@@ -638,6 +651,7 @@ class TokenStatsPlugin(BasePlugin):
         sid = self._sid(event)
         text = "".join(e.text for e in event.message.chain if isinstance(e, Text))
         if text:
+            self._sweep_stale_sessions()
             self._pending[sid] = {"text": text, "source": None, "steps": 0, "at": time.time()}
 
         if not self.enable_command:
@@ -696,6 +710,8 @@ class TokenStatsPlugin(BasePlugin):
         pending = self._pending.get(sid)
         if pending is None:
             pending = self._pending[sid] = {"text": "", "source": None, "steps": 0, "at": time.time()}
+        else:
+            pending["at"] = time.time()  # 活动触碰：续轮不视为过期
         errs, self._err_cursor[sid] = _err_scan(text, self._err_cursor.get(sid))
         if errs > 0:
             self._last_err_text = self._err_snippet(text)
@@ -1974,7 +1990,13 @@ class TokenStatsPlugin(BasePlugin):
                 f"<p>开启方式：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 启用挂件。<br>"
                 f"开启后此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球），适合浏览器小窗钉角落。</p>"
                 f"</body></html>")
-        return PluginPage.from_html(_WIDGET_HTML)
+        # 后端「紧凑模式」配置注入为前端默认值；localStorage 有记忆时以用户为准
+        html = _WIDGET_HTML.replace(
+            "let compact = localStorage.getItem('tsWidgetCompact')==='1';",
+            "let _c = localStorage.getItem('tsWidgetCompact'); let compact = _c === null ? "
+            + ("true" if self.widget_compact else "false") + " : _c === '1';",
+        )
+        return PluginPage.from_html(html)
 _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
