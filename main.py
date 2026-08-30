@@ -359,7 +359,8 @@ class TokenStatsPlugin(BasePlugin):
         interval = bal.get("balance_interval", 5)
         self.balance_interval = max(1, int(interval) if interval is not None else 5)
         sources = bal.get("balance_sources", [])
-        self.balance_sources = sources if isinstance(sources, list) else []
+        # 复制一份再 append，避免直接引用 cfg 原始 list（热重载时重复追加）
+        self.balance_sources = list(sources) if isinstance(sources, list) else []
         # New-API 站点简易文本格式（对齐 api-balance 插件）：每行 名称;base_url;令牌;用户ID;换算比例(可选)
         simple_sec = cfg.get("section_balance_newapi_simple", {}) or {}
         simple_list = simple_sec.get("newapi_sites_simple", [])
@@ -1368,10 +1369,13 @@ class TokenStatsPlugin(BasePlugin):
                               "ok": False, "msg": str(e)[:160]}
                     return src.get("name"), st
 
-                tasks = [asyncio.ensure_future(_safe_probe(s)) for s in net_srcs]
+                tasks = [asyncio.create_task(_safe_probe(s)) for s in net_srcs]
                 done, pending = await asyncio.wait(tasks, timeout=15)
                 for t in pending:
                     t.cancel()
+                if pending:
+                    # 等取消完成，避免事件循环关闭时 Task was destroyed 警告
+                    await asyncio.gather(*pending, return_exceptions=True)
                 for t in done:
                     try:
                         name, st = t.result()
