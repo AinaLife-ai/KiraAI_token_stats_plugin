@@ -82,7 +82,7 @@
         "type": "switch",
         "name": "全字匹配",
         "default": false,
-        "hint": "开启后来源/渠道/站点名匹配需全字相等，关闭则包含匹配"
+        "hint": "对「价格规则」启用的匹配行为：开启后 URL/模型名/渠道名需全字相等，关闭则包含匹配（来源关键词归类与渠道 URL 探测不受影响）"
       },
       "denied_message": {
         "type": "string",
@@ -221,7 +221,7 @@
         "type": "integer",
         "name": "日志保留条数",
         "default": 100000,
-        "minimum": 1000,
+        "minimum": 0,
         "hint": "usage-log.jsonl 超过此条数时自动裁剪（保留最新）。0=不裁剪"
       },
       "session_idle_minutes": {
@@ -230,6 +230,13 @@
         "default": 30,
         "minimum": 1,
         "hint": "\"本次会话\"范围统计的滚动窗口：超过该分钟无新记录则重新计一轮会话"
+      },
+      "session_expire_minutes": {
+        "type": "integer",
+        "name": "会话状态过期（分钟）",
+        "default": 30,
+        "minimum": 1,
+        "hint": "每个会话的临时状态（上次消息文本、错误计数游标）超过该时长无活动自动清理，防止长期运行内存缓慢增长"
       }
     }
   }
