@@ -94,10 +94,10 @@ LOG_ERR_LABELS = {"xml": "XML解析", "model": "模型调用", "tool": "工具�
 
 # ── 工具结果失败判定（on.tool_result 钩子）──
 # tool 返回 error / 权限 denied / 超时 / 调用失败等——LLM 白烧 token 的典型
-# 注意：error 字段值须为非零数字/非空字符串/true 才算失败（{"error": 0} 是很多 API 的成功约定）；
-# 不匹配裸 403（"第403条"会误报），只匹配 403 Forbidden / HTTP 403 / status 403
+# 注意：error 字段值须为非零数字（含负数/小数）/非空字符串/true 才算失败
+# （{"error": 0} 是很多 API 的成功约定）；不匹配裸 403（"第403条"会误报）
 TOOL_ERR_RE = re.compile(
-    r"\{['\"]?error['\"]?\s*:\s*(?:[1-9]\d*|['\"][^'\"]+['\"]|true|True)\s*[,}]|"
+    r"\{['\"]?error['\"]?\s*:\s*(?:-?(?:[1-9]\d*(?:\.\d+)?|0\.\d*[1-9]\d*)|['\"][^'\"]+['\"]|true|True)\s*[,}]|"
     r"Error\s*:|Permission denied|Access denied|权限不足|无权限|拒绝访问|"
     r"Forbidden|HTTP\s*403|status\s*[=:]\s*403|not allowed|timed out|超时|"
     r"Failed to call tool|not implemented|"
@@ -572,8 +572,8 @@ class TokenStatsPlugin(BasePlugin):
             except asyncio.CancelledError:
                 pass
             self._log_err_task = None
-        # 退出前落盘错误统计（热重载/重启不丢）
-        self._maybe_save_err_stats()
+        # 退出前强制落盘错误统计（绕过节流，热重载/重启不丢）
+        self._maybe_save_err_stats(force=True)
 
     # ── 历史加载 ──
 
@@ -1523,6 +1523,8 @@ class TokenStatsPlugin(BasePlugin):
     def _log_err_scan_file(self, path: Path, pos: int):
         """增量扫描单个日志文件：返回 (新游标, 新增计数, 最新一条)
 
+        二进制模式读取：tell()/seek() 返回真实字节偏移（Python 3.10-3.12 文本模式
+        tell() 返回不透明 cookie，不能与 st_size 直接比较，会误判截断）。
         只读打开 + FILE_SHARE_DELETE 共享模式（Windows）：
         不独占文件，不阻塞 KiraAI 的 RotatingFileHandler 轮转 rename。
         句柄生命周期仅限本次扫描（毫秒级），读完立即关闭。
@@ -1540,7 +1542,8 @@ class TokenStatsPlugin(BasePlugin):
                 return pos, count, last
             try:
                 f.seek(pos)
-                for line in f:
+                for raw in f:
+                    line = raw.decode("utf-8", errors="replace")
                     m = LOG_ERROR_RE.match(line)
                     if m:
                         count += 1
@@ -1560,7 +1563,7 @@ class TokenStatsPlugin(BasePlugin):
     @staticmethod
     def _open_log_shared(path: Path):
         """以共享删除模式打开日志文件（Windows 用 CreateFileW + FILE_SHARE_DELETE，
-        避免阻塞 RotatingFileHandler 轮转；其他平台普通只读打开）。"""
+        避免阻塞 RotatingFileHandler 轮转；其他平台普通只读打开）。二进制模式。"""
         try:
             if os.name == "nt":
                 import ctypes
@@ -1584,8 +1587,8 @@ class TokenStatsPlugin(BasePlugin):
                 if fd < 0:
                     ctypes.windll.kernel32.CloseHandle(handle)
                     return None
-                return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
-            return open(path, "r", encoding="utf-8", errors="replace")
+                return os.fdopen(fd, "rb")
+            return open(path, "rb")
         except Exception:
             return None
 
@@ -1616,10 +1619,15 @@ class TokenStatsPlugin(BasePlugin):
         try:
             if not (_HAS_DATA_PATH and get_data_path is not None):
                 return
-            d = get_data_path()
+            d = Path(get_data_path())
             if not d.is_dir():
                 return
-            files = sorted(d.glob("log.log*"))
+            # 显式匹配 log.log + log.log.[0-9]*（RotatingFileHandler 轮转命名），
+            # 防未来轮转策略变化误扫无关文件
+            files = sorted(
+                [p for p in d.glob("log.log") if p.is_file()]
+                + [p for p in d.glob("log.log.[0-9]*") if p.is_file()]
+            )
             if not files:
                 return
             seen = set()
@@ -1651,10 +1659,10 @@ class TokenStatsPlugin(BasePlugin):
         except Exception as e:
             logger.warning(f"[token_stats] 日志扫描失败: {e}")
 
-    def _maybe_save_err_stats(self):
-        """错误统计持久化（节流 30s）：热重载/重启不丢"""
+    def _maybe_save_err_stats(self, force: bool = False):
+        """错误统计持久化（节流 30s，force 时绕过节流）：热重载/重启不丢"""
         now = time.time()
-        if now - self._err_save_at < 30:
+        if not force and now - self._err_save_at < 30:
             return
         self._err_save_at = now
         try:
@@ -1663,6 +1671,8 @@ class TokenStatsPlugin(BasePlugin):
                 "log_last": self._log_err_last,
                 "tool_hist": self._tool_err_hist,
                 "tool_last": self._tool_err_last,
+                # 游标一并持久化：热重载后新实例从原游标续扫，历史 ERROR 不重复计数
+                "log_inodes": {str(k): v for k, v in self._log_err_inodes.items()},
             }
             p = self._data_dir / "err_stats.json"
             p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1670,7 +1680,7 @@ class TokenStatsPlugin(BasePlugin):
             pass
 
     def _load_err_stats(self):
-        """加载持久化的错误统计（热重载/重启恢复）"""
+        """加载持久化的错误统计与扫描游标（热重载/重启恢复）"""
         try:
             p = self._data_dir / "err_stats.json"
             if not p.exists():
@@ -1685,6 +1695,15 @@ class TokenStatsPlugin(BasePlugin):
                     self._tool_err_hist = data["tool_hist"]
                 if isinstance(data.get("tool_last"), dict):
                     self._tool_err_last = data["tool_last"]
+                if isinstance(data.get("log_inodes"), dict):
+                    inodes = {}
+                    for k, v in data["log_inodes"].items():
+                        try:
+                            kk = int(k)
+                        except (TypeError, ValueError):
+                            kk = k
+                        inodes[kk] = v
+                    self._log_err_inodes = inodes
         except Exception:
             pass
 
