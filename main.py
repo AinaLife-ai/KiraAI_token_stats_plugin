@@ -381,7 +381,7 @@ class TokenStatsPlugin(BasePlugin):
                     conversion = 500000
                 if not base_url or not api_key or not api_user:
                     continue
-                self.balance_sources.insert(0, {
+                self.balance_sources.append({
                     "name": name,
                     "type": "newapi",
                     "url": base_url,
@@ -398,7 +398,7 @@ class TokenStatsPlugin(BasePlugin):
                 ("zhipu", "智谱", "https://open.bigmodel.cn/api/paas/v4")):
             sec = cfg.get(f"section_balance_{key}", {}) or {}
             if sec.get("enabled") and sec.get("api_key"):
-                self.balance_sources.insert(0, {
+                self.balance_sources.append({
                     "name": (sec.get("name") or dname).strip(),
                     "type": "auto",
                     "url": (sec.get("base_url") or durl).strip(),
@@ -1327,22 +1327,60 @@ class TokenStatsPlugin(BasePlugin):
         except aiohttp.ClientError as e:
             raise RuntimeError(f"网络请求失败: {e}")
 
-    async def _probe_all(self):
+    async def _probe_all(self, wait: bool = False):
+        """探测全部余额源。
+
+        wait=True：若后台轮询正忙，等待其完成（最多 20s）再返回最新状态，
+        避免工具/命令查询拿到旧值；等待超时则返回现有状态不阻塞。
+        网络型源并行探测：单源 8s 超时、整体 15s 超时，防止串行 N×10s 拖住查询。
+        """
         if self._bal_busy:
+            if not wait:
+                return
+            for _ in range(40):
+                if not self._bal_busy:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                logger.warning("[token_stats] 等待余额探测完成超时(20s)，返回现有状态")
             return
         self._bal_busy = True
         try:
-            for src in self.balance_sources:
-                if not src.get("enabled", True):
-                    continue
-                name = src.get("name", "")
-                if not name:
-                    continue
-                if self._is_est(src):
-                    st = self._resolve_balance_state(src)
-                else:
-                    st = await self._probe_one(src)
-                self._bal_states[name] = st
+            est_srcs = [s for s in self.balance_sources
+                        if s.get("enabled", True) and s.get("name") and self._is_est(s)]
+            net_srcs = [s for s in self.balance_sources
+                        if s.get("enabled", True) and s.get("name") and not self._is_est(s)]
+            # 估算型本地推算，不走网络
+            for src in est_srcs:
+                self._bal_states[src.get("name")] = self._resolve_balance_state(src)
+
+            if net_srcs:
+                async def _safe_probe(src):
+                    try:
+                        st = await asyncio.wait_for(self._probe_one(src), timeout=8)
+                    except asyncio.TimeoutError:
+                        st = {"balance": 0, "currency": self._src_currency(src),
+                              "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                              "ok": False, "msg": "探测超时(8s)"}
+                    except Exception as e:
+                        st = {"balance": 0, "currency": self._src_currency(src),
+                              "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                              "ok": False, "msg": str(e)[:160]}
+                    return src.get("name"), st
+
+                tasks = [asyncio.ensure_future(_safe_probe(s)) for s in net_srcs]
+                done, pending = await asyncio.wait(tasks, timeout=15)
+                for t in pending:
+                    t.cancel()
+                for t in done:
+                    try:
+                        name, st = t.result()
+                        if name:
+                            self._bal_states[name] = st
+                    except Exception:
+                        pass
+                if pending:
+                    logger.warning(f"[token_stats] 余额并行探测整体超时(15s)，{len(pending)} 个源未完成")
             self._save_bal_states()
         except Exception as e:
             logger.warning(f"[token_stats] 余额探测异常: {e}")
@@ -1441,7 +1479,7 @@ class TokenStatsPlugin(BasePlugin):
         if key == "balance":
             if not self.enable_balance or not self.balance_sources:
                 return "未启用余额监测或未配置余额源（插件配置页 → 余额监测）"
-            await self._probe_all()
+            await self._probe_all(wait=True)
             lines = ["💳 账户余额："]
             for src in self.balance_sources:
                 if not src.get("enabled", True):
@@ -1649,7 +1687,7 @@ class TokenStatsPlugin(BasePlugin):
         try:
             # 工具查询余额时先即时探测，保证拿到最新值（与 api-balance 插件行为一致）
             if self.tool_include_balance and self.enable_balance and self.balance_sources:
-                await self._probe_all()
+                await self._probe_all(wait=True)
             return self._build_summary_text(range or "")
         except Exception as e:
             logger.exception("[token_stats] tool query failed")
@@ -2034,7 +2072,7 @@ class TokenStatsPlugin(BasePlugin):
     async def api_balance(self, request: Request):
         """/balance?refresh=1 → 先强制即时探测再返回"""
         if (request.query_params.get("refresh") or "") == "1":
-            await self._probe_all()
+            await self._probe_all(wait=True)
         sources = []
         for src in self.balance_sources:
             if not src.get("enabled", True):
