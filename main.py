@@ -20,12 +20,13 @@
 
 import asyncio
 import json
-import math
 import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
+
+from fastapi import Request
 
 from core.plugin import BasePlugin, logger, on, Priority, register
 from core.plugin.plugin_registry import PluginPage, PageMenu
@@ -302,7 +303,7 @@ class TokenStatsPlugin(BasePlugin):
         if self.enable_balance and self.balance_sources and _HAS_AIOHTTP:
             self._bal_task = asyncio.create_task(self._balance_loop())
             logger.info(f"[token_stats] 余额轮询已启动（间隔 {self.balance_interval} 分钟）")
-        elif not _HAS_AIOHTTP:
+        elif self.enable_balance and self.balance_sources and not _HAS_AIOHTTP:
             logger.warning("[token_stats] aiohttp 未安装，余额监测不可用（pip install aiohttp）")
 
         logger.info("[token_stats] Token 用量统计已就绪")
@@ -323,10 +324,7 @@ class TokenStatsPlugin(BasePlugin):
         self._hours.clear()
         for rec in _read_jsonl(self._log_path):
             self._apply_rec(rec, load=True)
-        logger.info(f"[token_stats] 已加载历史 {len(self._days)} 天 / {self._days_total()} tokens")
-
-    def _days_total(self):
-        return sum(d["v"] for d in self._days.values())
+        logger.info(f"[token_stats] 已加载历史 {len(self._days)} 天 / {sum(d['v'] for d in self._days.values())} tokens")
 
     def _apply_rec(self, rec: dict, load: bool = False):
         try:
@@ -376,7 +374,6 @@ class TokenStatsPlugin(BasePlugin):
         if agg is None:
             agg = slots[1 if peak else 0] = {"i": 0, "o": 0, "c": 0}
         agg["i"] += rec["i"]; agg["o"] += rec["o"]; agg["c"] += rec["c"]
-        s["e"] = s.get("e", 0)
 
     # ── 余额状态 ──
 
@@ -512,14 +509,12 @@ class TokenStatsPlugin(BasePlugin):
 
         sid = self._sid(event)
 
-        # 错误统计：只扫本轮新增文本段（工具循环不再重复累计同一段）
+        # 错误统计
         text = (resp.text_response or "") or ""
         pending = self._pending.get(sid)
         if pending is None:
             pending = self._pending[sid] = {"text": "", "source": None, "steps": 0, "at": time.time()}
-        errs = 0
-        if text:
-            errs = len(ERROR_TAG_RE.findall(text))
+        errs = len(ERROR_TAG_RE.findall(text)) if text else 0
         if errs > 0:
             self._session_err += errs
             self._last_err_text = self._err_snippet(text)
@@ -599,11 +594,7 @@ class TokenStatsPlugin(BasePlugin):
                 if rule is None:
                     continue
                 matched = True
-                off, peak = slots[0], slots[1]
-                # 峰谷判定需要具体时间，这里用当日峰谷近似拆分：
-                # 实际精确计价走逐条记录（/analytics），范围成本用峰谷槽聚合
-                for is_peak in (False, True):
-                    agg = peak if is_peak else off
+                for is_peak, agg in ((False, slots[0]), (True, slots[1])):
                     if agg is None:
                         continue
                     pk = bool(rule.get("peak_enabled", True)) and is_peak
@@ -877,11 +868,11 @@ class TokenStatsPlugin(BasePlugin):
         headers = {}
         if api_key:
             headers["Authorization"] = "Bearer " + api_key
+        timeout = aiohttp.ClientTimeout(total=10)
         try:
             connector = aiohttp.TCPConnector(resolver=ThreadedResolver(), ssl=False)
         except Exception:
             connector = None
-        timeout = aiohttp.ClientTimeout(total=10)
         try:
             if connector is not None:
                 async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -999,7 +990,7 @@ class TokenStatsPlugin(BasePlugin):
         if key in RANGES:
             text = self._build_summary_text(key)
             return self.cmd_success_template.format(provider=RANGE_LABELS[key], result=text)
-        if key in ("balance", "余额"):
+        if key == "balance":
             if not self.enable_balance or not self.balance_sources:
                 return "未启用余额监测或未配置余额源（插件配置页 → 余额监测）"
             await self._probe_all()
@@ -1046,7 +1037,7 @@ class TokenStatsPlugin(BasePlugin):
             logger.exception("[token_stats] tool query failed")
             return f"查询失败：{e}"
 
-    # ── WebUI API ──
+    # ── WebUI API（FastAPI 参数注入：query 参数按签名自动解析）──
 
     @register.api(method="GET", path="/stats", auth=True)
     async def api_stats(self):
@@ -1106,18 +1097,9 @@ class TokenStatsPlugin(BasePlugin):
         }
 
     @register.api(method="GET", path="/history", auth=True)
-    async def api_history(self):
+    async def api_history(self, request: Request):
         """/history?day=YYYY-MM-DD → 单天按小时；否则全部按天"""
-        day = None
-        try:
-            from urllib.parse import parse_qs
-            from aiohttp.web import Request
-        except Exception:
-            pass
-        # 从 query 取参数（框架传 query 字符串）
-        query = getattr(self, "_last_query", "") or ""
-        qs = parse_qs(query)
-        day = qs.get("day", [None])[0]
+        day = request.query_params.get("day")
         if day and re.match(r"^\d{4}-\d{2}-\d{2}$", day):
             hours = [{"h": i, **h} for i, h in enumerate(self._hours.get(day, []) or []) if h]
             return {"day": day, "hours": hours}
@@ -1125,13 +1107,10 @@ class TokenStatsPlugin(BasePlugin):
         return {"days": days}
 
     @register.api(method="GET", path="/records", auth=True)
-    async def api_records(self):
-        """/records?n=15&name= → 最近 n 轮（含费用）；name 空=全部，all=汇总"""
-        n = 15
-        from urllib.parse import parse_qs
-        qs = parse_qs(self._last_query or "")
+    async def api_records(self, request: Request):
+        """/records?n=15 → 最近 n 轮（含费用），倒序"""
         try:
-            n = max(1, min(100, int((qs.get("n", ["15"])[0] or 15))))
+            n = max(1, min(100, int(request.query_params.get("n", "15") or 15)))
         except Exception:
             n = 15
         recs = _read_jsonl(self._log_path)
@@ -1156,13 +1135,11 @@ class TokenStatsPlugin(BasePlugin):
         return {"recs": out}
 
     @register.api(method="GET", path="/analytics", auth=True)
-    async def api_analytics(self):
-        """/analytics?range=today|d7|d30|total|custom&from=&to=&name="""
-        from urllib.parse import parse_qs
-        qs = parse_qs(self._last_query or "")
+    async def api_analytics(self, request: Request):
+        """/analytics?range=today|d7|d30|total|custom&from=&to="""
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
-        range_key = (qs.get("range", ["today"])[0] or "today").lower()
+        range_key = (request.query_params.get("range") or "today").lower()
         if range_key == "total":
             frm, to = "0000-01-01", "9999-12-31"
         elif range_key == "d7":
@@ -1171,8 +1148,8 @@ class TokenStatsPlugin(BasePlugin):
             frm, to = (now - timedelta(days=29)).strftime("%Y-%m-%d"), today
         else:
             frm, to = today, today
-        frm = qs.get("from", [frm])[0] or frm
-        to = qs.get("to", [to])[0] or to
+        frm = request.query_params.get("from") or frm
+        to = request.query_params.get("to") or to
 
         by_source, by_channel, by_model, by_sid = {}, {}, {}, {}
         total = {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "cost": 0.0, "matched": False}
@@ -1218,11 +1195,9 @@ class TokenStatsPlugin(BasePlugin):
         }
 
     @register.api(method="GET", path="/balance", auth=True)
-    async def api_balance(self):
+    async def api_balance(self, request: Request):
         """/balance?refresh=1 → 先强制即时探测再返回"""
-        from urllib.parse import parse_qs
-        qs = parse_qs(self._last_query or "")
-        if qs.get("refresh") == ["1"]:
+        if (request.query_params.get("refresh") or "") == "1":
             await self._probe_all()
         sources = []
         for src in self.balance_sources:
@@ -1250,20 +1225,6 @@ class TokenStatsPlugin(BasePlugin):
     @register.page("/stats", auth=True, menu=PageMenu(label={"zh": "Token 用量"}, icon="DataLine"))
     def page_stats(self):
         return PluginPage.from_html(_DASHBOARD_HTML)
-
-
-# _last_query 由框架 query 注入？—— 不，这里手动从 request 取：
-# 框架 @register.api 支持注入 aiohttp Request？为兼容性，这里在请求处理前由框架填写。
-# 下面用适配方式：API 函数若收到 request 参数则由框架注入。
-# 由于无法确定签名注入方式，统一改为从 self 取 query 的方案不成立，
-# 改为：在每个 api 里通过参数接收。见下方 _api_query 辅助。
-
-def _api_query(request) -> str:
-    """从 aiohttp.Request 或对象上取 query string"""
-    try:
-        return request.query_string or ""
-    except Exception:
-        return ""
 
 
 _DASHBOARD_HTML = r"""<!DOCTYPE html>
