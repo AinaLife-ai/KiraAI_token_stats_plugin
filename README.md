@@ -1,8 +1,8 @@
 # KiraAI Token 用量统计（Token Stats）
 
-> **v1.2.0**：移植初心 TokenStats 4.9.x 设计——AI 维度聚合/逐轮明细查询、热读缓存、当前余额对表校准、每日重置/每日累计积分源、双币种计费、时间趋势下钻
+> **v1.2.1**：修复姐姐审查发现的兼容/移植缺陷（日志时间戳解析、错误计数游标、exact_match 生效、日志 IO 锁），新增 WebUI 悬浮挂件（默认关闭）与 HTTPS 证书校验开关
 
-为 KiraAI 提供完整的 **Token 用量统计看板**：逐轮记录输入/输出/缓存 tokens、按价格规则实时估算费用（峰谷价、双币种）、API 余额监测（探测 + 估算 + 对表校准）、出错统计——WebUI 侧边栏仪表盘 + bot 工具（概览/聚合/明细）+ 可选自定义命令，三大入口全覆盖。
+为 KiraAI 提供完整的 **Token 用量统计看板**：逐轮记录输入/输出/缓存 tokens、按价格规则实时估算费用（峰谷价、双币种）、API 余额监测（探测 + 估算 + 对表校准）、出错统计——WebUI 侧边栏仪表盘 + 悬浮挂件 + bot 工具（概览/聚合/明细）+ 可选自定义命令，四大入口全覆盖。
 
 > 移植自 [Alife 的 TokenStats](https://github.com/1chuxin/1chuxin-Alife.TokenStats)（初心出品，参考其 4.9.x 打包版设计），并整合了 [KiraAI-plugin-api-balance](https://github.com/ChuXia2004/KiraAI-plugin-api-balance) 的查询模式与命令设计。
 > **模型无关**：任何 Provider 只要在 LLMResponse 里上报 tokens 就能统计。
