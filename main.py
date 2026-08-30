@@ -2431,7 +2431,7 @@ async function tick(){
     const r = (d.ranges||{})||{}, co = (d.costs||{})||{};
     const t = co.today||{};
     $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
-    $('#sessV').textContent = fmt4(r.session?v0:0) + ' · ' + (d.rounds||0) + '轮';
+    $('#sessV').textContent = fmt4(((r.session)||{}).v||0) + ' · ' + (d.rounds||0) + '轮';
     $('#todayV').textContent = fmt4((r.today||{}).v||0);
     const costBits=[]; if(t.matched&&t.cny)costBits.push('¥'+t.cny); if(t.matched&&t.pts)costBits.push(t.pts+'积分');
     $('#costV').textContent = costBits.length?costBits.join(' + '):'—';
