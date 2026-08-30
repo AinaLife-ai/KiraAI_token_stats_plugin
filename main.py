@@ -94,9 +94,13 @@ LOG_ERR_LABELS = {"xml": "XML解析", "model": "模型调用", "tool": "工具�
 
 # ── 工具结果失败判定（on.tool_result 钩子）──
 # tool 返回 error / 权限 denied / 超时 / 调用失败等——LLM 白烧 token 的典型
+# 注意：error 字段值须为非零数字/非空字符串/true 才算失败（{"error": 0} 是很多 API 的成功约定）；
+# 不匹配裸 403（"第403条"会误报），只匹配 403 Forbidden / HTTP 403 / status 403
 TOOL_ERR_RE = re.compile(
-    r"\{['\"]?error['\"]?\s*:|Error\s*:|Permission denied|Access denied|权限不足|无权限|拒绝访问|"
-    r"Forbidden|403|not allowed|timed out|超时|Failed to call tool|not implemented|"
+    r"\{['\"]?error['\"]?\s*:\s*(?:[1-9]\d*|['\"][^'\"]+['\"]|true|True)\s*[,}]|"
+    r"Error\s*:|Permission denied|Access denied|权限不足|无权限|拒绝访问|"
+    r"Forbidden|HTTP\s*403|status\s*[=:]\s*403|not allowed|timed out|超时|"
+    r"Failed to call tool|not implemented|"
     r"调用失败|执行失败|查询失败|获取失败|生成失败|发送失败|上传失败|下载失败|删除失败|保存失败|"
     r"失败[：:，。]|失败$",
     re.IGNORECASE)
@@ -504,13 +508,13 @@ class TokenStatsPlugin(BasePlugin):
         # 出错统计游标（errScanPos）：{sid: (prev_text, prev_end)}，工具循环续轮不重复计数
         self._err_cursor = {}
 
-        # 后台日志（log.log）ERROR 扫描状态
-        self._log_err_path = None          # 当前扫描的日志文件（含轮转）
-        self._log_err_pos = 0              # 文件内字节游标
+        # 后台日志（log.log）ERROR 扫描状态（按文件身份 st_ino 跟踪游标，轮转改名不丢不重）
+        self._log_err_inodes = {}          # {st_ino: pos} 文件身份 → 字节游标
         self._log_err_hist = {}            # {day: {cat: count}} 按天分类聚合
         self._log_err_last = {"at": "", "cat": "", "text": ""}  # 最近一条 ERROR
         self._log_err_task: asyncio.Task = None
         self._log_err_lock = asyncio.Lock()
+        self._err_save_at = 0.0            # 错误统计持久化节流时间戳
 
         # 工具结果失败统计（on.tool_result 钩子）：{day: count}
         self._tool_err_hist = {}
@@ -534,14 +538,11 @@ class TokenStatsPlugin(BasePlugin):
 
         self._load_history()
         self._load_bal_states()
+        self._load_err_stats()
 
-        # 后台日志 ERROR 扫描：定位 KiraAI 的 log.log（含轮转文件）
-        self._log_err_path = self._resolve_log_err_path()
-        if self._log_err_path is not None:
-            self._log_err_task = asyncio.create_task(self._log_err_loop())
-            logger.info(f"[token_stats] 后台日志 ERROR 扫描已启动：{self._log_err_path}")
-        else:
-            logger.warning("[token_stats] 未找到 KiraAI 日志文件（log.log），后台错误统计不可用")
+        # 后台日志 ERROR 扫描：扫描 data 目录下 log.log*（含轮转文件），按 ino 增量
+        self._log_err_task = asyncio.create_task(self._log_err_loop())
+        logger.info("[token_stats] 后台日志 ERROR 扫描已启动（log.log* 含轮转）")
 
         if self.debug_log:
             logger.info(f"[token_stats] init: rules={len(self.rules)} balance_sources={len(self.balance_sources)} "
@@ -571,6 +572,8 @@ class TokenStatsPlugin(BasePlugin):
             except asyncio.CancelledError:
                 pass
             self._log_err_task = None
+        # 退出前落盘错误统计（热重载/重启不丢）
+        self._maybe_save_err_stats()
 
     # ── 历史加载 ──
 
@@ -1502,26 +1505,6 @@ class TokenStatsPlugin(BasePlugin):
 
     # ── 后台日志（log.log）ERROR 扫描 ──
 
-    def _resolve_log_err_path(self) -> Path:
-        """定位 KiraAI 日志文件：优先 data/log.log，找不到则扫 data 目录下 log.log*"""
-        try:
-            if _HAS_DATA_PATH and get_data_path is not None:
-                p = get_data_path() / "log.log"
-                if p.exists():
-                    return p
-        except Exception:
-            pass
-        try:
-            if _HAS_DATA_PATH and get_data_path is not None:
-                d = get_data_path()
-                if d.is_dir():
-                    for f in sorted(d.glob("log.log*")):
-                        if f.is_file():
-                            return f
-        except Exception:
-            pass
-        return None
-
     @staticmethod
     def _log_err_classify(text: str) -> str:
         """按内容分类 ERROR 行：xml/model/tool/net/traceback/other"""
@@ -1607,26 +1590,19 @@ class TokenStatsPlugin(BasePlugin):
             return None
 
     async def _log_err_loop(self):
-        """后台循环：每 10s 增量扫描 log.log，轮转时自动切到新文件"""
+        """后台循环：每 10s 增量扫描 log.log 及轮转文件（log.log.1/2/…）。
+
+        按文件身份（st_ino）跟踪游标：
+        - 轮转改名后同一文件继续从原游标扫，不重复计数
+        - 新出现的轮转文件（log.log.1 等）从头扫，历史 ERROR 也能统计到
+        - 文件被截断/重建（新 ino）时从头扫
+        """
         try:
             while True:
                 try:
                     async with self._log_err_lock:
-                        path = self._log_err_path
-                        if path is None or not path.exists():
-                            # 轮转后主文件可能消失，重新定位
-                            path = self._resolve_log_err_path()
-                            self._log_err_path = path
-                            if path is None:
-                                await asyncio.sleep(10)
-                                continue
-                            self._log_err_pos = 0
-                        pos, count, last = self._log_err_scan_file(path, self._log_err_pos)
-                        self._log_err_pos = pos
-                        if last:
-                            self._log_err_last = last
-                        if count and self.debug_log:
-                            logger.info(f"[token_stats] 日志扫描 +{count} 条 ERROR")
+                        self._log_err_scan_all()
+                        self._maybe_save_err_stats()
                 except Exception as e:
                     logger.warning(f"[token_stats] 日志扫描循环异常: {e}")
                 await asyncio.sleep(10)
@@ -1634,6 +1610,83 @@ class TokenStatsPlugin(BasePlugin):
             return
         except Exception:
             logger.exception("[token_stats] 日志扫描循环退出")
+
+    def _log_err_scan_all(self):
+        """扫描 data 目录下全部 log.log* 文件（含轮转），按 ino 增量"""
+        try:
+            if not (_HAS_DATA_PATH and get_data_path is not None):
+                return
+            d = get_data_path()
+            if not d.is_dir():
+                return
+            files = sorted(d.glob("log.log*"))
+            if not files:
+                return
+            seen = set()
+            for path in files:
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                ino = getattr(st, "st_ino", None)
+                if ino is None:
+                    # 平台无 ino（如某些网络盘）：退化为路径跟踪
+                    ino = str(path)
+                seen.add(ino)
+                pos = self._log_err_inodes.get(ino, 0)
+                size = st.st_size
+                if size < pos:
+                    # 文件被截断/重建：从头扫
+                    pos = 0
+                new_pos, count, last = self._log_err_scan_file(path, pos)
+                self._log_err_inodes[ino] = new_pos
+                if last:
+                    self._log_err_last = last
+                if count and self.debug_log:
+                    logger.info(f"[token_stats] 日志扫描 {path.name} +{count} 条 ERROR")
+            # 清理已消失文件的游标（轮转后旧 ino 不再出现）
+            for ino in list(self._log_err_inodes):
+                if ino not in seen:
+                    del self._log_err_inodes[ino]
+        except Exception as e:
+            logger.warning(f"[token_stats] 日志扫描失败: {e}")
+
+    def _maybe_save_err_stats(self):
+        """错误统计持久化（节流 30s）：热重载/重启不丢"""
+        now = time.time()
+        if now - self._err_save_at < 30:
+            return
+        self._err_save_at = now
+        try:
+            payload = {
+                "log_hist": self._log_err_hist,
+                "log_last": self._log_err_last,
+                "tool_hist": self._tool_err_hist,
+                "tool_last": self._tool_err_last,
+            }
+            p = self._data_dir / "err_stats.json"
+            p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_err_stats(self):
+        """加载持久化的错误统计（热重载/重启恢复）"""
+        try:
+            p = self._data_dir / "err_stats.json"
+            if not p.exists():
+                return
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                if isinstance(data.get("log_hist"), dict):
+                    self._log_err_hist = data["log_hist"]
+                if isinstance(data.get("log_last"), dict):
+                    self._log_err_last = data["log_last"]
+                if isinstance(data.get("tool_hist"), dict):
+                    self._tool_err_hist = data["tool_hist"]
+                if isinstance(data.get("tool_last"), dict):
+                    self._tool_err_last = data["tool_last"]
+        except Exception:
+            pass
 
     def _log_err_summary(self, days: int = 7) -> str:
         """近 N 天分类聚合摘要（含最近一条）"""
@@ -2374,24 +2427,35 @@ class TokenStatsPlugin(BasePlugin):
 
     @register.api(method="GET", path="/balance", auth=True)
     async def api_balance(self, request: Request):
-        """/balance?refresh=1 → 先强制即时探测再返回"""
+        """/balance?refresh=1 → 先强制即时探测再返回；返回完整配置字段（含禁用源），
+        展示与可视化编辑器共用同一数据源——编辑回填不丢配置、保存不丢禁用源"""
         if (request.query_params.get("refresh") or "") == "1":
             await self._probe_all(wait=True)
         sources = []
         for src in self.balance_sources:
             if not src.get("enabled", True):
-                continue
-            st = self._resolve_balance_state(src)
-            sources.append({
+                # 禁用源不探测，只取缓存状态
+                st = self._bal_state_of(src.get("name", ""))
+            else:
+                st = self._resolve_balance_state(src)
+            item = {
                 "name": src.get("name", ""),
                 "type": (src.get("type") or "auto").strip().lower(),
+                "enabled": bool(src.get("enabled", True)),
                 "est": self._is_est(src),
                 "ok": st["ok"],
                 "balance": f"{st['balance']:.4f}" if st["ok"] else "",
                 "currency": st.get("currency", "CNY"),
                 "at": st.get("at", ""),
                 "msg": st.get("msg", ""),
-            })
+            }
+            # 配置字段（可视化编辑器回填用，含禁用源）
+            for k in ("url", "api_key", "api_user", "json_path", "quota_conversion",
+                      "daily_quota", "anchor_balance", "refresh_time", "anchor_at"):
+                v = src.get(k)
+                if v is not None:
+                    item[k] = v
+            sources.append(item)
         return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
 
     @register.api(method="POST", path="/balance-config", auth=True)
@@ -2689,9 +2753,10 @@ async function loadOv(){
   const er = d.errors||{};
   if (er.last) cards.push('<div class="card errbox"><div class="k">最近出错</div><div class="d">'+esc(er.last)+'</div></div>');
   const lg = er.log||{};
+  const lgNames = {xml:'XML解析',model:'模型调用',tool:'工具执行',net:'网络/超时',traceback:'异常堆栈',other:'其他'};
   const lgBits = [];
   for (const c of ['xml','model','tool','net','traceback','other']){
-    if (lg[c]) lgBits.push(c+' '+lg[c]);
+    if (lg[c]) lgBits.push((lgNames[c]||c)+' '+lg[c]);
   }
   if (lgBits.length){
     let lgTxt = '后台日志错误（近7天）：'+lgBits.join(' · ');
@@ -2853,7 +2918,7 @@ async function loadBal(refresh){
   $('#balInfo').textContent = '轮询间隔 ' + d.interval + ' 分钟';
   $('#balBody').innerHTML = balSources.map((x,i)=>{
     const unit = x.currency==='积分' ? '积分' : (d.unit||'元');
-    return '<tr><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</td>'+
+    return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td>'+esc(x.name)+(x.enabled===false?' <span class="note">(禁用)</span>':'')+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</td>'+
     '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
     '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+')">删除</button></td></tr>';
   }).join('') ||
