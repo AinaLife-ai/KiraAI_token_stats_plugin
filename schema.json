@@ -177,11 +177,17 @@
         "minimum": 5,
         "hint": "最小 5 分钟。页面/工具查询时也可手动刷新"
       },
+      "balance_unit": {
+        "type": "string",
+        "name": "余额显示单位",
+        "default": "元",
+        "hint": "余额展示使用的单位，可自定义为：元、额度、美元、美刀、点数等。作用于工具/命令/WebUI 所有余额展示（newapi 类型按 quota_conversion 换算后的数值也使用此单位）"
+      },
       "balance_sources": {
         "type": "json",
         "name": "余额监测源",
         "default": [],
-        "hint": "数组，每项 {name, type: auto/custom/preset, url, api_key, json_path(可选), initial(可选，初始额度元), currency, enabled}。auto=按 URL 自动探测（DeepSeek/Moonshot/硅基/智谱官方端点或 One-API 系中转站）；custom=填 Base 地址自动尝试常见余额接口，或直接填完整余额接口 URL+json_path；preset=无接口，填 initial 后按 初始额度−已计费用 估算。注意：api_key 为明文存储"
+        "hint": "数组，每项 {name, type: auto/custom/newapi/preset, url, api_key, json_path(可选), api_user(newapi 必填，纯数字用户ID), quota_conversion(newapi 可选，默认500000), initial(可选，初始额度), currency, enabled}。auto=按 URL 自动探测（DeepSeek/Moonshot/硅基/智谱官方端点或 One-API 系中转站）；custom=填 Base 地址自动尝试常见余额接口，或直接填完整余额接口 URL+json_path；newapi=New-API 站点专属（请求带 New-Api-User 头，打 /api/user/self，多字段自动提取 quota 并按 quota_conversion 换算，默认 500000）；preset=无接口，填 initial 后按 初始额度−已计费用 估算。注意：api_key 为明文存储"
       }
     }
   },
