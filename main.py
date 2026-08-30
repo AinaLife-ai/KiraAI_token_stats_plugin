@@ -363,8 +363,8 @@ class TokenStatsPlugin(BasePlugin):
         idle = adv.get("session_idle_minutes", 30)
         self.session_idle_minutes = max(1, int(idle) if idle is not None else 30)
         expire = adv.get("session_expire_minutes", 30)
-        # 会话内临时状态（来源继承/错误游标）无活动清理时间，秒
-        self.session_expire_seconds = max(60, int(expire) if expire is not None else 30) * 60
+        # 会话内临时状态（来源继承/错误游标）无活动清理时间，秒；最小 1 分钟
+        self.session_expire_seconds = max(1, int(expire) if expire is not None else 30) * 60
 
         # ── 挂件（WebUI 悬浮小卡片，默认关闭）──
         wid = cfg.get("section_widget", {})
@@ -565,7 +565,9 @@ class TokenStatsPlugin(BasePlugin):
     def _load_bal_states(self):
         try:
             if self._bal_state_path.exists():
-                self._bal_states = json.loads(self._bal_state_path.read_text(encoding="utf-8"))
+                data = json.loads(self._bal_state_path.read_text(encoding="utf-8"))
+                # 顶层类型校验：文件被写坏成数组/字符串时回退空 dict，避免后续 .get 崩
+                self._bal_states = data if isinstance(data, dict) else {}
         except Exception:
             self._bal_states = {}
 
@@ -1338,16 +1340,21 @@ class TokenStatsPlugin(BasePlugin):
             sb.append(line)
 
         if self.tool_include_balance and self.enable_balance and self.balance_sources:
-            sb.append("账户余额：")
-            for src in self.balance_sources:
-                if not src.get("enabled", True):
-                    continue
-                st = self._resolve_balance_state(src)
-                name = src.get("name", "")
-                if st["ok"]:
-                    sb.append(f"- {name}：{st['balance']:.4f} {self.balance_unit}（{st.get('msg', '')[:40]}）")
-                else:
-                    sb.append(f"- {name}：探测失败（{st['msg']}）")
+            try:
+                sb.append("账户余额：")
+                for src in self.balance_sources:
+                    if not src.get("enabled", True):
+                        continue
+                    st = self._resolve_balance_state(src)
+                    name = src.get("name", "")
+                    if st["ok"]:
+                        # 积分制源显示「积分」，其余用全局余额单位
+                        unit = "积分" if self._src_currency(src) == "积分" else self.balance_unit
+                        sb.append(f"- {name}：{st['balance']:.4f} {unit}（{st.get('msg', '')[:40]}）")
+                    else:
+                        sb.append(f"- {name}：探测失败（{st['msg']}）")
+            except Exception:
+                sb.append("- 余额读取失败")
 
         if self._last_err_text:
             sb.append(f"最近出错：{self._last_err_text}")
@@ -1372,7 +1379,8 @@ class TokenStatsPlugin(BasePlugin):
                 st = self._resolve_balance_state(src)
                 name = src.get("name", "")
                 if st["ok"]:
-                    lines.append(f"- {name}：{st['balance']:.4f} {self.balance_unit}（{st.get('msg', '')[:40]}）")
+                    unit = "积分" if self._src_currency(src) == "积分" else self.balance_unit
+                    lines.append(f"- {name}：{st['balance']:.4f} {unit}（{st.get('msg', '')[:40]}）")
                 else:
                     lines.append(f"- {name}：探测失败（{st['msg']}）")
             return "\n".join(lines)
@@ -1831,8 +1839,8 @@ class TokenStatsPlugin(BasePlugin):
         day = (request.query_params.get("day") or "").strip()
         hour_s = (request.query_params.get("hour") or "").strip()
 
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", day) and day in self._hours:
-            # 单天按小时
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", day) and day in self._hours and not hour_s:
+            # 单天按小时（不带 hour 参数才走这里；带 hour 下钻到 5 分钟桶）
             hours = []
             for h, hr in enumerate(self._hours[day]):
                 if not hr:
