@@ -360,6 +360,36 @@ class TokenStatsPlugin(BasePlugin):
         self.balance_interval = max(1, int(interval) if interval is not None else 5)
         sources = bal.get("balance_sources", [])
         self.balance_sources = sources if isinstance(sources, list) else []
+        # New-API 站点简易文本格式（对齐 api-balance 插件）：每行 名称;base_url;令牌;用户ID;换算比例(可选)
+        simple_sec = cfg.get("section_balance_newapi_simple", {}) or {}
+        simple_list = simple_sec.get("newapi_sites_simple", [])
+        if isinstance(simple_list, list):
+            for line in simple_list:
+                if not line or not str(line).strip():
+                    continue
+                parts = [p.strip() for p in str(line).split(";")]
+                if len(parts) < 4:
+                    continue
+                name = parts[0] or "未命名站点"
+                base_url = parts[1].rstrip("/")
+                api_key = parts[2]
+                api_user = parts[3]
+                conversion = parts[4] if len(parts) >= 5 and parts[4].strip() else "500000"
+                try:
+                    conversion = float(conversion)
+                except (TypeError, ValueError):
+                    conversion = 500000
+                if not base_url or not api_key or not api_user:
+                    continue
+                self.balance_sources.insert(0, {
+                    "name": name,
+                    "type": "newapi",
+                    "url": base_url,
+                    "api_key": api_key,
+                    "api_user": api_user,
+                    "quota_conversion": conversion,
+                    "enabled": True,
+                })
         # 固定平台快捷配置（对齐 api-balance 插件风格）：启用 + 填 key 即自动并入余额源
         for key, dname, durl in (
                 ("deepseek", "DeepSeek", "https://api.deepseek.com"),
