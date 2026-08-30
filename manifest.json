@@ -7,13 +7,7 @@
   "repo": "https://github.com/znq19/KiraAI_token_stats_plugin",
   "icon": "icon.svg",
   "icon-dark": "icon-dark.svg",
-  "tags": [
-    "stats",
-    "token",
-    "balance",
-    "dashboard",
-    "cost"
-  ],
+  "tags": ["stats", "token", "balance", "dashboard", "cost"],
   "core_version": ">=2.29.7",
   "locales": {
     "zh": {
