@@ -38,19 +38,25 @@
       "source_default": {
         "type": "list",
         "name": "默认来源标签（可多填）",
-        "default": ["system"],
+        "default": [
+          "system"
+        ],
         "hint": "无法判定来源时的兜底标签。支持多填：第一个为主标签（实际归类用），其余作为备选/别名。兼容旧配置的单个字符串"
       },
       "source_group": {
         "type": "list",
         "name": "群聊来源标签（可多填）",
-        "default": ["gm"],
+        "default": [
+          "gm"
+        ],
         "hint": "群聊消息用量的来源标签（默认对齐 KiraAI 会话类型 gm，可自定义）。支持多填：第一个为主标签，其余为别名。兼容旧配置的单个字符串"
       },
       "source_dm": {
         "type": "list",
         "name": "私聊来源标签（可多填）",
-        "default": ["dm"],
+        "default": [
+          "dm"
+        ],
         "hint": "私聊消息用量的来源标签。支持多填：第一个为主标签，其余为别名。兼容旧配置的单个字符串"
       }
     }
@@ -69,7 +75,10 @@
       "command_words": {
         "type": "list",
         "name": "命令词",
-        "default": ["/用量", "/token"],
+        "default": [
+          "/用量",
+          "/token"
+        ],
         "hint": "每行一个命令词，支持前缀匹配（如 /用量 今天）"
       },
       "allowed_users": {
@@ -131,7 +140,7 @@
             "model_match": "flash",
             "currency": "CNY",
             "peak_enabled": true,
-            "hit_peak": 0.10,
+            "hit_peak": 0.1,
             "hit_off": 0.05,
             "miss_peak": 3.0,
             "miss_off": 1.5,
@@ -143,7 +152,7 @@
             "model_match": "pro",
             "currency": "CNY",
             "peak_enabled": true,
-            "hit_peak": 0.30,
+            "hit_peak": 0.3,
             "hit_off": 0.15,
             "miss_peak": 9.0,
             "miss_off": 4.5,
@@ -174,10 +183,10 @@
       },
       "balance_interval": {
         "type": "integer",
-        "name": "轮询间隔（分钟）",
-        "default": 1,
-        "minimum": 1,
-        "hint": "默认 1 分钟，最小 1 分钟。可在 WebUI 侧边栏「Token 用量 → 余额监测」页直接修改。工具/命令查询时会先即时探测，不受此间隔限制"
+        "name": "轮询间隔（秒）",
+        "default": 10,
+        "minimum": 5,
+        "hint": "默认 10 秒，最小 5 秒。可在 WebUI 侧边栏「Token 用量 → 余额监测」页直接修改。工具/命令查询时会先即时探测，不受此间隔限制"
       },
       "balance_unit": {
         "type": "string",
