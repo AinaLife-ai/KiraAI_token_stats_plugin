@@ -191,11 +191,30 @@ def _fmt4(v):
     return str(round(v / 1000000000)) + "B"
 
 
+def _parse_hhmm(s, default_h=0, default_m=0):
+    """解析 HH:mm → (时, 分)；失败返回默认"""
+    try:
+        h, m = str(s or "").strip().split(":")
+        return int(h), int(m)
+    except Exception:
+        return default_h, default_m
+
+
+# 全局峰谷窗口（工作日）：默认 09:00-12:00 / 14:00-18:00 为峰，其余谷；
+# 可在 WebUI「价格规则」页自定义（格式 [["HH:MM","HH:MM"], ...]），热重载后历史按新窗口重分桶
+_PEAK_WINDOWS = [("09:00", "12:00"), ("14:00", "18:00")]
+
+
 def _is_peak(t: datetime) -> bool:
     if t.weekday() >= 5:
         return False
-    h = t.hour
-    return (9 <= h < 12) or (14 <= h < 18)
+    tm = t.hour * 60 + t.minute
+    for ws, we in _PEAK_WINDOWS:
+        sh, sm = _parse_hhmm(ws)
+        eh, em = _parse_hhmm(we)
+        if sh * 60 + sm <= tm < eh * 60 + em:
+            return True
+    return False
 
 
 def _url_loose_match(candidate: str, pattern: str) -> bool:
@@ -342,15 +361,6 @@ def _clamp_ai_output(s: str) -> str:
     return s[:AI_OUTPUT_LIMIT - 60] + "\n…（结果过长已截断，请缩小范围或减少 top/n）"
 
 
-def _parse_hhmm(s, default_h=0, default_m=0):
-    """解析 HH:mm → (时, 分)；失败返回默认"""
-    try:
-        h, m = str(s or "").strip().split(":")
-        return int(h), int(m)
-    except Exception:
-        return default_h, default_m
-
-
 def _last_refresh(now: datetime, refresh_time: str) -> datetime:
     """上次刷新时刻（纯时间推导，不落状态）：客户端离线期间发放不丢"""
     h, m = _parse_hhmm(refresh_time)
@@ -412,12 +422,26 @@ class TokenStatsPlugin(BasePlugin):
         rules = pr.get("rules", None)
         # 空数组也保留（用户删光规则 → 费用显示「—」），仅 None/非 list 回退默认
         self.rules = rules if isinstance(rules, list) else DEFAULT_RULES
+        # 峰谷窗口（全局）：默认工作日 09:00-12:00 / 14:00-18:00 为峰，其余谷
+        global _PEAK_WINDOWS
+        pw = pr.get("peak_windows", None)
+        if isinstance(pw, list) and pw:
+            cleaned_w = []
+            for item in pw:
+                if not (isinstance(item, (list, tuple)) and len(item) == 2):
+                    continue
+                sh, sm = _parse_hhmm(item[0])
+                eh, em = _parse_hhmm(item[1])
+                if sh * 60 + sm < eh * 60 + em:
+                    cleaned_w.append((f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"))
+            if cleaned_w:
+                _PEAK_WINDOWS = cleaned_w
 
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
         self.enable_balance = bool(bal.get("enable_balance", False))
-        interval = bal.get("balance_interval", 5)
-        self.balance_interval = max(1, int(interval) if interval is not None else 5)
+        interval = bal.get("balance_interval", 1)
+        self.balance_interval = max(1, int(interval) if interval is not None else 1)
         sources = bal.get("balance_sources", [])
         # 复制一份再 append，避免直接引用 cfg 原始 list（热重载时重复追加）
         self.balance_sources = list(sources) if isinstance(sources, list) else []
@@ -1023,8 +1047,9 @@ class TokenStatsPlugin(BasePlugin):
         cny, _, matched = self._session_cost_ex()
         return cny if matched else None
 
-    def _channel_cost_ex(self, url: str, name: str):
-        """某渠道（URL/渠道名包含匹配）在全部历史里的计费 → (cny, pts, matched)"""
+    def _channel_cost_ex(self, url: str, name: str, model_ref: str = ""):
+        """某渠道（URL/渠道名包含匹配）在全部历史里的计费 → (cny, pts, matched)；
+        model_ref 非空时只统计关联模型（provider:model）的用量"""
         merged = {}
         for ds in self._days.values():
             for mkey, slots in ds["aggs"].items():
@@ -1033,6 +1058,8 @@ class TokenStatsPlugin(BasePlugin):
                 host = parts[2] if len(parts) > 2 else ""
                 if not (_url_loose_match(host, url) or _url_loose_match(channel, url)
                         or (name and name.lower() in channel.lower())):
+                    continue
+                if not self._model_ref_hit(parts[0] if len(parts) > 0 else "", channel, host, model_ref):
                     continue
                 slots2 = merged.setdefault(mkey, [None, None])
                 for i in (0, 1):
@@ -1053,7 +1080,7 @@ class TokenStatsPlugin(BasePlugin):
         cny, _, matched = self._channel_cost_ex(url, name)
         return cny if matched else 0.0
 
-    def _channel_cost_since_ex(self, url: str, name: str, since: datetime):
+    def _channel_cost_since_ex(self, url: str, name: str, since: datetime, model_ref: str = ""):
         """自 since 时刻以来（含）的渠道计费 → (cny, pts, matched)。
         逐条扫日志，按 t >= since 过滤；双币种分开累计。"""
         cny, pts, matched = 0.0, 0.0, False
@@ -1066,6 +1093,8 @@ class TokenStatsPlugin(BasePlugin):
                 continue
             if not (_url_loose_match(r.get("h", ""), url) or _url_loose_match(r.get("ch", ""), url)
                     or (name and name.lower() in (r.get("ch", "") or "").lower())):
+                continue
+            if not self._model_ref_hit(r.get("m", ""), r.get("ch", ""), r.get("h", ""), model_ref):
                 continue
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
             if rule is None:
@@ -1083,6 +1112,21 @@ class TokenStatsPlugin(BasePlugin):
     def _bal_state_of(self, name: str) -> dict:
         s = self._bal_states.get(name) or {"balance": 0, "currency": "CNY", "at": "", "ok": False, "msg": "尚未探测"}
         return s
+
+    @staticmethod
+    def _model_ref_hit(model: str, channel: str, host: str, model_ref: str) -> bool:
+        """估算型余额源「关联模型」过滤：model_ref 格式 provider:model（或仅模型名）。
+        模型名包含匹配；provider 段匹配渠道名或 host 包含。留空 = 不过滤。"""
+        ref = (model_ref or "").strip()
+        if not ref:
+            return True
+        ref_p, _, ref_m = ref.partition(":")
+        if ref_m and ref_m.lower() not in (model or "").lower():
+            return False
+        if ref_p and not (ref_p.lower() in (channel or "").lower()
+                          or ref_p.lower() in (host or "").lower()):
+            return False
+        return True
 
     def _is_est(self, src: dict) -> bool:
         return (src.get("type") or "auto").strip().lower() in EST_TYPES
@@ -1109,6 +1153,7 @@ class TokenStatsPlugin(BasePlugin):
             return self._bal_state_of(name)
 
         currency = self._src_currency(src)
+        model_ref = src.get("model_ref", "") or ""
         anchor = src.get("anchor_balance")
         try:
             anchor = float(anchor) if anchor not in (None, "") else None
@@ -1136,11 +1181,11 @@ class TokenStatsPlugin(BasePlugin):
         try:
             if anchor is not None and anchor_dt is not None:
                 # 锚定：设定值 − 其后计费（daily/rolling 另加此后发放；daily 跨刷新自动回落）
-                cny, pts, matched = self._channel_cost_since_ex(src.get("url", ""), name, anchor_dt)
+                cny, pts, matched = self._channel_cost_since_ex(src.get("url", ""), name, anchor_dt, model_ref)
                 cost = pts if currency == "积分" else cny
                 if s_type == "daily" and _last_refresh(now, refresh) > anchor_dt:
                     # 跨刷新：锚定失效，回落每日额度模型
-                    cost2 = self._channel_cost_since_ex(src.get("url", ""), name, _last_refresh(now, refresh))
+                    cost2 = self._channel_cost_since_ex(src.get("url", ""), name, _last_refresh(now, refresh), model_ref)
                     c2 = cost2[1] if currency == "积分" else cost2[0]
                     cur = daily - c2
                     return {"balance": cur, "currency": currency,
@@ -1161,7 +1206,7 @@ class TokenStatsPlugin(BasePlugin):
                 if daily <= 0:
                     return {"balance": 0, "currency": currency, "at": "", "ok": False,
                             "msg": "daily 源需填「每日额度」（当前 = 每日额度 − 本周期计费）；可再填「当前余额(对表)」校准"}
-                cny, pts, matched = self._channel_cost_since_ex(src.get("url", ""), name, _last_refresh(now, refresh))
+                cny, pts, matched = self._channel_cost_since_ex(src.get("url", ""), name, _last_refresh(now, refresh), model_ref)
                 cost = pts if currency == "积分" else cny
                 cur = daily - cost
                 return {"balance": cur, "currency": currency,
@@ -1173,7 +1218,7 @@ class TokenStatsPlugin(BasePlugin):
                     return {"balance": 0, "currency": currency, "at": "", "ok": False,
                             "msg": "rolling 源需先填「当前余额(对表)」建立基准（当前 = 设定余额 − 计费 + 每日发放，没用完的结转滚存）"}
                 grants = _grant_count(anchor_dt, now, refresh)
-                cny, pts, matched = self._channel_cost_ex(src.get("url", ""), name)
+                cny, pts, matched = self._channel_cost_ex(src.get("url", ""), name, model_ref)
                 cost = pts if currency == "积分" else cny
                 cur = anchor + grants * daily - cost
                 return {"balance": cur, "currency": currency,
@@ -1184,7 +1229,7 @@ class TokenStatsPlugin(BasePlugin):
             if initial is None:
                 return {"balance": 0, "currency": currency, "at": "", "ok": False,
                         "msg": "preset 源需先填「初始额度」或「当前余额(对表)」"}
-            cny, pts, matched = self._channel_cost_ex(src.get("url", ""), name)
+            cny, pts, matched = self._channel_cost_ex(src.get("url", ""), name, model_ref)
             cost = pts if currency == "积分" else cny
             cur = initial - cost
             return {"balance": cur, "currency": currency,
@@ -2478,6 +2523,34 @@ class TokenStatsPlugin(BasePlugin):
                 m["cny"] += amt
         return sorted(top.values(), key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
 
+    @register.api(method="GET", path="/models", auth=True)
+    async def api_models(self):
+        """KiraAI 已配置的全部 LLM 模型列表（provider:model），供估算型余额源「关联模型」下拉选择"""
+        models = []
+        try:
+            pm = self.ctx.provider_mgr
+            if pm is not None:
+                for pid in pm.get_all_providers():
+                    try:
+                        infos = pm.get_model_infos(pid)
+                    except Exception:
+                        continue
+                    for info in infos:
+                        try:
+                            mt = getattr(info, "model_type", None)
+                            if mt is not None and getattr(mt, "value", "") != "llm":
+                                continue
+                        except Exception:
+                            pass
+                        mid = getattr(info, "model_id", "") or ""
+                        pname = getattr(info, "provider_name", "") or pid
+                        if mid:
+                            models.append({"key": f"{pid}:{mid}", "label": f"{pname} / {mid}"})
+        except Exception:
+            pass
+        models.sort(key=lambda x: x["label"].lower())
+        return {"models": models}
+
     @register.api(method="GET", path="/balance", auth=True)
     async def api_balance(self, request: Request):
         """/balance?refresh=1 → 先强制即时探测再返回；返回完整配置字段（含禁用源），
@@ -2509,7 +2582,7 @@ class TokenStatsPlugin(BasePlugin):
                 if v is not None:
                     item[k] = v
             sources.append(item)
-        return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
+        return {"interval": max(1, self.balance_interval), "unit": self.balance_unit, "sources": sources}
 
     @register.api(method="POST", path="/balance-config", auth=True)
     async def api_balance_config(self, request: Request):
@@ -2531,7 +2604,7 @@ class TokenStatsPlugin(BasePlugin):
                 continue
             item = {"name": name, "type": (str(s.get("type") or "auto").strip().lower() or "auto"),
                     "enabled": bool(s.get("enabled", True))}
-            for k in ("url", "api_key", "api_user", "json_path", "currency"):
+            for k in ("url", "api_key", "api_user", "json_path", "currency", "model_ref"):
                 v = s.get(k)
                 if v not in (None, ""):
                     item[k] = str(v).strip()
@@ -2567,7 +2640,7 @@ class TokenStatsPlugin(BasePlugin):
 
     @register.api(method="GET", path="/pricing", auth=True)
     async def api_pricing(self):
-        return {"rules": self.rules}
+        return {"rules": self.rules, "peak_windows": [list(w) for w in _PEAK_WINDOWS]}
 
     @register.api(method="POST", path="/pricing-config", auth=True)
     async def api_pricing_config(self, request: Request):
@@ -2613,6 +2686,40 @@ class TokenStatsPlugin(BasePlugin):
             return {"ok": True, "count": len(cleaned)}
         except Exception as e:
             logger.warning(f"[token_stats] 保存价格规则失败: {e}")
+            return {"ok": False, "msg": f"保存失败: {e}"}
+
+    @register.api(method="POST", path="/pricing-windows", auth=True)
+    async def api_pricing_windows(self, request: Request):
+        """保存全局峰谷时段（WebUI 价格规则页）：格式 [["09:00","12:00"],["14:00","18:00"]]"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        pw = body.get("peak_windows")
+        if not isinstance(pw, list) or not pw:
+            return {"ok": False, "msg": "peak_windows 必须是数组"}
+        cleaned = []
+        for item in pw:
+            if not (isinstance(item, (list, tuple)) and len(item) == 2):
+                continue
+            sh, sm = _parse_hhmm(item[0])
+            eh, em = _parse_hhmm(item[1])
+            if sh * 60 + sm < eh * 60 + em:
+                cleaned.append([f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"])
+        if not cleaned:
+            return {"ok": False, "msg": "峰谷时段格式错误：需为 [['09:00','12:00'],...] 且结束晚于开始"}
+        try:
+            pm = self.ctx.plugin_mgr
+            if pm is None:
+                return {"ok": False, "msg": "plugin_mgr 不可用"}
+            cfg = pm.get_plugin_config("KiraAI_token_stats_plugin")
+            sec = dict(cfg.get("section_pricing") or {})
+            sec["peak_windows"] = cleaned
+            cfg["section_pricing"] = sec
+            await pm.update_plugin_config("KiraAI_token_stats_plugin", cfg)
+            return {"ok": True, "count": len(cleaned)}
+        except Exception as e:
+            logger.warning(f"[token_stats] 保存峰谷时段失败: {e}")
             return {"ok": False, "msg": f"保存失败: {e}"}
 
     # ── WebUI 侧边栏页面 ──
@@ -2772,6 +2879,12 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="priceAdd">＋ 添加规则</button>
       <span style="color:var(--dim);font-size:12px" id="priceInfo"></span>
     </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:8px 12px">
+      <span style="color:var(--dim);font-size:12px">峰谷时段（工作日）：</span>
+      <input id="peakWindows" style="width:260px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px" placeholder="09:00-12:00,14:00-18:00">
+      <button class="btn" id="peakWindowsSave">保存</button>
+      <span style="color:var(--dim);font-size:11px">格式 开始-结束，逗号分隔多段；保存后热重载，历史按新窗口重算</span>
+    </div>
     <div id="priceBody"></div>
   </div>
 </div>
@@ -2784,7 +2897,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <span style="color:var(--dim);font-size:12px" id="balInfo"></span>
     </div>
     <table><thead><tr><th>名称</th><th>类型</th><th>余额</th><th>更新时间</th><th>状态</th><th style="width:110px">操作</th></tr></thead><tbody id="balBody"></tbody></table>
-    <div class="note">点击「＋ 添加监测源」可视化配置，保存后自动热重载。类型说明：auto=按 URL 自动探测官方端点或 One-API 中转站；custom=自定义接口多端点尝试；newapi=New-API 站点；preset=预设扣减（钱包型）；daily=每日重置积分；rolling=每日累计滚存积分。估算型填「当前余额(对表)」即以上游实际余额校准，此后按价格规则自动扣减。</div>
+    <div class="note">点击「＋ 添加监测源」可视化配置，保存后自动热重载。类型说明：auto=按 URL 自动探测官方端点或 One-API 中转站；custom=自定义接口多端点尝试；newapi=New-API 站点；preset=预设扣减（钱包型）；daily=每日重置积分；rolling=每日累计滚存积分。估算型填「当前余额(对表)」即以上游实际余额校准，此后按价格规则自动扣减；可再选「关联模型」只统计该模型的用量来估算。</div>
   </div>
 </div>
 
@@ -3026,11 +3139,13 @@ async function loadPrice(){
   const d = await jget('/pricing');
   priceRules = d.rules||[];
   $('#priceInfo').textContent = '共 ' + priceRules.length + ' 条规则';
+  const pw = d.peak_windows || [['09:00','12:00'],['14:00','18:00']];
+  $('#peakWindows').value = pw.map(x=>x[0]+'-'+x[1]).join(',');
   $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>名称</th><th>币种</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
     priceRules.map((r,i)=>'<tr><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
     '<td>'+(r.peak_enabled!==false?'峰谷':'恒谷')+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
     '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+')">删除</button></td></tr>').join('')+'</tbody></table>'+
-    '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；峰=工作日 9:00-12:00、14:00-18:00。双币种分别累计，不与 ¥ 混算。改价后全历史费用即时重算。</div>'
+    '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；峰谷时段可在上方自定义（默认工作日 09:00-12:00、14:00-18:00 为峰，其余谷）。双币种分别累计，不与 ¥ 混算。改价/改峰谷后全历史费用即时重算。</div>'
     : '<div class="note">暂无价格规则，费用显示「—」。点「＋ 添加规则」配置第一条。</div>';
 }
 const PRICE_FIELDS = [
@@ -3098,6 +3213,23 @@ async function priceDel(i){
 }
 $('#priceAdd').onclick = ()=>priceEditOpen(-1);
 $('#priceEditClose').onclick = ()=>{ $('#priceEditor').style.display='none'; };
+$('#peakWindowsSave').onclick = async ()=>{
+  const raw = $('#peakWindows').value.trim();
+  const parts = raw.split(',').map(s=>s.trim()).filter(Boolean);
+  const windows = [];
+  let bad = false;
+  parts.forEach(p=>{
+    const m = p.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+    if(!m){ bad = true; return; }
+    const sh=+m[1], sm=+m[2], eh=+m[3], em=+m[4];
+    if(sh>23||sm>59||eh>23||em>59||sh*60+sm>=eh*60+em){ bad = true; return; }
+    windows.push([String(sh).padStart(2,'0')+':'+String(sm).padStart(2,'0'), String(eh).padStart(2,'0')+':'+String(em).padStart(2,'0')]);
+  });
+  if(bad || !windows.length){ alert('格式错误：请用 09:00-12:00,14:00-18:00 格式，且结束须晚于开始'); return; }
+  const r = await fetch(API+'/pricing-windows', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({peak_windows:windows})}).then(x=>x.json());
+  if(r.ok){ loadPrice(); loadOv(); }
+  else alert('保存失败：'+(r.msg||'未知错误'));
+};
 let balSources = [];
 let balEditIdx = -1;
 async function loadBal(refresh){
@@ -3124,9 +3256,9 @@ const BAL_FIELDS = {
   auto: [['url','站点/接口地址','https://api.deepseek.com'],['api_key','API Key','']],
   custom: [['url','接口地址','https://myproxy.example.com'],['api_key','API Key',''],['json_path','余额字段路径(可选)','balance_infos.0.total_balance']],
   newapi: [['url','站点地址','https://newapi.example.com'],['api_key','系统访问令牌',''],['api_user','用户ID(纯数字)',''],['quota_conversion','换算比例(默认500000)','500000']],
-  preset: [['anchor_balance','当前余额(对表)',''],['currency','币种(CNY/积分)','CNY']],
-  daily: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表,可选)',''],['currency','币种','积分']],
-  rolling: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表)',''],['currency','币种','积分']]
+  preset: [['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种(CNY/积分)','CNY']],
+  daily: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表,可选)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分']],
+  rolling: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分']]
 };
 function balFieldHtml(f){
   return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
@@ -3146,11 +3278,29 @@ function balEditOpen(i){
   $('#bf_name').value = src.name||'';
   const renderDyn = ()=>{
     const t = $('#bf_type').value;
-    $('#bf_dyn').innerHTML = (BAL_FIELDS[t]||[]).map(f=>balFieldHtml(f)).join('');
+    $('#bf_dyn').innerHTML = (BAL_FIELDS[t]||[]).map(f=>{
+      if(f[0]==='model_ref') return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label><select id="bf_model_ref" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px"><option value="">（不关联，按渠道/URL 全算）</option></select><div class="note">从 KiraAI 已配置的 LLM 模型中选择，估算消耗只统计该模型的用量（模型名+渠道匹配）</div></div>';
+      return balFieldHtml(f);
+    }).join('');
     (BAL_FIELDS[t]||[]).forEach(f=>{
       const v = src[f[0]];
-      if(v!=null && v!=='') $('#bf_'+f[0]).value = v;
+      if(v!=null && v!=='') {
+        if(f[0]==='model_ref') $('#bf_model_ref').value = v;
+        else $('#bf_'+f[0]).value = v;
+      }
     });
+    if(t==='preset'||t==='daily'||t==='rolling'){
+      fetch(API+'/models').then(r=>r.json()).then(d=>{
+        const sel = $('#bf_model_ref');
+        if(!sel) return;
+        (d.models||[]).forEach(m=>{
+          const op = document.createElement('option');
+          op.value = m.key; op.textContent = m.label;
+          sel.appendChild(op);
+        });
+        if(src.model_ref) sel.value = src.model_ref;
+      });
+    }
   };
   renderDyn();
   // 编辑已有源：回填 anchor_at（表单无输入框，用隐藏字段原样保留，避免锚定基准漂移）
@@ -3188,7 +3338,7 @@ $('#balEditClose').onclick = ()=>{ $('#balEditor').style.display='none'; };
 $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent='15'; loadRec(); };
 
 loadOv();
-setInterval(loadOv, 5000);
+setInterval(loadOv, 1000);
 </script>
 </body>
 </html>
@@ -3222,146 +3372,96 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 .bal .bname{color:var(--dim);max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .foot{padding:8px 12px;border-top:1px solid rgba(51,65,85,.5);display:flex;gap:6px;align-items:center;justify-content:flex-end}
 .foot .st{font-size:10px;color:var(--dim);margin-right:auto}
-.foot .go{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;text-decoration:none}
+.foot .go{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px}
 .foot .go:hover{border-color:var(--acc)}
-/* 折叠小球 */
-#w.ball{width:auto;border-radius:999px;overflow:hidden}
-#w.ball .head{border-bottom:none;padding:8px 14px}
-#w.ball .body,#w.ball .foot{display:none}
-#w.ball .t{font-size:16px}
-/* 紧凑模式 */
-#w.compact{width:230px}
-#w.compact .row{font-size:11px;padding:2px 0}
-#w.compact .bal .bname{max-width:80px}
-/* 独立窗口（popup）模式：卡片填满窗口 */
-body.popup{background:#0f172a}
-body.popup #w{left:0;top:0;width:100%;height:100%;border:none;border-radius:0;box-shadow:none;display:flex;flex-direction:column}
-body.popup .body{flex:1;overflow:auto}
-body.popup .head{cursor:default}
-/* 提示条 */
-#toast{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);background:#0b1220;border:1px solid var(--line);color:var(--fg);font-size:11px;padding:6px 12px;border-radius:8px;opacity:0;transition:.2s;pointer-events:none;z-index:10000;white-space:nowrap}
-#toast.show{opacity:1}
 </style>
 </head>
 <body>
 <div id="w">
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
-    <span class="t" id="title">Token 用量</span>
-    <button class="hbtn" id="popout" title="弹出独立窗口">⧉</button>
-    <button class="hbtn" id="fold" title="折叠/展开">–</button>
-    <button class="hbtn" id="close" title="关闭窗口" style="display:none">✕</button>
+    <span class="t" id="title">Token 挂件</span>
+    <button class="hbtn" id="pop" title="独立小窗">⧉</button>
+    <button class="hbtn" id="fold" title="折叠">—</button>
   </div>
   <div class="body" id="body">
-    <div class="row"><span class="k">会话</span><span class="v" id="sessV">—</span></div>
-    <div class="row"><span class="k">今日</span><span class="v" id="todayV">—</span></div>
-    <div class="row"><span class="k">费用(今日)</span><span class="v cost" id="costV">—</span></div>
-    <div class="row"><span class="k">输入 / 输出</span><span class="v" id="ioV">—</span></div>
-    <div class="row"><span class="k">模型</span><span class="v" id="modelV" style="font-size:11px;color:var(--dim)">—</span></div>
+    <div class="row"><span class="k">本次会话</span><span class="v" id="v_sess">—</span></div>
+    <div class="row"><span class="k">今日</span><span class="v" id="v_today">—</span></div>
+    <div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div>
+    <div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div>
+    <div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div>
     <div class="sep"></div>
-    <div id="balBox"></div>
+    <div class="bal" id="bal"></div>
   </div>
-  <div class="foot" id="foot">
-    <span class="st" id="upd">—</span>
-    <a class="go" href="./stats" target="_blank" rel="noopener">完整看板</a>
-    <a class="go" href="stats-widget" target="_blank" rel="noopener" id="tabLink">新标签</a>
+  <div class="foot">
+    <span class="st" id="st">—</span>
+    <button class="go" id="go">打开看板</button>
   </div>
 </div>
-<div id="toast"></div>
 <script>
 const API = '/api/plugin/KiraAI_token_stats_plugin';
-const $ = s => document.querySelector(s);
+const $ = s=>document.querySelector(s);
 const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1000)+'K';
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
   return Math.round(v/1e9)+'B'; };
-const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const isPopup = !!window.opener;
-let collapsed = localStorage.getItem('tsWidgetCollapsed')==='1';
 let compact = localStorage.getItem('tsWidgetCompact')==='1';
-let toastTimer = null;
-function toast(msg){
-  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.remove('show'), 2600);
-}
-applyMode();
-$('#fold').onclick = ()=>{ collapsed=!collapsed; localStorage.setItem('tsWidgetCollapsed', collapsed?'1':'0'); applyMode(); };
-$('#popout').onclick = ()=>{
-  const w = window.open(location.pathname, 'tsWidgetPopup', 'popup=yes,width=360,height=500,resizable=yes');
-  if(!w) toast('弹窗被拦截：请允许本站弹窗，或用底部「新标签」打开');
-};
-$('#close').onclick = ()=>{ try{ window.close(); }catch(e){ toast('无法自动关闭，请手动关闭窗口'); } };
-function applyMode(){
-  const w = $('#w');
-  w.classList.toggle('ball', collapsed);
-  w.classList.toggle('compact', !collapsed && compact);
-  $('#fold').textContent = collapsed ? '+' : '–';
-  $('#title').textContent = collapsed ? '☰' : 'Token 用量';
-}
-if(isPopup){
-  document.body.classList.add('popup');
-  $('#close').style.display = '';
-  $('#popout').style.display = 'none';
-  $('#fold').style.display = 'none';
-  $('#tabLink').style.display = 'none';
-}
-async function tick(){
+let pos = null;
+try{ pos = JSON.parse(localStorage.getItem('tsWidgetPos')||'null'); }catch(e){}
+if(pos){ $('#w').style.left=pos.x+'px'; $('#w').style.top=pos.y+'px'; }
+if(compact){ $('#w').style.width='180px'; }
+async function refresh(){
   try{
     const d = await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());
-    const r = (d.ranges||{})||{}, co = (d.costs||{})||{};
-    const t = co.today||{};
     $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
-    $('#sessV').textContent = fmt4(((r.session)||{}).v||0) + ' · ' + (d.rounds||0) + '轮';
-    $('#todayV').textContent = fmt4((r.today||{}).v||0);
-    const costBits=[]; if(t.matched&&t.cny)costBits.push('¥'+t.cny); if(t.matched&&t.pts)costBits.push(t.pts+'积分');
-    $('#costV').textContent = costBits.length?costBits.join(' + '):'—';
-    $('#ioV').textContent = fmt4((r.today||{}).i||0)+' / '+fmt4((r.today||{}).o||0);
-    $('#modelV').textContent = esc(d.model||'—');
-    let balHtml='';
-    try{
-      const b = await fetch(API+'/balance',{cache:'no-store'}).then(r=>r.json());
-      (b.sources||[]).slice(0,3).forEach(x=>{
-        const unit = x.currency==='积分'?'积分':(b.unit||'元');
-        balHtml += '<div class="row bal"><span class="bname" title="'+esc(x.name)+'">'+esc(x.name)+'</span><span class="v '+(x.ok?'cost':'')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</span></div>';
-      });
-      if(!(b.sources||[]).length) balHtml = '<div class="row bal"><span class="bname">未配置余额源</span></div>';
-    }catch(e){ balHtml = '<div class="row bal"><span class="bname">余额加载失败</span></div>'; }
-    $('#balBox').innerHTML = balHtml;
-    $('#upd').textContent = new Date().toTimeString().slice(0,8);
-  }catch(e){ $('#upd').textContent = '连接失败'; }
+    $('#title').textContent = 'Token · ' + (d.model||'—');
+    $('#v_sess').textContent = fmt4(d.total);
+    $('#v_today').textContent = fmt4((d.ranges||{}).today ? d.ranges.today.v : 0);
+    $('#v_d7').textContent = fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0);
+    const co = (d.costs||{}).today||{}, coT = (d.costs||{}).total||{};
+    $('#v_cost').textContent = co.matched ? (co.cny?('¥'+co.cny):(co.pts?co.pts+' 积分':'—')) : '—';
+    $('#v_cost_total').textContent = coT.matched ? (coT.cny?('¥'+coT.cny):(coT.pts?coT.pts+' 积分':'—')) : '—';
+    const b = d.balance||{};
+    $('#bal').innerHTML = b.current ? '<div class="row"><span class="k">余额</span><span class="v">'+b.current+'</span></div>' : '';
+    $('#st').textContent = '会话 '+d.rounds+' 轮 · '+(d.src||'');
+  }catch(e){ $('#st').textContent = '加载失败'; }
 }
-/* 拖动（仅 iframe 内嵌模式；独立窗口由浏览器标题栏拖动） */
-if(!isPopup){
-  (function(){
-    const w = $('#w'), hd = $('#hd');
-    let sx,sy,ox,oy,drag=false;
-    let pos=null; try{ pos=JSON.parse(localStorage.getItem('tsWidgetPos')||'null'); }catch(e){}
-    const cx = (pos && typeof pos.x==='number') ? pos.x : 16;
-    const cy = (pos && typeof pos.y==='number') ? pos.y : 16;
-    w.style.left = cx+'px'; w.style.top = cy+'px';
-    hd.addEventListener('mousedown',e=>{
-      if(e.target.tagName==='BUTTON') return;
-      drag=true; w.classList.add('dragging');
-      sx=e.clientX; sy=e.clientY;
-      const r=w.getBoundingClientRect(); ox=r.left; oy=r.top;
-    });
-    document.addEventListener('mousemove',e=>{
-      if(!drag) return;
-      const nx=Math.max(0,Math.min(window.innerWidth-40, ox+e.clientX-sx));
-      const ny=Math.max(0,Math.min(window.innerHeight-40, oy+e.clientY-sy));
-      w.style.left=nx+'px'; w.style.top=ny+'px';
-    });
-    document.addEventListener('mouseup',()=>{
-      if(!drag) return;
-      drag=false; w.classList.remove('dragging');
-      try{ localStorage.setItem('tsWidgetPos', JSON.stringify({x:parseInt(w.style.left,10),y:parseInt(w.style.top,10)})); }catch(e){}
-    });
-  })();
-}
-tick();
-setInterval(tick, 10000);
+refresh();
+setInterval(refresh, 5000);
+// 拖动
+let drag=false, sx=0, sy=0, ox=0, oy=0;
+$('#hd').addEventListener('mousedown',e=>{
+  if(e.target.classList.contains('hbtn')) return;
+  drag=true; sx=e.clientX; sy=e.clientY;
+  const r=$('#w').getBoundingClientRect(); ox=r.left; oy=r.top;
+  $('#w').classList.add('dragging');
+});
+document.addEventListener('mousemove',e=>{
+  if(!drag) return;
+  $('#w').style.left=Math.max(0,ox+e.clientX-sx)+'px';
+  $('#w').style.top=Math.max(0,oy+e.clientY-sy)+'px';
+});
+document.addEventListener('mouseup',()=>{
+  if(!drag) return;
+  drag=false; $('#w').classList.remove('dragging');
+  const r=$('#w').getBoundingClientRect();
+  localStorage.setItem('tsWidgetPos', JSON.stringify({x:r.left,y:r.top}));
+});
+// 折叠
+$('#fold').onclick=()=>{
+  const b=$('#body'), f=$('#fold');
+  if(b.style.display==='none'){ b.style.display=''; f.textContent='—'; }
+  else { b.style.display='none'; f.textContent='+'; }
+};
+// 独立小窗
+$('#pop').onclick=()=>{
+  const w=window.open('', '_blank', 'width=340,height=300');
+  if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
+  w.document.write('<html><head><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.95);border:1px solid #334155;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#e2e8f0;user-select:none;z-index:9999}.row{display:flex;justify-content:space-between;padding:5px 12px;font-size:12px}.row .k{color:#94a3b8}.row .v{font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:#334155;margin:6px 0}.foot{padding:8px 12px;font-size:10px;color:#94a3b8;border-top:1px solid #334155}</style></head><body><div id="w"></div><script>const API='"+API+"';const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ''+v;if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K';if(v<995000)return Math.round(v/1000)+'K';if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M';if(v<995000000)return Math.round(v/1e6)+'M';return Math.round(v/1e9)+'B'};async function rf(){try{const d=await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const b=d.balance||{};document.getElementById('w').innerHTML='<div class=row><span class=k>本次会话</span><span class=v>'+fmt4(d.total)+'</span></div><div class=row><span class=k>今日</span><span class=v>'+fmt4((d.ranges||{}).today?d.ranges.today.v:0)+'</span></div><div class=row><span class=k>近7天</span><span class=v>'+fmt4((d.ranges||{}).d7?d.ranges.d7.v:0)+'</span></div><div class=row><span class=k>费用(今日)</span><span class="v cost">'+(co.matched?(co.cny?('¥'+co.cny):(co.pts?co.pts+' 积分':'—')):'—')+'</span></div><div class=row><span class=k>费用(累计)</span><span class="v cost">'+(coT.matched?(coT.cny?('¥'+coT.cny):(coT.pts?coT.pts+' 积分':'—')):'—')+'</span></div>'+(b.current?'<div class=sep></div><div class=row><span class=k>余额</span><span class=v>'+b.current+'</span></div>':'')+'<div class=foot>会话 '+d.rounds+' 轮 · '+(d.src||'')+'</div>';}catch(e){document.getElementById('w').innerHTML='<div class=foot>加载失败</div>';}}rf();setInterval(rf,5000);<\/script></body></html>');
+  w.document.close();
+};
+$('#go').onclick=()=>{ window.open('/page/plugin/KiraAI_token_stats_plugin/stats','_blank'); };
 </script>
 </body>
 </html>
 """
-
