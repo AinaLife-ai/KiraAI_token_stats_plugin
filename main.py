@@ -3288,8 +3288,17 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Token 用量统计</title>
 <style>
-:root{--bg:#0f172a;--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--purple:#a78bfa;--pink:#f472b6}
+:root{--bg:#0f172a;--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#a3b2c7;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--purple:#a78bfa;--pink:#f472b6;--inset:#0b1220}
 *{margin:0;padding:0;box-sizing:border-box}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@keyframes shimmer{from{background-position:-200px 0}to{background-position:200px 0}}
+.panel.on{animation:fadeIn .25s ease}
+.skel{height:92px;border-radius:12px;background:linear-gradient(90deg,var(--card) 25%,#263449 50%,var(--card) 75%);background-size:400px 100%;animation:shimmer 1.2s linear infinite;border:1px solid var(--line)}
+.card{transition:transform .18s ease,box-shadow .18s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.3)}
+.card[data-k="session"],.card[data-k="today"]{grid-column:span 2}
+@media(max-width:700px){.card[data-k="session"],.card[data-k="today"]{grid-column:span 1}}
+.card.errbox{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),var(--card)}
 body{background:var(--bg);color:var(--fg);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;padding:20px;font-size:14px;background-size:cover;background-position:center;background-attachment:fixed}
 body.bg-on #app{background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-radius:16px;padding:20px;border:1px solid rgba(51,65,85,.5);box-shadow:0 8px 32px rgba(0,0,0,.35)}
 #skinBtn{position:fixed;right:14px;bottom:14px;width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:rgba(30,41,59,.7);color:var(--dim);cursor:pointer;font-size:16px;z-index:999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
@@ -3321,6 +3330,8 @@ h1 .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 @media(max-width:900px){.grid2{grid-template-columns:1fr}}
 .box{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.hours .h{background:var(--inset)}
+.bar{background:var(--inset)}
 .box h3{font-size:14px;margin-bottom:10px;color:var(--fg)}
 .box h3 .seg{float:right;font-size:11px;color:var(--dim);font-weight:400;cursor:pointer;border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin-left:6px}
 .box h3 .seg.on{background:var(--acc);color:#06283d;border-color:var(--acc)}
@@ -3330,11 +3341,11 @@ td{padding:6px 8px;border-bottom:1px solid rgba(51,65,85,.4);font-variant-numeri
 tr:hover td{background:rgba(56,189,248,.05)}
 tr.cur td{background:rgba(52,211,153,.07)}
 .rate{color:var(--purple)}.ok{color:var(--ok)}.bad{color:var(--err)}
-.bar{height:8px;border-radius:4px;background:#0b1220;overflow:hidden;margin-top:4px}
+.bar{height:8px;border-radius:4px;background:var(--inset);overflow:hidden;margin-top:4px}
 .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--purple));border-radius:4px}
 .hours{display:grid;grid-template-columns:repeat(12,1fr);gap:6px}
-.hours .h{background:#0b1220;border-radius:6px;padding:6px;text-align:center;font-size:10px;color:var(--dim)}
-.hours .h i{display:block;height:46px;background:#0b1220;border-radius:3px;margin:4px 0 2px;position:relative;overflow:hidden}
+.hours .h{background:var(--inset);border-radius:6px;padding:6px;text-align:center;font-size:10px;color:var(--dim)}
+.hours .h i{display:block;height:46px;background:var(--inset);border-radius:3px;margin:4px 0 2px;position:relative;overflow:hidden}
 .hours .h i b{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(180deg,var(--acc),#6366f1);border-radius:3px 3px 0 0}
 .hours .h.clickable{cursor:pointer}.hours .h.clickable:hover{border:1px solid var(--acc)}
 .btn{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:8px;padding:5px 14px;cursor:pointer;font-size:12px}
@@ -3357,7 +3368,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
 .trend .col:hover .stack{filter:brightness(1.3)}
 .trend .hitsvg{position:absolute;left:0;top:6px;width:100%;height:calc(100% - 22px);pointer-events:none;overflow:visible}
 .trend .tlbl{text-align:center;font-size:10px;color:var(--dim);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.trend .tip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11px;white-space:nowrap;opacity:0;transition:.15s;z-index:20;pointer-events:none;color:var(--fg)}
+.trend .tip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11px;white-space:nowrap;opacity:0;transition:.15s;z-index:20;pointer-events:none;color:var(--fg)}
 .trend .tip.flip{left:auto;right:0;transform:none}
 .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--dim)}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
@@ -3381,7 +3392,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
 
 <div class="panel on" id="p-ov">
   <div class="snapshot" id="snap"></div>
-  <div class="cards" id="cards"></div>
+  <div class="cards" id="cards"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
   <div class="grid2">
     <div class="box" id="histBox"><h3>按天历史</h3><div id="hist"></div></div>
     <div class="box" id="hourBox"><h3>今日按小时 <span class="note" style="float:right">点击小时柱下钻最近记录</span></h3><div id="hours"></div></div>
@@ -3447,7 +3458,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="priceAdd">＋ 添加规则</button>
       <span style="color:var(--dim);font-size:12px" id="priceInfo"></span>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:8px 12px">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:8px 12px">
       <span style="color:var(--dim);font-size:12px">峰谷方案库：</span>
       <select id="peakProfileSel" style="width:200px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px"></select>
       <input id="peakProfileName" style="width:130px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px" placeholder="方案名">
@@ -3508,6 +3519,37 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const localDate = () => { const d=new Date();
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
+// 页内 toast（沙箱内 alert 不可用，一律用 toast）
+function dtoast(msg){
+  let t = document.getElementById('dToast');
+  if(!t){
+    t = document.createElement('div');
+    t.id = 'dToast';
+    t.style.cssText = 'position:fixed;left:50%;bottom:60px;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid var(--line);color:var(--fg);padding:8px 16px;border-radius:20px;font-size:13px;z-index:999;transition:opacity .3s;pointer-events:none;max-width:88vw';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.opacity = '1';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 2200);
+}
+// 内联二次确认（沙箱内 confirm 不可用）：首次点击变「确认？」2.5s 内再点执行
+function confirmBtn(btn, label, fn){
+  if(btn._arm){ btn._arm=false; btn.textContent=btn._orig; btn.classList.remove('on'); fn(); return; }
+  btn._arm = true; btn._orig = btn.textContent; btn.textContent = label; btn.classList.add('on');
+  setTimeout(()=>{ if(btn._arm){ btn._arm=false; btn.textContent=btn._orig; btn.classList.remove('on'); } }, 2500);
+}
+// KPI 数字 rAF 300ms 插值滚动
+function tweenNum(el, from, to){
+  if(from===to){ el.textContent = fmt4(to); return; }
+  const t0 = performance.now();
+  const step = t => {
+    const p = Math.min(1,(t-t0)/300);
+    el.textContent = fmt4(Math.round(from+(to-from)*p));
+    if(p<1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
 const MODEL_COLORS = ['#38bdf8','#a78bfa','#f472b6','#34d399','#fbbf24','#fb7185','#22d3ee','#c084fc'];
 const costText = c => c==null ? '—' : (c.indexOf('积分')>=0 ? c : '¥'+c);
 
@@ -3537,7 +3579,19 @@ function sparkHtml(arr){
 const RL = {session:'本次会话',today:'今天',d7:'近7天',d30:'近30天',total:'累计'};
 const sessLabel = d => d.sess_name ? d.sess_name : (d.sess_sid ? d.sess_sid : '本次会话');
 async function loadOv(){
+  try{
+    await _loadOvInner();
+    const t = new Date();
+    $('#updAt').textContent = '上次更新 '+String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0')+':'+String(t.getSeconds()).padStart(2,'0');
+  }catch(e){
+    $('#dot').style.background = 'var(--err)';
+    $('#dot').style.boxShadow = '0 0 8px var(--err)';
+    $('#updAt').textContent = '更新失败';
+  }
+}
+async function _loadOvInner(){
   const d = await jget('/stats');
+  $('#dot').style.boxShadow = '';
   $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
   $('#sub').textContent = '模型 ' + (d.model||'—') + ' · 渠道 ' + (d.channel||'—') + ' · 日志 ' + (d.logFile||'');
   const el = Math.floor(d.elapsed/60), em = d.elapsed%60;
@@ -3556,7 +3610,7 @@ async function loadOv(){
     // 迷你走势（非本次会话）：近14天分布
     let sp = '';
     if(k!=='session') sp = '<div class="spark">'+sparkHtml(dayVols.slice(-14))+'</div>';
-    cards.push({k:k, html:'<div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
+    cards.push({k:k, vnum:rg.v||0, html:'<div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
       '<div class="d">'+fmt(rg.r)+' 轮 · 输入 '+fmt(rg.i)+' · 输出 '+fmt(rg.o)+' · 缓存 '+fmt(rg.c)+' · 命中率 <span class="rate">'+rate+'</span></div>'+
       '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div>'});
   }
@@ -3606,7 +3660,7 @@ function renderCards(cards){
 async function loadHist(hist){
   const d = hist || await jget('/history');
   const days = (d.days||[]).slice(-14);
-  if(!days.length){ $('#hist').innerHTML='<div class="note">暂无历史数据</div>'; return; }
+  if(!days.length){ $('#hist').innerHTML='<div class="note">暂无历史数据。开始对话后自动统计；想看到费用请先去 <button class="btn" onclick="showTab(\'price\')">配置价格规则</button></div>'; return; }
   const max = Math.max(...days.map(x=>x.v),1);
   const today = localDate();
   $('#hist').innerHTML = '<table><thead><tr><th>日期</th><th>总量</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th style="width:30%">分布</th></tr></thead><tbody>'+
@@ -3652,7 +3706,7 @@ async function loadTrend(r){
     : (d.from+' ~ '+d.to+'（点柱 → 下钻该天按小时）');
   $('#trendBack').style.display = (curDay||curHour!==null) ? '' : 'none';
   const days = d.days||[], models = d.topModels||[];
-  if(!days.length){ $('#trend').innerHTML='<div class="note" style="padding:20px">该范围暂无数据</div>'; $('#trendLegend').innerHTML=''; $('#trendNote').textContent=''; return; }
+  if(!days.length){ $('#trend').innerHTML='<div class="note" style="padding:20px">该范围暂无数据 <button class="btn" onclick="showTab(\'price\')">去配置价格规则</button></div>'; $('#trendLegend').innerHTML=''; $('#trendNote').textContent=''; return; }
   const maxV = Math.max(...days.map(x=>x.v),1);
   // 图例色与柱色统一：按 topModels 顺序建立 name→color 映射
   const colorOf = {};
@@ -3799,7 +3853,7 @@ async function loadPrice(){
   $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>启用</th><th>名称</th><th>币种</th><th>单位</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷方案</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
     priceRules.map((r,i)=>'<tr'+(r.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(r.enabled!==false?'checked':'')+' onchange="priceToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.unit!==undefined?r.unit:(r.currency==='积分'?'积分':'¥'))+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
     '<td>'+(r.peak_enabled===false?'恒谷':esc(r.peak_profile||'默认工作日'))+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
-    '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+')">删除</button></td></tr>').join('')+'</tbody></table>'+
+    '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+',this)">删除</button></td></tr>').join('')+'</tbody></table>'+
     '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；每条规则可选自己的峰谷方案（上方方案库管理）。双币种分别累计，不与 ¥ 混算。改价/改方案后全历史费用即时重算。</div>'
     : '<div class="note">暂无价格规则，费用显示「—」。点「＋ 添加规则」配置第一条。</div>';
 }
@@ -3819,7 +3873,7 @@ const PRICE_FIELDS = [
 ];
 function priceFieldHtml(f){
   return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
-    '<input id="pf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
+    '<input id="pf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
 }
 function priceEditOpen(i){
   priceEditIdx = i;
@@ -3827,10 +3881,10 @@ function priceEditOpen(i){
   const pe = r.peak_enabled !== undefined ? r.peak_enabled : true; // 旧规则无该字段按启用处理
   $('#priceEditTitle').textContent = i>=0 ? '编辑价格规则' : '添加价格规则';
   let html = priceFieldHtml(['name','规则名称',r.name||'']);
-  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷价</label><select id="pf_peak_enabled" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷价</label><select id="pf_peak_enabled" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
     '<option value="1"'+(pe?' selected':'')+'>启用峰谷价</option>'+
     '<option value="0"'+(pe?'':' selected')+'>不启用（全天按谷价）</option></select></div>';
-  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷方案</label><select id="pf_peak_profile" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷方案</label><select id="pf_peak_profile" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
     peakProfiles.map(p=>'<option value="'+esc(p.name)+'"'+(r.peak_profile===p.name?' selected':'')+'>'+esc(p.name)+'</option>').join('')+'</select></div>';
   html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">';
   PRICE_FIELDS.slice(1).forEach(f=>{ html += priceFieldHtml(f); });
@@ -3847,7 +3901,7 @@ function priceEditOpen(i){
     const item = {name:$('#pf_name').value.trim(), peak_enabled:$('#pf_peak_enabled').value==='1'};
     const pp = $('#pf_peak_profile');
     if(pp && pp.value) item.peak_profile = pp.value;
-    if(!item.name){ alert('请填写规则名称'); return; }
+    if(!item.name){ dtoast('请填写规则名称'); return; }
     PRICE_FIELDS.slice(1).forEach(f=>{
       const el = $('#pf_'+f[0]);
       if(!el) return;
@@ -3862,16 +3916,17 @@ function priceEditOpen(i){
     else priceRules.push(item);
     const r2 = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
     if(r2.ok){ $('#priceEditor').style.display='none'; loadPrice(); loadOv(); }
-    else alert('保存失败：'+(r2.msg||'未知错误'));
+    else dtoast('保存失败：'+(r2.msg||'未知错误'));
   };
   $('#priceEditor').style.display='flex';
 }
-async function priceDel(i){
-  if(!confirm('删除价格规则「'+(priceRules[i]?priceRules[i].name:'')+'」？')) return;
-  priceRules.splice(i,1);
-  const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
-  if(r.ok){ loadPrice(); loadOv(); }
-  else alert('删除失败：'+(r.msg||'未知错误'));
+function priceDel(i, btn){
+  confirmBtn(btn, '确认删除？', async ()=>{
+    priceRules.splice(i,1);
+    const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
+    if(r.ok){ loadPrice(); loadOv(); }
+    else dtoast('删除失败：'+(r.msg||'未知错误'));
+  });
 }
 $('#priceAdd').onclick = ()=>priceEditOpen(-1);
 $('#priceEditClose').onclick = ()=>{ $('#priceEditor').style.display='none'; };
@@ -3891,7 +3946,7 @@ function parseWindows(raw){
 async function saveProfiles(){
   const r = await fetch(API+'/pricing-profiles', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({profiles:peakProfiles})}).then(x=>x.json());
   if(r.ok){ loadPrice(); loadOv(); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 }
 $('#peakProfileSel').onchange = ()=>{
   peakProfileIdx = parseInt($('#peakProfileSel').value,10);
@@ -3900,13 +3955,13 @@ $('#peakProfileSel').onchange = ()=>{
 };
 $('#peakWindowsSave').onclick = async ()=>{
   const w = parseWindows($('#peakWindows').value);
-  if(!w){ alert('格式错误：请用 09:00-12:00,14:00-18:00 格式，且结束须晚于开始'); return; }
+  if(!w){ dtoast('格式错误：请用 09:00-12:00,14:00-18:00 格式，且结束须晚于开始'); return; }
   peakProfiles[peakProfileIdx].windows = w;
   await saveProfiles();
 };
 $('#peakProfileAdd').onclick = ()=>{
   const name = ($('#peakProfileName').value.trim() || ('方案'+(peakProfiles.length+1)));
-  if(peakProfiles.some(p=>p.name===name)){ alert('方案名已存在'); return; }
+  if(peakProfiles.some(p=>p.name===name)){ dtoast('方案名已存在'); return; }
   peakProfiles.push({name:name, windows:[['09:00','12:00'],['14:00','18:00']]});
   peakProfileIdx = peakProfiles.length-1;
   $('#peakProfileSel').innerHTML = peakProfiles.map((p,i)=>'<option value="'+i+'">'+esc(p.name)+'</option>').join('');
@@ -3915,20 +3970,21 @@ $('#peakProfileAdd').onclick = ()=>{
   $('#peakWindows').value = '09:00-12:00,14:00-18:00';
   saveProfiles();
 };
-$('#peakProfileDel').onclick = async ()=>{
-  if(peakProfiles.length<=1){ alert('至少保留一套方案'); return; }
+$('#peakProfileDel').onclick = async (ev)=>{
+  if(peakProfiles.length<=1){ dtoast('至少保留一套方案'); return; }
   const name = peakProfiles[peakProfileIdx].name;
-  if(priceRules.some(r=>r.peak_profile===name)){ alert('有计价规则正在使用「'+name+'」，请先改掉那些规则的方案再删'); return; }
-  if(!confirm('删除峰谷方案「'+name+'」？')) return;
-  peakProfiles.splice(peakProfileIdx,1);
-  peakProfileIdx = 0;
-  await saveProfiles();
+  if(priceRules.some(r=>r.peak_profile===name)){ dtoast('有计价规则正在使用「'+name+'」，请先改掉那些规则的方案再删'); return; }
+  confirmBtn(ev.currentTarget, '确认删除？', async ()=>{
+    peakProfiles.splice(peakProfileIdx,1);
+    peakProfileIdx = 0;
+    await saveProfiles();
+  });
 };
 async function priceToggle(i,on){
   priceRules[i].enabled = on;
   const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
   if(r.ok){ loadPrice(); loadOv(); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 }
 let balSources = [];
 let balEditIdx = -1;
@@ -3941,7 +3997,7 @@ async function loadBal(refresh){
     const unit = x.unit!==undefined ? x.unit : (x.currency==='积分' ? '积分' : (d.unit||'元'));
     return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(x.enabled!==false?'checked':'')+' onchange="balToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+(unit?' '+esc(unit):'')):'失败')+'</td>'+
     '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
-    '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+')">删除</button></td></tr>';
+    '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+',this)">删除</button></td></tr>';
   }).join('') ||
     '<tr><td colspan="7" class="note">未配置余额监测源，点「＋ 添加监测源」开始</td></tr>';
 }
@@ -3949,14 +4005,14 @@ async function balToggle(i,on){
   balSources[i].enabled = on;
   const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
   if(r.ok){ loadBal(false); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 }
 $('#balIntervalSave').onclick = async ()=>{
   const v = parseInt($('#balInterval').value,10);
-  if(!v || v<5){ alert('间隔须为 ≥5 的整数（秒）'); return; }
+  if(!v || v<5){ dtoast('间隔须为 ≥5 的整数（秒）'); return; }
   const r = await fetch(API+'/balance-interval', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({interval:v})}).then(x=>x.json());
   if(r.ok){ loadBal(false); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 };
 const BAL_TYPES = [
   ['auto','auto · 自动探测（官方端点/One-API 中转站）'],
@@ -3977,14 +4033,14 @@ const BAL_FIELDS = {
 function balFieldHtml(f){
   const tp = (f[0]==='api_key') ? ' type="password" autocomplete="off"' : '';
   return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
-    '<input id="bf_'+f[0]+'"'+tp+' style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
+    '<input id="bf_'+f[0]+'"'+tp+' style="width:100%;box-sizing:border-box;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
 }
 function balEditOpen(i){
   balEditIdx = i;
   const src = (i>=0 && balSources[i]) ? balSources[i] : {name:'',type:'auto',enabled:true};
   $('#balEditTitle').textContent = i>=0 ? '编辑监测源' : '添加监测源';
   let html = balFieldHtml(['name','名称',src.name||'']);
-  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">类型</label><select id="bf_type" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">类型</label><select id="bf_type" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
     BAL_TYPES.map(t=>'<option value="'+t[0]+'"'+(src.type===t[0]?' selected':'')+'>'+esc(t[1])+'</option>').join('')+'</select></div>';
   html += '<div id="bf_dyn"></div>';
   html += '<div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim)"><input type="checkbox" id="bf_enabled"'+(src.enabled===false?'':' checked')+'> 启用</label></div>';
@@ -3994,7 +4050,7 @@ function balEditOpen(i){
   const renderDyn = ()=>{
     const t = $('#bf_type').value;
     $('#bf_dyn').innerHTML = (BAL_FIELDS[t]||[]).map(f=>{
-      if(f[0]==='model_ref') return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label><select id="bf_model_ref" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px"><option value="">（不关联，按渠道/URL 全算）</option></select><div class="note">从 KiraAI 已配置的 LLM 模型中选择，估算消耗只统计该模型的用量（模型名+渠道匹配）</div></div>';
+      if(f[0]==='model_ref') return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label><select id="bf_model_ref" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px"><option value="">（不关联，按渠道/URL 全算）</option></select><div class="note">从 KiraAI 已配置的 LLM 模型中选择，估算消耗只统计该模型的用量（模型名+渠道匹配）</div></div>';
       return balFieldHtml(f);
     }).join('');
     (BAL_FIELDS[t]||[]).forEach(f=>{
@@ -4025,7 +4081,7 @@ function balEditOpen(i){
   $('#bf_save').onclick = async ()=>{
     const t = $('#bf_type').value;
     const item = {name:$('#bf_name').value.trim(), type:t, enabled:$('#bf_enabled').checked};
-    if(!item.name){ alert('请填写名称'); return; }
+    if(!item.name){ dtoast('请填写名称'); return; }
     (BAL_FIELDS[t]||[]).forEach(f=>{
       const el = $('#bf_'+f[0]);
       if(!el) return;
@@ -4039,16 +4095,17 @@ function balEditOpen(i){
     else balSources.push(item);
     const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
     if(r.ok){ $('#balEditor').style.display='none'; loadBal(true); }
-    else alert('保存失败：'+(r.msg||'未知错误'));
+    else dtoast('保存失败：'+(r.msg||'未知错误'));
   };
   $('#balEditor').style.display='flex';
 }
-async function balDel(i){
-  if(!confirm('删除监测源「'+(balSources[i]?balSources[i].name:'')+'」？')) return;
-  balSources.splice(i,1);
-  const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
-  if(r.ok) loadBal(false);
-  else alert('删除失败：'+(r.msg||'未知错误'));
+function balDel(i, btn){
+  confirmBtn(btn, '确认删除？', async ()=>{
+    balSources.splice(i,1);
+    const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
+    if(r.ok) loadBal(false);
+    else dtoast('删除失败：'+(r.msg||'未知错误'));
+  });
 }
 $('#balRefresh').onclick = ()=>{ $('#balRefresh').disabled=true; loadBal(true).finally(()=>$('#balRefresh').disabled=false); };
 $('#balEdit').onclick = ()=>balEditOpen(-1);
