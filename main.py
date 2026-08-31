@@ -582,7 +582,7 @@ class TokenStatsPlugin(BasePlugin):
         self._sess = {
             "start": time.time(), "last": time.time(),
             "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
-            "aggs": {},
+            "aggs": {}, "sid": "",
         }
         self._last_err_text = ""
         self._last_err_at = None
@@ -760,12 +760,15 @@ class TokenStatsPlugin(BasePlugin):
     def _apply_session(self, rec: dict):
         now = time.time()
         # 会话窗口滚动：超过 idle 分钟无新记录 → 重置
-        if now - self._sess["last"] > self.session_idle_minutes * 60:
+        sid = rec.get("sid", "") or ""
+        # 会话窗口滚动：超过 idle 分钟无新记录，或切换到其他会话 → 重置
+        if (now - self._sess["last"] > self.session_idle_minutes * 60) or (sid and sid != self._sess.get("sid")):
             self._sess = {
                 "start": now, "last": now,
-                "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {},
+                "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}, "sid": sid,
             }
         self._sess["last"] = now
+        self._sess["sid"] = sid
         s = self._sess
         s["r"] += 1
         s["v"] += rec["v"]; s["i"] += rec["i"]; s["o"] += rec["o"]; s["c"] += rec["c"]
@@ -2327,12 +2330,42 @@ class TokenStatsPlugin(BasePlugin):
                    for uu in [ukey.partition("|")[2]]]
             return {"units": arr, "matched": matched}
 
+        # 兜底：内存 aggs 未匹配到规则时，直接遍历记录现算（保证历史费用一定显示）
+        def _cost_pair_scan(frm, to):
+            units, matched = {}, False
+            for r in self._read_records():
+                try:
+                    t = _parse_ts(r["t"])
+                except Exception:
+                    continue
+                d = t.strftime("%Y-%m-%d")
+                if d < frm or d > to:
+                    continue
+                rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
+                if rule is None:
+                    continue
+                amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t)
+                if amt is None:
+                    continue
+                ukey = f"{cur}|{_rule_unit(rule)}"
+                units[ukey] = units.get(ukey, 0.0) + amt
+                matched = True
+            arr = [{"unit": uu, "amt": f"{uamt:,.4f}"} for ukey, uamt in units.items() if uamt
+                   for uu in [ukey.partition("|")[2]]]
+            return {"units": arr, "matched": matched}
+
+        def _cost_any(k, frm, to):
+            cp = _cost_pair(k)
+            if cp["matched"] and cp["units"]:
+                return cp
+            return _cost_pair_scan(frm, to)
+
         costs = {
             "session": _cost_pair(self._session_cost_units()),
-            "today": _cost_pair(self._range_cost_units(today, today)),
-            "d7": _cost_pair(self._range_cost_units(d7, today)),
-            "d30": _cost_pair(self._range_cost_units(d30, today)),
-            "total": _cost_pair(self._range_cost_units("0000-01-01", "9999-12-31")),
+            "today": _cost_any(self._range_cost_units(today, today), today, today),
+            "d7": _cost_any(self._range_cost_units(d7, today), d7, today),
+            "d30": _cost_any(self._range_cost_units(d30, today), d30, today),
+            "total": _cost_any(self._range_cost_units("0000-01-01", "9999-12-31"), "0000-01-01", "9999-12-31"),
         }
         errors = {
             "session": s.get("e", 0),
@@ -2374,6 +2407,8 @@ class TokenStatsPlugin(BasePlugin):
             "model": model,
             "channel": channel,
             "src": self._cur_source,
+            "sess_sid": s.get("sid", ""),
+            "sess_name": await self._resolve_sid_name(s.get("sid", "")) if s.get("sid") else "",
             "elapsed": max(0, int(time.time() - s["start"])),
             "rounds": s["r"],
             "total": s["v"], "input": s["i"], "output": s["o"], "cached": s["c"],
@@ -2427,6 +2462,12 @@ class TokenStatsPlugin(BasePlugin):
                 "cur": cur,
                 "unit": _rule_unit(rule) if rule else "",
             })
+        # 并发解析会话昵称（唯一 sid 去重，缓存命中后零开销）
+        uniq = sorted({x["sid"] for x in out if x["sid"]})
+        nmap = dict(zip(uniq, await asyncio.gather(*(self._resolve_sid_name(s) for s in uniq))))
+        for x in out:
+            x["sid_name"] = nmap.get(x["sid"], "")
+            x["type"] = "dm" if ":dm:" in x["sid"] else ("gm" if ":gm:" in x["sid"] else "other")
         return {"recs": out}
 
     @register.api(method="GET", path="/analytics", auth=True)
@@ -2486,6 +2527,16 @@ class TokenStatsPlugin(BasePlugin):
             arr.sort(key=lambda x: x["v"], reverse=True)
             return arr[:20]
 
+        async def dim_sid(d):
+            arr = [{"k": k, **v} for k, v in d.items()]
+            arr.sort(key=lambda x: x["v"], reverse=True)
+            out = arr[:20]
+            uniq = sorted({x["k"] for x in out if x["k"]})
+            nmap = dict(zip(uniq, await asyncio.gather(*(self._resolve_sid_name(s) for s in uniq))))
+            for x in out:
+                x["name"] = nmap.get(x["k"], "")
+            return out
+
         def fmt_cost(a):
             bits = []
             if a.get("matched"):
@@ -2501,7 +2552,7 @@ class TokenStatsPlugin(BasePlugin):
             "bySource": dim(by_source),
             "byChannel": dim(by_channel),
             "byModel": dim(by_model),
-            "bySid": dim(by_sid),
+            "bySid": await dim_sid(by_sid),
         }
 
     # ── 会话昵称解析（OneBot，带 1 小时缓存，失败降级为 sid）──
@@ -3346,6 +3397,7 @@ function sparkHtml(arr){
 }
 
 const RL = {session:'本次会话',today:'今天',d7:'近7天',d30:'近30天',total:'累计'};
+const sessLabel = d => d.sess_name ? d.sess_name : (d.sess_sid ? d.sess_sid : '本次会话');
 async function loadOv(){
   const d = await jget('/stats');
   $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
@@ -3366,7 +3418,7 @@ async function loadOv(){
     // 迷你走势（非本次会话）：近14天分布
     let sp = '';
     if(k!=='session') sp = '<div class="spark">'+sparkHtml(dayVols.slice(-14))+'</div>';
-    cards.push('<div class="card"><div class="k">'+RL[k]+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
+    cards.push('<div class="card"><div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
       '<div class="d">'+fmt(rg.r)+' 轮 · 输入 '+fmt(rg.i)+' · 输出 '+fmt(rg.o)+' · 缓存 '+fmt(rg.c)+' · 命中率 <span class="rate">'+rate+'</span></div>'+
       '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div></div>');
   }
@@ -3429,7 +3481,7 @@ $('#trendBack').onclick=()=>{
   else if(curDay){ curDay=null; loadTrend(); }
 };
 async function loadTrend(r){
-  let url = '/trend?range='+(curDay?curTr:'d7');
+  let url = '/trend?range='+(curTr||'d7');
   if(curDay && curHour===null) url = '/trend?day='+curDay;   // 后端按天(day=)返回小时桶
   if(curDay && curHour!==null) url = '/trend?day='+curDay+'&hour='+curHour; // 后端按小时(day+hour=)返回5分钟桶
   const d = await jget(url);
@@ -3498,7 +3550,8 @@ async function loadDim(r){
   const push = (name, arr) => (arr||[]).forEach(x=>{
     rows.push('<tr><td>'+esc(name)+'</td><td>'+esc(x.k)+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td></tr>');
   });
-  push('来源', d.bySource); push('渠道', d.byChannel); push('模型', d.byModel); push('会话', d.bySid);
+  push('来源', d.bySource); push('渠道', d.byChannel); push('模型', d.byModel);
+  (d.bySid||[]).forEach(x=>{ rows.push('<tr><td>会话</td><td>'+esc(x.name||x.k)+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td></tr>'); });
   $('#dimBody').innerHTML = rows.join('') || '<tr><td colspan="8" class="note">该范围暂无数据</td></tr>';
 }
 let curSessRange='d7';
@@ -3527,7 +3580,7 @@ function sessRecs(sid){
 async function loadRecBySid(sid){
   const d = await jget('/records?n=100&sid='+encodeURIComponent(sid));
   $('#recBody').innerHTML = (d.recs||[]).map(x=>
-    '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+esc(x.s)+'</td><td>'+esc(x.ch)+'</td>'+
+    '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+(x.sid?('<span class="note">['+(x.type==='dm'?'私聊':(x.type==='gm'?'群聊':'其他'))+']</span> '+esc(x.sid_name||x.sid)):esc(x.s))+'</td><td>'+esc(x.ch)+'</td>'+
     '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
     '<tr><td colspan="9" class="note">该会话暂无记录</td></tr>';
 }
@@ -3546,7 +3599,7 @@ async function loadRec(){
     });
   }
   $('#recBody').innerHTML = recs.map(x=>
-    '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+esc(x.s)+'</td><td>'+esc(x.ch)+'</td>'+
+    '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+(x.sid?('<span class="note">['+(x.type==='dm'?'私聊':(x.type==='gm'?'群聊':'其他'))+']</span> '+esc(x.sid_name||x.sid)):esc(x.s))+'</td><td>'+esc(x.ch)+'</td>'+
     '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
     '<tr><td colspan="9" class="note">'+(recSlotFilter?'该时段暂无记录':'暂无记录')+'</td></tr>';
   recSlotFilter = null;
@@ -3578,8 +3631,8 @@ const PRICE_FIELDS = [
   ['url_match','URL 匹配（可选）','api.deepseek.com'],
   ['model_match','模型匹配（可选）','flash'],
   ['channel_match','渠道匹配（可选）','deepseek'],
-  ['currency','币种','CNY（或填 积分）'],
-  ['unit','显示单位(留空=无单位)','¥'],
+  ['currency','币种','CNY=人民币计价；填 积分 则按积分计价（与 ¥ 分开累计，永不混算）'],
+  ['unit','显示单位(留空=无单位)','仅影响展示：如 ¥ / 元 / $ / 积分。币种决定计价口径，单位只是显示符号，两者独立'],
   ['hit_peak','缓存命中·峰时价','0.10'],
   ['hit_off','缓存命中·谷时价','0.05'],
   ['miss_peak','未命中·峰时价','3.0'],
@@ -4037,7 +4090,7 @@ $('#pop').onclick=()=>{
   if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
   setTimeout(()=>URL.revokeObjectURL(url), 60000);
 };
-$('#go').onclick=()=>{ window.open('/page/plugin/KiraAI_token_stats_plugin/stats','_blank'); };
+$('#go').onclick=()=>{ const u='/page/plugin/KiraAI_token_stats_plugin/stats'; const w=window.open(u,'_blank'); if(!w){ const a=document.createElement('a'); a.href=u; a.target='_blank'; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove(); } };
 </script>
 </body>
 </html>
