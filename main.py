@@ -2975,7 +2975,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
 </style>
 </head>
 <body>
-<button id="skinBtn" title="随机背景开关">🎨</button>
+<button id="skinBtn" title="随机背景开关">👕</button>
 <div id="app">
 <h1><span class="dot" id="dot"></span>Token 用量统计</h1>
 <div class="sub" id="sub">加载中…</div>
@@ -3573,7 +3573,7 @@ $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent=
 
 loadOv();
 setInterval(loadOv, 1000);
-// 随机背景（默认开，右下角 🎨 点击关闭，localStorage 记忆）
+// 随机背景（默认开，右下角 👕 点击关闭，localStorage 记忆）
 (function(){
   const BG_KEY = 'tsSkinBg';
   const bgOn = localStorage.getItem(BG_KEY) !== '0';
@@ -3634,7 +3634,7 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 </style>
 </head>
 <body>
-<button id="skinBtn" title="随机背景开关">🎨</button>
+<button id="skinBtn" title="随机背景开关">👕</button>
 <div id="w">
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
@@ -3686,7 +3686,7 @@ async function refresh(){
 }
 refresh();
 setInterval(refresh, 5000);
-// 随机背景（默认开，右下角 🎨 点击关闭）
+// 随机背景（默认开，右下角 👕 点击关闭）
 (function(){
   const BG_KEY = 'tsWidgetSkinBg';
   const bgOn = localStorage.getItem(BG_KEY) !== '0';
