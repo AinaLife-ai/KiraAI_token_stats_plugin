@@ -313,6 +313,16 @@ def _rule_cost(r: dict, input_t: int, output_t: int, cached_t: int, t: datetime)
 _IO_LOCK = threading.RLock()
 
 
+def _mask_api_key(key: str) -> str:
+    """API Key 掩码：sk-****xxxx（短 key 全掩码）"""
+    if not key:
+        return ""
+    if len(key) <= 7:
+        return "****"
+    head = key[:3] if "-" not in key[:6] else key[:key.index("-") + 1]
+    return f"{head}****{key[-4:]}"
+
+
 def _read_jsonl(path: Path):
     recs = []
     if not path.exists():
@@ -332,36 +342,61 @@ def _read_jsonl(path: Path):
     return recs
 
 
+# JSONL 行数内存计数（启动时数一次，此后增量），避免每写一条全量读盘
+_JSONL_LINES: dict = {}
+# 发生过裁剪的日志文件集合（估算余额据此提示早期计费缺失）
+_LOG_TRIMMED: set = set()
+
+
 def _append_jsonl(path: Path, rec: dict, max_size: int = 0):
     try:
         with _IO_LOCK:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            # 裁剪：超过 max_size 条时保留最新（0 = 不裁剪）
+            # 裁剪：超过 max_size 20% 才裁一次，只保留尾部（0 = 不裁剪）；
+            # 行数走内存计数（首次读一次盘），避免每条都全量读盘 + O(N²) 重写
             if max_size and max_size > 0:
-                lines = path.read_text(encoding="utf-8").splitlines()
-                if len(lines) > max_size:
-                    path.write_text("\n".join(lines[-max_size:]) + "\n", encoding="utf-8")
+                key = str(path)
+                n = _JSONL_LINES.get(key)
+                if n is None:
+                    try:
+                        n = len(path.read_text(encoding="utf-8").splitlines())
+                    except Exception:
+                        n = 0
+                n += 1
+                if n > max_size * 1.2:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                    if len(lines) > max_size:
+                        path.write_text("\n".join(lines[-max_size:]) + "\n", encoding="utf-8")
+                        _LOG_TRIMMED.add(key)
+                        n = max_size
+                _JSONL_LINES[key] = n
     except Exception as e:
         logger.warning(f"[token_stats] 日志写入失败: {e}")
 
 
 def _parse_ts(s: str):
-    """日志时间戳解析：兼容 3/6 位微秒（Python 3.10- 的 fromisoformat 只认 6 位）"""
+    """日志时间戳解析：兼容 3/6 位微秒（Python 3.10- 的 fromisoformat 只认 6 位）；
+    带时区的 aware 时间统一去 tzinfo（丢弃偏移），避免与本地 naive 时间比较炸 TypeError"""
     if not s:
         raise ValueError("empty timestamp")
+    dt = None
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except ValueError:
         pass
-    if "." in s:
+    if dt is None and "." in s:
         try:
             head, frac = s.split(".", 1)
             frac = (frac + "000000")[:6]
-            return datetime.fromisoformat(f"{head}.{frac}")
+            dt = datetime.fromisoformat(f"{head}.{frac}")
         except ValueError:
             pass
-    raise ValueError(f"bad timestamp: {s}")
+    if dt is None:
+        raise ValueError(f"bad timestamp: {s}")
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
 
 
 def _fmt_ts(dt: datetime) -> str:
@@ -402,15 +437,17 @@ def _last_refresh(now: datetime, refresh_time: str) -> datetime:
 
 
 def _grant_count(since: datetime, now: datetime, refresh_time: str) -> int:
-    """since（严格大于）之后到 now 的刷新发放次数"""
+    """since（严格大于）之后到 now 的刷新发放次数（除法直算，不逐日循环）"""
     h, m = _parse_hhmm(refresh_time)
-    count = 0
-    t = since.replace(hour=h, minute=m, second=0, microsecond=0)
-    while t <= now:
-        if t > since:
-            count += 1
-        t += timedelta(days=1)
-    return count
+    first = since.replace(hour=h, minute=m, second=0, microsecond=0)
+    if first <= since:
+        first += timedelta(days=1)
+    last = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if last > now:
+        last -= timedelta(days=1)
+    if first > last:
+        return 0
+    return (last.date() - first.date()).days + 1
 # ────────────────────────────────────────────────────────────
 # 插件主类
 # ────────────────────────────────────────────────────────────
@@ -578,12 +615,16 @@ class TokenStatsPlugin(BasePlugin):
         self._hours = {}
         # 5 分钟桶：{day: [None]*24 each [None]*12 each {r,v,i,o,c,e, aggs}}（时间趋势最深层下钻）
         self._mins = {}
-        # 会话窗口（滚动）：
+        # 会话窗口（滚动）：按 sid 各维护一个有界 LRU 窗口（多群交替互不清零）；
+        # self._sess 始终指向最近活跃会话的窗口（/stats 展示用）
+        self._sess_map = {}
+        self._sess_map_max = 20
         self._sess = {
             "start": time.time(), "last": time.time(),
             "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
             "aggs": {}, "sid": "",
         }
+        self._sess_map[""] = self._sess
         self._last_err_text = ""
         self._last_err_at = None
         self._cur_source = self.source_default
@@ -601,7 +642,11 @@ class TokenStatsPlugin(BasePlugin):
 
         # 热读缓存（4.9.x）：按 mtime+length 判失效；多端点轮询共享
         self._rec_cache = {"path": None, "mtime": None, "len": -1, "list": None}
-        self._rec_cache_lock = asyncio.Lock()
+
+        # 费用/估算计算缓存：记录数+最大时间戳+规则 hash 未变则直接复用（H1/H3）
+        self._rules_hash = ""
+        self._since_cost_cache = {}   # (url,name,model_ref,since_iso) → (fingerprint, cny, pts, matched)
+        self._range_scan_cache = {}   # (frm,to) → (fingerprint, result)
 
         # 出错统计游标（errScanPos）：{sid: (prev_text, prev_end)}，工具循环续轮不重复计数
         self._err_cursor = {}
@@ -706,6 +751,19 @@ class TokenStatsPlugin(BasePlugin):
     def _invalidate_rec_cache(self):
         self._rec_cache["list"] = None
 
+    def _calc_fingerprint(self, recs=None):
+        """计算结果缓存指纹：记录数 + 最新时间戳 + 规则内容 hash，任一变化即失效重算"""
+        if recs is None:
+            recs = self._read_records()
+        try:
+            rh = hash(json.dumps(self.rules or [], sort_keys=True, ensure_ascii=False))
+        except Exception:
+            rh = id(self.rules)
+        if rh != self._rules_hash:
+            self._rules_hash = rh
+        last_t = recs[-1].get("t", "") if recs else ""
+        return (len(recs), last_t, rh)
+
     def _apply_rec(self, rec: dict):
         try:
             t = _parse_ts(rec.get("t", ""))
@@ -759,17 +817,25 @@ class TokenStatsPlugin(BasePlugin):
 
     def _apply_session(self, rec: dict):
         now = time.time()
-        # 会话窗口滚动：超过 idle 分钟无新记录 → 重置
         sid = rec.get("sid", "") or ""
-        # 会话窗口滚动：超过 idle 分钟无新记录，或切换到其他会话 → 重置
-        if (now - self._sess["last"] > self.session_idle_minutes * 60) or (sid and sid != self._sess.get("sid")):
-            self._sess = {
+        # 按 sid 各维护会话窗口（LRU）：多群交替互不清零；同会话超 idle 才重置
+        s = self._sess_map.get(sid)
+        if s is None:
+            s = {
                 "start": now, "last": now,
                 "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}, "sid": sid,
             }
-        self._sess["last"] = now
-        self._sess["sid"] = sid
-        s = self._sess
+            self._sess_map[sid] = s
+        else:
+            # LRU：移到末尾（最近活跃）
+            self._sess_map[sid] = self._sess_map.pop(sid)
+            if now - s["last"] > self.session_idle_minutes * 60:
+                s.update({"start": now, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}})
+        while len(self._sess_map) > self._sess_map_max:
+            self._sess_map.pop(next(iter(self._sess_map)))
+        s["last"] = now
+        s["sid"] = sid
+        self._sess = s
         s["r"] += 1
         s["v"] += rec["v"]; s["i"] += rec["i"]; s["o"] += rec["o"]; s["c"] += rec["c"]
         s["e"] += rec.get("e", 0)
@@ -799,8 +865,9 @@ class TokenStatsPlugin(BasePlugin):
 
     def _save_bal_states(self):
         try:
-            self._bal_state_path.write_text(
-                json.dumps(self._bal_states, ensure_ascii=False), encoding="utf-8")
+            tmp = self._bal_state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._bal_states, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._bal_state_path)  # 原子写：防中途断电写坏
         except Exception:
             pass
 
@@ -1126,7 +1193,13 @@ class TokenStatsPlugin(BasePlugin):
 
     def _channel_cost_ex(self, url: str, name: str, model_ref: str = ""):
         """某渠道（URL/渠道名包含匹配）在全部历史里的计费 → (cny, pts, matched)；
-        model_ref 非空时只统计关联模型（provider:model）的用量"""
+        model_ref 非空时只统计关联模型（provider:model）的用量。
+        带缓存：记录数/最新时间戳/规则 hash 未变直接复用"""
+        fp = self._calc_fingerprint()
+        ckey = ("all", url, name, model_ref)
+        hit = self._since_cost_cache.get(ckey)
+        if hit and hit[0] == fp:
+            return hit[1], hit[2], hit[3]
         merged = {}
         for ds in self._days.values():
             for mkey, slots in ds["aggs"].items():
@@ -1148,8 +1221,10 @@ class TokenStatsPlugin(BasePlugin):
                     slots2[i]["o"] += slots[i]["o"]
                     slots2[i]["c"] += slots[i]["c"]
         if not merged:
+            self._since_cost_cache[ckey] = (fp, 0.0, 0.0, False)
             return 0.0, 0.0, False
         cny, pts, matched = self._aggs_cost_ex(merged)
+        self._since_cost_cache[ckey] = (fp, cny, pts, matched)
         return cny, pts, matched
 
     def _channel_cost(self, url: str, name: str) -> float:
@@ -1159,9 +1234,16 @@ class TokenStatsPlugin(BasePlugin):
 
     def _channel_cost_since_ex(self, url: str, name: str, since: datetime, model_ref: str = ""):
         """自 since 时刻以来（含）的渠道计费 → (cny, pts, matched)。
-        逐条扫日志，按 t >= since 过滤；双币种分开累计。"""
+        逐条扫日志，按 t >= since 过滤；双币种分开累计。
+        带缓存：记录数/最新时间戳/规则 hash 未变直接复用（余额估算高频调用）"""
+        recs = self._read_records()
+        fp = self._calc_fingerprint(recs)
+        ckey = ("since", url, name, model_ref, since.isoformat())
+        hit = self._since_cost_cache.get(ckey)
+        if hit and hit[0] == fp:
+            return hit[1], hit[2], hit[3]
         cny, pts, matched = 0.0, 0.0, False
-        for r in self._read_records():
+        for r in recs:
             try:
                 t = _parse_ts(r["t"])
             except Exception:
@@ -1182,6 +1264,9 @@ class TokenStatsPlugin(BasePlugin):
             else:
                 cny += amt
             matched = True
+        self._since_cost_cache[ckey] = (fp, cny, pts, matched)
+        if len(self._since_cost_cache) > 64:
+            self._since_cost_cache.clear()  # 有界：键含 since/url 组合，防止无限增长
         return cny, pts, matched
 
     # ── 余额探测 ──
@@ -1230,7 +1315,7 @@ class TokenStatsPlugin(BasePlugin):
           当前 = 设定的「当前余额(对表)」− 自设定时刻以来计费（按价格规则现算，改价即时重估）；
           preset 无锚定时回落 初始额度 − 全历史计费；
           daily 无锚定时 = 每日额度 − 上次刷新以来计费；
-          rolling 无锚定时 = 初始额度(基准) − 全历史计费 + 发放次数 × 每日额度"""
+          rolling 必须先锚定（当前 = 设定余额 − 其后计费 + 发放次数 × 每日额度）"""
         s_type = (src.get("type") or "auto").strip().lower()
         name = src.get("name", "")
         if s_type not in EST_TYPES:
@@ -1262,6 +1347,9 @@ class TokenStatsPlugin(BasePlugin):
         def _fmt(v):
             return f"{v:0.6f}".rstrip("0").rstrip(".")
 
+        # M3：日志发生过裁剪 → 早期计费记录缺失，估算可能偏高，msg 附警告
+        tw = "（⚠ 日志曾裁剪，早期计费缺失，估算可能偏高）" if str(self._log_path) in _LOG_TRIMMED else ""
+
         try:
             if anchor is not None and anchor_dt is not None:
                 # 锚定：设定值 − 其后计费（daily/rolling 另加此后发放；daily 跨刷新自动回落）
@@ -1274,17 +1362,17 @@ class TokenStatsPlugin(BasePlugin):
                     cur = daily - c2
                     return {"balance": cur, "currency": currency,
                             "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                            "msg": f"每日重置：每日额度 {_fmt(daily)} − 本周期计费 {_fmt(c2)} = 当前 {_fmt(cur)}（锚定已跨刷新失效，回落每日额度模型）"}
+                            "msg": f"每日重置：每日额度 {_fmt(daily)} − 本周期计费 {_fmt(c2)} = 当前 {_fmt(cur)}（锚定已跨刷新失效，回落每日额度模型）{tw}"}
                 if s_type == "rolling":
                     grants = _grant_count(anchor_dt, now, refresh)
                     cur = anchor + grants * daily - cost
                     return {"balance": cur, "currency": currency,
                             "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                            "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} + 已发放 {grants} 期 × {_fmt(daily)} = 当前 {_fmt(cur)}（按价格规则估算）"}
+                            "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} + 已发放 {grants} 期 × {_fmt(daily)} = 当前 {_fmt(cur)}（按价格规则估算）{tw}"}
                 cur = anchor - cost
                 return {"balance": cur, "currency": currency,
                         "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                        "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）"}
+                        "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）{tw}"}
 
             if s_type == "daily":
                 if daily <= 0:
@@ -1295,19 +1383,11 @@ class TokenStatsPlugin(BasePlugin):
                 cur = daily - cost
                 return {"balance": cur, "currency": currency,
                         "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                        "msg": f"每日重置：每日额度 {_fmt(daily)} − 上次刷新以来计费 {_fmt(cost)} = 当前 {_fmt(cur)}（刷新 {refresh}）"}
+                        "msg": f"每日重置：每日额度 {_fmt(daily)} − 上次刷新以来计费 {_fmt(cost)} = 当前 {_fmt(cur)}（刷新 {refresh}）{tw}"}
 
             if s_type == "rolling":
-                if anchor is None or anchor_dt is None:
-                    return {"balance": 0, "currency": currency, "at": "", "ok": False,
-                            "msg": "rolling 源需先填「当前余额(对表)」建立基准（当前 = 设定余额 − 计费 + 每日发放，没用完的结转滚存）"}
-                grants = _grant_count(anchor_dt, now, refresh)
-                cny, pts, matched = self._channel_cost_ex(src.get("url", ""), name, model_ref)
-                cost = pts if currency == "积分" else cny
-                cur = anchor + grants * daily - cost
-                return {"balance": cur, "currency": currency,
-                        "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                        "msg": f"每日累计：设定余额 {_fmt(anchor)} − 累计计费 {_fmt(cost)} + 发放 {grants} 期 × {_fmt(daily)} = 当前 {_fmt(cur)}（结转滚存，刷新 {refresh}）"}
+                return {"balance": 0, "currency": currency, "at": "", "ok": False,
+                        "msg": "rolling 源需先填「当前余额(对表)」建立基准（当前 = 设定余额 − 计费 + 每日发放，没用完的结转滚存）"}
 
             # preset
             if initial is None:
@@ -1318,7 +1398,7 @@ class TokenStatsPlugin(BasePlugin):
             cur = initial - cost
             return {"balance": cur, "currency": currency,
                     "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                    "msg": f"预设扣减：初始额度 {_fmt(initial)} − 累计计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）"}
+                    "msg": f"预设扣减：初始额度 {_fmt(initial)} − 累计计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）{tw}"}
         except Exception as e:
             return {"balance": 0, "currency": currency, "at": "", "ok": False, "msg": f"估算失败: {e}"}
 
@@ -2331,9 +2411,16 @@ class TokenStatsPlugin(BasePlugin):
             return {"units": arr, "matched": matched}
 
         # 兜底：内存 aggs 未匹配到规则时，直接遍历记录现算（保证历史费用一定显示）
+        # H3：按 (frm,to,记录数,最新时间戳,规则hash) 缓存，轮询不再每秒全扫
         def _cost_pair_scan(frm, to):
+            recs = self._read_records()
+            fp = self._calc_fingerprint(recs)
+            ck = (frm, to)
+            hit = self._range_scan_cache.get(ck)
+            if hit and hit[0] == fp:
+                return hit[1]
             units, matched = {}, False
-            for r in self._read_records():
+            for r in recs:
                 try:
                     t = _parse_ts(r["t"])
                 except Exception:
@@ -2352,7 +2439,11 @@ class TokenStatsPlugin(BasePlugin):
                 matched = True
             arr = [{"unit": uu, "amt": f"{uamt:,.4f}"} for ukey, uamt in units.items() if uamt
                    for uu in [ukey.partition("|")[2]]]
-            return {"units": arr, "matched": matched}
+            result = {"units": arr, "matched": matched}
+            self._range_scan_cache[ck] = (fp, result)
+            if len(self._range_scan_cache) > 16:
+                self._range_scan_cache.clear()  # 有界
+            return result
 
         def _cost_any(k, frm, to):
             cp = _cost_pair(k)
@@ -2522,21 +2613,6 @@ class TokenStatsPlugin(BasePlugin):
                 total["units"][ukey] = total["units"].get(ukey, 0.0) + amt
                 total["matched"] = True
 
-        def dim(d):
-            arr = [{"k": k, **v} for k, v in d.items()]
-            arr.sort(key=lambda x: x["v"], reverse=True)
-            return arr[:20]
-
-        async def dim_sid(d):
-            arr = [{"k": k, **v} for k, v in d.items()]
-            arr.sort(key=lambda x: x["v"], reverse=True)
-            out = arr[:20]
-            uniq = sorted({x["k"] for x in out if x["k"]})
-            nmap = dict(zip(uniq, await asyncio.gather(*(self._resolve_sid_name(s) for s in uniq))))
-            for x in out:
-                x["name"] = nmap.get(x["k"], "")
-            return out
-
         def fmt_cost(a):
             bits = []
             if a.get("matched"):
@@ -2544,6 +2620,21 @@ class TokenStatsPlugin(BasePlugin):
                     _, _, uu = ukey.partition("|")
                     bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
             return " + ".join(bits) if bits else None
+
+        def dim(d):
+            arr = [{"k": k, **v, "cost": fmt_cost(v)} for k, v in d.items()]
+            arr.sort(key=lambda x: x["v"], reverse=True)
+            return arr[:20]
+
+        async def dim_sid(d):
+            arr = [{"k": k, **v, "cost": fmt_cost(v)} for k, v in d.items()]
+            arr.sort(key=lambda x: x["v"], reverse=True)
+            out = arr[:20]
+            uniq = sorted({x["k"] for x in out if x["k"]})
+            nmap = dict(zip(uniq, await asyncio.gather(*(self._resolve_sid_name(s) for s in uniq))))
+            for x in out:
+                x["name"] = nmap.get(x["k"], "")
+            return out
 
         return {
             "from": frm, "to": to,
@@ -2732,7 +2823,7 @@ class TokenStatsPlugin(BasePlugin):
                     "r": hr["r"], "v": hr["v"], "i": hr["i"], "o": hr["o"], "c": hr["c"], "e": hr["e"],
                     "models": self._bucket_fee_models(hr["aggs"]),
                 })
-            top = self._all_top_models()
+            top = self._all_top_models(day, day)
             return {"from": day, "to": day, "day": day, "unit": "hour", "days": hours, "topModels": top}
 
         if day and hour_s.isdigit() and day in self._mins:
@@ -2745,7 +2836,7 @@ class TokenStatsPlugin(BasePlugin):
                         if not mb:
                             continue
                         buckets.append({
-                            "d": f"{day} {h:02d}:{m5 * 5:02d}", "m": m5,
+                            "d": f"{day} {h:02d}:{m5 * 5:02d}", "h": h, "m": m5,
                             "r": mb["r"], "v": mb["v"], "i": mb["i"], "o": mb["o"], "c": mb["c"], "e": mb["e"],
                             "models": self._bucket_fee_models(mb["aggs"]),
                         })
@@ -2753,9 +2844,12 @@ class TokenStatsPlugin(BasePlugin):
                 return {"from": day, "to": day, "day": day, "hour": h, "unit": "min5",
                         "days": buckets, "topModels": top}
 
-        # 按天（原逻辑）
+        # 按天（内存按天聚合 self._days 现算，零磁盘扫描；缺天补 0 桶；total 超 62 天按月聚合）
         if range_key == "total" or range_key == "all":
-            frm, to = "0000-01-01", "9999-12-31"
+            if self._days:
+                frm, to = min(self._days.keys()), max(self._days.keys())
+            else:
+                frm, to = today, today
         elif range_key == "d30":
             frm, to = (now - timedelta(days=29)).strftime("%Y-%m-%d"), today
         elif range_key == "today":
@@ -2763,33 +2857,61 @@ class TokenStatsPlugin(BasePlugin):
         else:
             frm, to = (now - timedelta(days=6)).strftime("%Y-%m-%d"), today
 
-        buckets = {}
+        day_keys = sorted(k for k in self._days if frm <= k <= to)
+        span = len(day_keys)
         top_models = {}
-        for r in self._read_records():
+        if span > 62:
+            # 累计且跨度大 → 按月聚合（避免上百根柱）
+            mbuckets = {}
+            for dk in day_keys:
+                mk2 = dk[:7]
+                b = mbuckets.setdefault(mk2, {"d": mk2, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
+                                              "_aggs": {}, "_models": {}})
+                src = self._days[dk]
+                for kk in ("r", "v", "i", "o", "c", "e"):
+                    b[kk] += src[kk]
+                for m in self._bucket_fee_models(src["aggs"]):
+                    bm = b["_models"].setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
+                    bm["cny"] += m["cny"]; bm["pts"] += m["pts"]
+                    tm = top_models.setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
+                    tm["cny"] += m["cny"]; tm["pts"] += m["pts"]
+            days = []
+            for mk2 in sorted(mbuckets.keys()):
+                b = mbuckets[mk2]
+                b["models"] = sorted(b.pop("_models").values(),
+                                     key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
+                b.pop("_aggs", None)
+                days.append(b)
+            unit = "month"
+        else:
+            # 从 frm 到 to 逐日补齐 0 值桶（漏天不错位）
+            days = []
             try:
-                t = _parse_ts(r["t"])
-            except Exception:
-                continue
-            d = t.strftime("%Y-%m-%d")
-            if d < frm or d > to:
-                continue
-            i, o, c, v = r.get("i", 0), r.get("o", 0), r.get("c", 0), r.get("v", 0)
-            rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
-            amt, cur = _rule_cost_ex(rule, i, o, c, t) if rule else (None, "CNY")
-            b = buckets.setdefault(d, {"d": d, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0})
-            b["r"] += 1; b["v"] += v; b["i"] += i; b["o"] += o; b["c"] += c
-            b["e"] += max(0, int(r.get("e", 0) or 0))
-            mk = r.get("m", "") or "未知"
-            tm = top_models.setdefault(mk, {"name": mk, "cny": 0.0, "pts": 0.0})
-            if amt is not None:
-                if cur == "积分":
-                    tm["pts"] += amt
-                else:
-                    tm["cny"] += amt
-
-        days = [buckets[k] for k in sorted(buckets.keys())]
+                d0 = datetime.strptime(frm, "%Y-%m-%d")
+                d1 = datetime.strptime(to, "%Y-%m-%d")
+                cur_d = d0
+                while cur_d <= d1:
+                    dk = cur_d.strftime("%Y-%m-%d")
+                    src = self._days.get(dk)
+                    if src:
+                        models_l = self._bucket_fee_models(src["aggs"])
+                        days.append({"d": dk, "r": src["r"], "v": src["v"], "i": src["i"],
+                                     "o": src["o"], "c": src["c"], "e": src["e"], "models": models_l})
+                        for m in models_l:
+                            tm = top_models.setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
+                            tm["cny"] += m["cny"]; tm["pts"] += m["pts"]
+                    else:
+                        days.append({"d": dk, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "models": []})
+                    cur_d += timedelta(days=1)
+            except ValueError:
+                for dk in day_keys:
+                    src = self._days[dk]
+                    days.append({"d": dk, "r": src["r"], "v": src["v"], "i": src["i"],
+                                 "o": src["o"], "c": src["c"], "e": src["e"],
+                                 "models": self._bucket_fee_models(src["aggs"])})
+            unit = "day"
         models = sorted(top_models.values(), key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
-        return {"from": frm, "to": to, "unit": "day", "days": days, "topModels": models}
+        return {"from": frm, "to": to, "unit": unit, "days": days, "topModels": models}
 
     def _bucket_fee_models(self, aggs: dict):
         """桶内按模型聚合费用（内存 aggs 现算，无磁盘扫描）→ [{name,cny,pts}] Top8"""
@@ -2819,14 +2941,18 @@ class TokenStatsPlugin(BasePlugin):
         arr = sorted(per.values(), key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
         return [x for x in arr if x["cny"] or x["pts"]]
 
-    def _all_top_models(self):
-        """全局 Top8 模型（费用分色图例用）"""
+    def _all_top_models(self, frm: str = "", to: str = ""):
+        """Top8 模型（费用分色图例用）；frm/to 非空时只统计该日期范围（按天）"""
         top = {}
         for r in self._read_records():
             try:
                 t = _parse_ts(r["t"])
             except Exception:
                 continue
+            if frm or to:
+                d = t.strftime("%Y-%m-%d")
+                if (frm and d < frm) or (to and d > to):
+                    continue
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
             amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t) if rule else (None, "CNY")
             if amt is None:
@@ -2892,11 +3018,13 @@ class TokenStatsPlugin(BasePlugin):
                 "at": st.get("at", ""),
                 "msg": st.get("msg", ""),
             }
-            # 配置字段（可视化编辑器回填用，含禁用源）
+            # 配置字段（可视化编辑器回填用，含禁用源）；api_key 掩码回传防明文泄露
             for k in ("url", "api_key", "api_user", "json_path", "quota_conversion",
                       "daily_quota", "anchor_balance", "refresh_time", "anchor_at", "model_ref"):
                 v = src.get(k)
                 if v is not None:
+                    if k == "api_key" and v:
+                        v = _mask_api_key(str(v))
                     item[k] = v
             sources.append(item)
         return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
@@ -2942,6 +3070,12 @@ class TokenStatsPlugin(BasePlugin):
                 # 仅估算型源：WebUI 表单无 anchor_at 输入，填了「当前余额(对表)」但没给时间时锚定取当前；
                 # 编辑已有源时前端会回填原 anchor_at（见 balEditOpen），不会漂移
                 item["anchor_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # api_key 未改动（值等于掩码）时保留原值，防掩码覆盖真 key
+            if "api_key" in item and "****" in item["api_key"]:
+                for old in self.balance_sources:
+                    if old.get("name") == name and old.get("api_key"):
+                        item["api_key"] = old["api_key"]
+                        break
             cleaned.append(item)
         try:
             pm = self.ctx.plugin_mgr
@@ -3137,9 +3271,9 @@ class TokenStatsPlugin(BasePlugin):
         if not self.enable_widget:
             return PluginPage.from_html(
                 f"<!DOCTYPE html><html lang=\"zh-CN\"><body style=\"background:#0f172a;color:#94a3b8;font-family:sans-serif;padding:24px;font-size:13px\">"
-                f"<p style=\"color:#e2e8f0;font-weight:600;margin-bottom:8px\">Token 挂件已启用（默认开启）</p>"
-                f"<p>此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球），适合浏览器小窗钉角落。<br>"
-                f"如需关闭：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 关闭「启用挂件」。</p>"
+                f"<p style=\"color:#e2e8f0;font-weight:600;margin-bottom:8px\">Token 挂件已停用</p>"
+                f"<p>此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球，可弹独立小窗），当前在配置中被关闭。<br>"
+                f"如需开启：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 打开「启用挂件」。</p>"
                 f"</body></html>")
         # 后端「紧凑模式」配置注入为前端默认值；localStorage 有记忆时以用户为准
         html = _WIDGET_HTML.replace(
@@ -3154,8 +3288,17 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Token 用量统计</title>
 <style>
-:root{--bg:#0f172a;--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--purple:#a78bfa;--pink:#f472b6}
+:root{--bg:#0f172a;--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#a3b2c7;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--purple:#a78bfa;--pink:#f472b6;--inset:#0b1220}
 *{margin:0;padding:0;box-sizing:border-box}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@keyframes shimmer{from{background-position:-200px 0}to{background-position:200px 0}}
+.panel.on{animation:fadeIn .25s ease}
+.skel{height:92px;border-radius:12px;background:linear-gradient(90deg,var(--card) 25%,#263449 50%,var(--card) 75%);background-size:400px 100%;animation:shimmer 1.2s linear infinite;border:1px solid var(--line)}
+.card{transition:transform .18s ease,box-shadow .18s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.3)}
+.card[data-k="session"],.card[data-k="today"]{grid-column:span 2}
+@media(max-width:700px){.card[data-k="session"],.card[data-k="today"]{grid-column:span 1}}
+.card.errbox{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),var(--card)}
 body{background:var(--bg);color:var(--fg);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;padding:20px;font-size:14px;background-size:cover;background-position:center;background-attachment:fixed}
 body.bg-on #app{background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-radius:16px;padding:20px;border:1px solid rgba(51,65,85,.5);box-shadow:0 8px 32px rgba(0,0,0,.35)}
 #skinBtn{position:fixed;right:14px;bottom:14px;width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:rgba(30,41,59,.7);color:var(--dim);cursor:pointer;font-size:16px;z-index:999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
@@ -3187,6 +3330,8 @@ h1 .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 @media(max-width:900px){.grid2{grid-template-columns:1fr}}
 .box{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.hours .h{background:var(--inset)}
+.bar{background:var(--inset)}
 .box h3{font-size:14px;margin-bottom:10px;color:var(--fg)}
 .box h3 .seg{float:right;font-size:11px;color:var(--dim);font-weight:400;cursor:pointer;border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin-left:6px}
 .box h3 .seg.on{background:var(--acc);color:#06283d;border-color:var(--acc)}
@@ -3196,11 +3341,11 @@ td{padding:6px 8px;border-bottom:1px solid rgba(51,65,85,.4);font-variant-numeri
 tr:hover td{background:rgba(56,189,248,.05)}
 tr.cur td{background:rgba(52,211,153,.07)}
 .rate{color:var(--purple)}.ok{color:var(--ok)}.bad{color:var(--err)}
-.bar{height:8px;border-radius:4px;background:#0b1220;overflow:hidden;margin-top:4px}
+.bar{height:8px;border-radius:4px;background:var(--inset);overflow:hidden;margin-top:4px}
 .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--purple));border-radius:4px}
 .hours{display:grid;grid-template-columns:repeat(12,1fr);gap:6px}
-.hours .h{background:#0b1220;border-radius:6px;padding:6px;text-align:center;font-size:10px;color:var(--dim)}
-.hours .h i{display:block;height:46px;background:#0b1220;border-radius:3px;margin:4px 0 2px;position:relative;overflow:hidden}
+.hours .h{background:var(--inset);border-radius:6px;padding:6px;text-align:center;font-size:10px;color:var(--dim)}
+.hours .h i{display:block;height:46px;background:var(--inset);border-radius:3px;margin:4px 0 2px;position:relative;overflow:hidden}
 .hours .h i b{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(180deg,var(--acc),#6366f1);border-radius:3px 3px 0 0}
 .hours .h.clickable{cursor:pointer}.hours .h.clickable:hover{border:1px solid var(--acc)}
 .btn{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:8px;padding:5px 14px;cursor:pointer;font-size:12px}
@@ -3218,12 +3363,15 @@ tr.cur td{background:rgba(52,211,153,.07)}
 .trend{display:flex;align-items:flex-end;gap:3px;height:150px;padding:6px 0 0;position:relative}
 .trend .col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;position:relative;cursor:pointer;min-width:0}
 .trend .col:hover .tip{opacity:1}
-.trend .stack{border-radius:2px 2px 0 0;width:100%}
+.trend .stk{display:flex;flex-direction:column;justify-content:flex-end;width:100%}
+.trend .stack{border-radius:2px 2px 0 0;width:100%;transition:filter .15s}
+.trend .col:hover .stack{filter:brightness(1.3)}
+.trend .hitsvg{position:absolute;left:0;top:6px;width:100%;height:calc(100% - 22px);pointer-events:none;overflow:visible}
 .trend .tlbl{text-align:center;font-size:10px;color:var(--dim);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.trend .tip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11px;white-space:nowrap;opacity:0;transition:.15s;z-index:20;pointer-events:none;color:var(--fg)}
+.trend .tip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11px;white-space:nowrap;opacity:0;transition:.15s;z-index:20;pointer-events:none;color:var(--fg)}
+.trend .tip.flip{left:auto;right:0;transform:none}
 .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--dim)}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
-.hitline{position:absolute;left:0;right:0;height:1px;background:rgba(167,139,250,.4);pointer-events:none}
 </style>
 </head>
 <body>
@@ -3243,7 +3391,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
 
 <div class="panel on" id="p-ov">
   <div class="snapshot" id="snap"></div>
-  <div class="cards" id="cards"></div>
+  <div class="cards" id="cards"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
   <div class="grid2">
     <div class="box" id="histBox"><h3>按天历史</h3><div id="hist"></div></div>
     <div class="box" id="hourBox"><h3>今日按小时 <span class="note" style="float:right">点击小时柱下钻最近记录</span></h3><div id="hours"></div></div>
@@ -3309,7 +3457,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="priceAdd">＋ 添加规则</button>
       <span style="color:var(--dim);font-size:12px" id="priceInfo"></span>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:8px 12px">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:8px 12px">
       <span style="color:var(--dim);font-size:12px">峰谷方案库：</span>
       <select id="peakProfileSel" style="width:200px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px"></select>
       <input id="peakProfileName" style="width:130px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px" placeholder="方案名">
@@ -3370,6 +3518,37 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const localDate = () => { const d=new Date();
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
+// 页内 toast（沙箱内 alert 不可用，一律用 toast）
+function dtoast(msg){
+  let t = document.getElementById('dToast');
+  if(!t){
+    t = document.createElement('div');
+    t.id = 'dToast';
+    t.style.cssText = 'position:fixed;left:50%;bottom:60px;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid var(--line);color:var(--fg);padding:8px 16px;border-radius:20px;font-size:13px;z-index:999;transition:opacity .3s;pointer-events:none;max-width:88vw';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.opacity = '1';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 2200);
+}
+// 内联二次确认（沙箱内 confirm 不可用）：首次点击变「确认？」2.5s 内再点执行
+function confirmBtn(btn, label, fn){
+  if(btn._arm){ btn._arm=false; btn.textContent=btn._orig; btn.classList.remove('on'); fn(); return; }
+  btn._arm = true; btn._orig = btn.textContent; btn.textContent = label; btn.classList.add('on');
+  setTimeout(()=>{ if(btn._arm){ btn._arm=false; btn.textContent=btn._orig; btn.classList.remove('on'); } }, 2500);
+}
+// KPI 数字 rAF 300ms 插值滚动
+function tweenNum(el, from, to){
+  if(from===to){ el.textContent = fmt4(to); return; }
+  const t0 = performance.now();
+  const step = t => {
+    const p = Math.min(1,(t-t0)/300);
+    el.textContent = fmt4(Math.round(from+(to-from)*p));
+    if(p<1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
 const MODEL_COLORS = ['#38bdf8','#a78bfa','#f472b6','#34d399','#fbbf24','#fb7185','#22d3ee','#c084fc'];
 const costText = c => c==null ? '—' : (c.indexOf('积分')>=0 ? c : '¥'+c);
 
@@ -3399,7 +3578,19 @@ function sparkHtml(arr){
 const RL = {session:'本次会话',today:'今天',d7:'近7天',d30:'近30天',total:'累计'};
 const sessLabel = d => d.sess_name ? d.sess_name : (d.sess_sid ? d.sess_sid : '本次会话');
 async function loadOv(){
+  try{
+    await _loadOvInner();
+    const t = new Date();
+    $('#updAt').textContent = '上次更新 '+String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0')+':'+String(t.getSeconds()).padStart(2,'0');
+  }catch(e){
+    $('#dot').style.background = 'var(--err)';
+    $('#dot').style.boxShadow = '0 0 8px var(--err)';
+    $('#updAt').textContent = '更新失败';
+  }
+}
+async function _loadOvInner(){
   const d = await jget('/stats');
+  $('#dot').style.boxShadow = '';
   $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
   $('#sub').textContent = '模型 ' + (d.model||'—') + ' · 渠道 ' + (d.channel||'—') + ' · 日志 ' + (d.logFile||'');
   const el = Math.floor(d.elapsed/60), em = d.elapsed%60;
@@ -3418,12 +3609,12 @@ async function loadOv(){
     // 迷你走势（非本次会话）：近14天分布
     let sp = '';
     if(k!=='session') sp = '<div class="spark">'+sparkHtml(dayVols.slice(-14))+'</div>';
-    cards.push('<div class="card"><div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
+    cards.push({k:k, vnum:rg.v||0, html:'<div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
       '<div class="d">'+fmt(rg.r)+' 轮 · 输入 '+fmt(rg.i)+' · 输出 '+fmt(rg.o)+' · 缓存 '+fmt(rg.c)+' · 命中率 <span class="rate">'+rate+'</span></div>'+
-      '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div></div>');
+      '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div>'});
   }
   const er = d.errors||{};
-  if (er.last) cards.push('<div class="card errbox"><div class="k">最近出错</div><div class="d">'+esc(er.last)+'</div></div>');
+  if (er.last) cards.push({k:'errLast', cls:'errbox', html:'<div class="k">最近出错</div><div class="d">'+esc(er.last)+'</div>'});
   const lg = er.log||{};
   const lgNames = {xml:'XML解析',model:'模型调用',tool:'工具执行',net:'网络/超时',traceback:'异常堆栈',other:'其他'};
   const lgBits = [];
@@ -3433,20 +3624,42 @@ async function loadOv(){
   if (lgBits.length){
     let lgTxt = '后台日志错误（近7天）：'+lgBits.join(' · ');
     if (er.logLast && er.logLast.text) lgTxt += '｜最近：'+esc(er.logLast.text.slice(0,60));
-    cards.push('<div class="card errbox"><div class="k">后台日志 ERROR</div><div class="d">'+lgTxt+'</div></div>');
+    cards.push({k:'errLog', cls:'errbox', html:'<div class="k">后台日志 ERROR</div><div class="d">'+lgTxt+'</div>'});
   }
   if (er.tool){
     let tt = '工具结果失败（近7天）：'+er.tool+' 次';
     if (er.toolLast && er.toolLast.text) tt += '｜最近：'+esc(er.toolLast.text.slice(0,60));
-    cards.push('<div class="card errbox"><div class="k">工具结果失败</div><div class="d">'+tt+'</div></div>');
+    cards.push({k:'errTool', cls:'errbox', html:'<div class="k">工具结果失败</div><div class="d">'+tt+'</div>'});
   }
-  $('#cards').innerHTML = cards.join('');
+  renderCards(cards);
   loadHist(hist); loadHours();
+}
+// M1：cards 按 data-k 增量更新——内容签名未变不动 DOM，避免轮询全量 innerHTML 重建
+let _cardEls = {};
+function renderCards(cards){
+  const box = $('#cards');
+  const seen = {};
+  cards.forEach(c=>{
+    seen[c.k] = 1;
+    const el0 = _cardEls[c.k];
+    if(el0 && el0._sig === c.html) return;
+    if(el0){ el0.className = 'card'+(c.cls?' '+c.cls:''); el0.innerHTML = c.html; el0._sig = c.html; return; }
+    const el = document.createElement('div');
+    el.className = 'card'+(c.cls?' '+c.cls:'');
+    el.dataset.k = c.k;
+    el.innerHTML = c.html;
+    el._sig = c.html;
+    box.appendChild(el);
+    _cardEls[c.k] = el;
+  });
+  for(const k in _cardEls){
+    if(!seen[k]){ _cardEls[k].remove(); delete _cardEls[k]; }
+  }
 }
 async function loadHist(hist){
   const d = hist || await jget('/history');
   const days = (d.days||[]).slice(-14);
-  if(!days.length){ $('#hist').innerHTML='<div class="note">暂无历史数据</div>'; return; }
+  if(!days.length){ $('#hist').innerHTML='<div class="note">暂无历史数据。开始对话后自动统计；想看到费用请先去 <button class="btn" onclick="showTab(\'price\')">配置价格规则</button></div>'; return; }
   const max = Math.max(...days.map(x=>x.v),1);
   const today = localDate();
   $('#hist').innerHTML = '<table><thead><tr><th>日期</th><th>总量</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th style="width:30%">分布</th></tr></thead><tbody>'+
@@ -3485,49 +3698,66 @@ async function loadTrend(r){
   if(curDay && curHour===null) url = '/trend?day='+curDay;   // 后端按天(day=)返回小时桶
   if(curDay && curHour!==null) url = '/trend?day='+curDay+'&hour='+curHour; // 后端按小时(day+hour=)返回5分钟桶
   const d = await jget(url);
-  const isDay = !!curDay && curHour===null, isMin = !!curDay && curHour!==null;
+  const isDay = !!curDay && curHour===null, isMin = !!curDay && curHour!==null, isMonth = !curDay && d.unit==='month';
   $('#trendRange').textContent = isMin ? ('单小时 '+curDay+' '+String(curHour).padStart(2,'0')+':00 按5分钟（点柱 → 查看该时段记录）')
     : isDay ? ('单天 '+curDay+' 按小时（点柱 → 下钻5分钟/看记录）')
+    : isMonth ? (d.from+' ~ '+d.to+'（按月聚合）')
     : (d.from+' ~ '+d.to+'（点柱 → 下钻该天按小时）');
   $('#trendBack').style.display = (curDay||curHour!==null) ? '' : 'none';
   const days = d.days||[], models = d.topModels||[];
-  if(!days.length){ $('#trend').innerHTML='<div class="note" style="padding:20px">该范围暂无数据</div>'; $('#trendLegend').innerHTML=''; $('#trendNote').textContent=''; return; }
+  if(!days.length){ $('#trend').innerHTML='<div class="note" style="padding:20px">该范围暂无数据 <button class="btn" onclick="showTab(\'price\')">去配置价格规则</button></div>'; $('#trendLegend').innerHTML=''; $('#trendNote').textContent=''; return; }
   const maxV = Math.max(...days.map(x=>x.v),1);
+  // 图例色与柱色统一：按 topModels 顺序建立 name→color 映射
+  const colorOf = {};
+  models.forEach((m,i)=>{ colorOf[m.name] = MODEL_COLORS[i%8]; });
   const legend = [];
-  models.forEach((m,i)=>{ if(m.cny||m.pts) legend.push('<span><i style="background:'+MODEL_COLORS[i%8]+'"></i>'+esc(m.name)+'</span>'); });
+  models.forEach(m=>{ if(m.cny||m.pts) legend.push('<span><i style="background:'+colorOf[m.name]+'"></i>'+esc(m.name)+'</span>'); });
   legend.push('<span><i style="background:#334155"></i>未计价</span>');
+  legend.push('<span><i style="background:transparent;border-top:2px dashed var(--purple);border-radius:0;height:0;width:14px;vertical-align:2px"></i>缓存命中率</span>');
   $('#trendLegend').innerHTML = legend.join('');
-  $('#trendNote').textContent = '柱高=总量，堆叠色=Top8 模型费用分色；紫色虚线=缓存命中率（右轴 0-100%）。'+(isMin?'当前为单小时按5分钟桶。':(isDay?'当前为单天按小时桶。':''))+'点柱：'+(isMin?'→ 查看该时段记录':(isDay?'→ 下钻该小时按5分钟':'→ 下钻该天按小时'))+'；「← 返回」逐级回退。';
-  const rows = days.map(x=>{
+  $('#trendNote').textContent = '柱高=总量，堆叠色=Top8 模型费用分色；紫色虚线=缓存命中率（右轴 0-100%）。'+(isMin?'当前为单小时按5分钟桶。':(isDay?'当前为单天按小时桶。':(isMonth?'当前为按月聚合，不可下钻。':'')))+(isMonth?'':'点柱：'+(isMin?'→ 查看该时段记录':(isDay?'→ 下钻该小时按5分钟':'→ 下钻该天按小时'))+'；「← 返回」逐级回退。');
+  const N = days.length;
+  const rows = days.map((x,xi)=>{
     const stack = [];
     const bm = x.models||[];
     if(bm.length){
       const total = bm.reduce((s,m)=>s+m.cny+(m.pts||0)/500,0);
       if(total>0){
-        bm.forEach((m,i)=>{
+        bm.forEach(m=>{
           const w = (m.cny+(m.pts||0)/500)/total*100;
           if(w<0.3) return;
-          stack.push('<div class="stack" style="height:'+w+'%;background:'+MODEL_COLORS[i%8]+'" title="'+esc(m.name)+'"></div>');
+          stack.push('<div class="stack" style="height:'+w+'%;background:'+(colorOf[m.name]||'#334155')+'" title="'+esc(m.name)+'"></div>');
         });
       }
     }
     if(!stack.length) stack.push('<div class="stack" style="height:100%;background:#334155"></div>');
     const rate = x.i>0 ? (x.c/x.i*100) : 0;
     const costLine = bm.length ? bm.slice(0,3).map(m=>esc(m.name)+' ¥'+m.cny.toFixed(2)).join(' · ') : '';
-    const tip = '<div class="tip">'+(x.d)+(x.h!=null?' 时':'')+(x.m!=null?':'+String(x.m*5).padStart(2,'0'):'')+'<br>'+(x.r)+' 轮 · '+fmt4(x.v)+' Token<br>输入 '+fmt(x.i)+' · 输出 '+fmt(x.o)+' · 缓存 '+fmt(x.c)+'<br>命中率 <span class="rate">'+rate.toFixed(1)+'%</span>'+(x.e?' · 出错 '+x.e:'')+(costLine?'<br>'+costLine:'')+'</div>';
-    return '<div class="col" data-d="'+esc(x.d)+'" data-h="'+(x.h!=null?x.h:'')+'" data-m="'+(x.m!=null?x.m:'')+'">'+tip+'<div style="display:flex;flex-direction:column;justify-content:flex-end;height:100%">'+
+    const tip = '<div class="tip'+(xi>=N*0.7?' flip':'')+'">'+(x.d)+(x.h!=null&&isDay?' 时':'')+(x.m!=null?':'+String(x.m*5).padStart(2,'0'):'')+'<br>'+(x.r)+' 轮 · '+fmt4(x.v)+' Token<br>输入 '+fmt(x.i)+' · 输出 '+fmt(x.o)+' · 缓存 '+fmt(x.c)+'<br>命中率 <span class="rate">'+rate.toFixed(1)+'%</span>'+(x.e?' · 出错 '+x.e:'')+(costLine?'<br>'+costLine:'')+'</div>';
+    const hgt = x.v>0 ? Math.max(2, x.v/maxV*100) : 0;
+    const lbl = isMonth ? x.d : (x.d.length>10?x.d.slice(x.d.length-5):x.d);
+    return '<div class="col" data-d="'+esc(x.d)+'" data-h="'+(x.h!=null?x.h:'')+'" data-m="'+(x.m!=null?x.m:'')+'">'+tip+'<div class="stk" style="height:'+hgt+'%">'+
       (stack.join(''))+'</div>'+
-      '<div class="tlbl">'+esc(x.d.length>10?x.d.slice(x.d.length-5):x.d)+'</div></div>';
+      '<div class="tlbl">'+esc(lbl)+'</div></div>';
   }).join('');
-  $('#trend').innerHTML = rows;
-  document.querySelectorAll('#trend .col').forEach(c=>c.onclick=()=>{
-    const d = c.dataset.d, h = c.dataset.h, m = c.dataset.m;
-    if(!curDay){ curDay = d.slice(0,10); loadTrend(); }
-    else if(curDay && curHour===null && h!==''){ curHour = parseInt(h,10); loadTrend(); }
-    else { // 5分钟桶 → 跳记录并过滤该时段
-      showTab('rec');
-      filterRecBySlot(d.slice(0,10), parseInt(h,10), m===''?null:parseInt(m,10));
-    }
+  // 缓存命中率折线（内联 SVG，紫色虚线，右轴 0-100%）
+  const hitPts = days.map((x,xi)=>{
+    const rate = x.i>0 ? (x.c/x.i*100) : 0;
+    return ((xi+0.5)/N*100).toFixed(2)+','+(100-Math.min(100,rate)).toFixed(2);
+  }).join(' ');
+  const hitSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+hitPts+'" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 2" vector-effect="non-scaling-stroke" opacity=".85"/></svg>';
+  $('#trend').innerHTML = rows + hitSvg;
+  document.querySelectorAll('#trend .col').forEach(c=>{
+    if(isMonth) return; // 按月聚合不可下钻
+    c.onclick=()=>{
+      const d = c.dataset.d, h = c.dataset.h, m = c.dataset.m;
+      if(!curDay){ curDay = d.slice(0,10); loadTrend(); }
+      else if(curDay && curHour===null && h!==''){ curHour = parseInt(h,10); loadTrend(); }
+      else { // 5分钟桶 → 跳记录并过滤该时段
+        showTab('rec');
+        filterRecBySlot(d.slice(0,10), h===''?null:parseInt(h,10), m===''?null:parseInt(m,10));
+      }
+    };
   });
 }
 
@@ -3622,7 +3852,7 @@ async function loadPrice(){
   $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>启用</th><th>名称</th><th>币种</th><th>单位</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷方案</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
     priceRules.map((r,i)=>'<tr'+(r.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(r.enabled!==false?'checked':'')+' onchange="priceToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.unit!==undefined?r.unit:(r.currency==='积分'?'积分':'¥'))+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
     '<td>'+(r.peak_enabled===false?'恒谷':esc(r.peak_profile||'默认工作日'))+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
-    '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+')">删除</button></td></tr>').join('')+'</tbody></table>'+
+    '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+',this)">删除</button></td></tr>').join('')+'</tbody></table>'+
     '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；每条规则可选自己的峰谷方案（上方方案库管理）。双币种分别累计，不与 ¥ 混算。改价/改方案后全历史费用即时重算。</div>'
     : '<div class="note">暂无价格规则，费用显示「—」。点「＋ 添加规则」配置第一条。</div>';
 }
@@ -3642,7 +3872,7 @@ const PRICE_FIELDS = [
 ];
 function priceFieldHtml(f){
   return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
-    '<input id="pf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
+    '<input id="pf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
 }
 function priceEditOpen(i){
   priceEditIdx = i;
@@ -3650,10 +3880,10 @@ function priceEditOpen(i){
   const pe = r.peak_enabled !== undefined ? r.peak_enabled : true; // 旧规则无该字段按启用处理
   $('#priceEditTitle').textContent = i>=0 ? '编辑价格规则' : '添加价格规则';
   let html = priceFieldHtml(['name','规则名称',r.name||'']);
-  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷价</label><select id="pf_peak_enabled" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷价</label><select id="pf_peak_enabled" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
     '<option value="1"'+(pe?' selected':'')+'>启用峰谷价</option>'+
     '<option value="0"'+(pe?'':' selected')+'>不启用（全天按谷价）</option></select></div>';
-  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷方案</label><select id="pf_peak_profile" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷方案</label><select id="pf_peak_profile" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
     peakProfiles.map(p=>'<option value="'+esc(p.name)+'"'+(r.peak_profile===p.name?' selected':'')+'>'+esc(p.name)+'</option>').join('')+'</select></div>';
   html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">';
   PRICE_FIELDS.slice(1).forEach(f=>{ html += priceFieldHtml(f); });
@@ -3670,7 +3900,7 @@ function priceEditOpen(i){
     const item = {name:$('#pf_name').value.trim(), peak_enabled:$('#pf_peak_enabled').value==='1'};
     const pp = $('#pf_peak_profile');
     if(pp && pp.value) item.peak_profile = pp.value;
-    if(!item.name){ alert('请填写规则名称'); return; }
+    if(!item.name){ dtoast('请填写规则名称'); return; }
     PRICE_FIELDS.slice(1).forEach(f=>{
       const el = $('#pf_'+f[0]);
       if(!el) return;
@@ -3685,16 +3915,17 @@ function priceEditOpen(i){
     else priceRules.push(item);
     const r2 = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
     if(r2.ok){ $('#priceEditor').style.display='none'; loadPrice(); loadOv(); }
-    else alert('保存失败：'+(r2.msg||'未知错误'));
+    else dtoast('保存失败：'+(r2.msg||'未知错误'));
   };
   $('#priceEditor').style.display='flex';
 }
-async function priceDel(i){
-  if(!confirm('删除价格规则「'+(priceRules[i]?priceRules[i].name:'')+'」？')) return;
-  priceRules.splice(i,1);
-  const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
-  if(r.ok){ loadPrice(); loadOv(); }
-  else alert('删除失败：'+(r.msg||'未知错误'));
+function priceDel(i, btn){
+  confirmBtn(btn, '确认删除？', async ()=>{
+    priceRules.splice(i,1);
+    const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
+    if(r.ok){ loadPrice(); loadOv(); }
+    else dtoast('删除失败：'+(r.msg||'未知错误'));
+  });
 }
 $('#priceAdd').onclick = ()=>priceEditOpen(-1);
 $('#priceEditClose').onclick = ()=>{ $('#priceEditor').style.display='none'; };
@@ -3714,7 +3945,7 @@ function parseWindows(raw){
 async function saveProfiles(){
   const r = await fetch(API+'/pricing-profiles', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({profiles:peakProfiles})}).then(x=>x.json());
   if(r.ok){ loadPrice(); loadOv(); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 }
 $('#peakProfileSel').onchange = ()=>{
   peakProfileIdx = parseInt($('#peakProfileSel').value,10);
@@ -3723,13 +3954,13 @@ $('#peakProfileSel').onchange = ()=>{
 };
 $('#peakWindowsSave').onclick = async ()=>{
   const w = parseWindows($('#peakWindows').value);
-  if(!w){ alert('格式错误：请用 09:00-12:00,14:00-18:00 格式，且结束须晚于开始'); return; }
+  if(!w){ dtoast('格式错误：请用 09:00-12:00,14:00-18:00 格式，且结束须晚于开始'); return; }
   peakProfiles[peakProfileIdx].windows = w;
   await saveProfiles();
 };
 $('#peakProfileAdd').onclick = ()=>{
   const name = ($('#peakProfileName').value.trim() || ('方案'+(peakProfiles.length+1)));
-  if(peakProfiles.some(p=>p.name===name)){ alert('方案名已存在'); return; }
+  if(peakProfiles.some(p=>p.name===name)){ dtoast('方案名已存在'); return; }
   peakProfiles.push({name:name, windows:[['09:00','12:00'],['14:00','18:00']]});
   peakProfileIdx = peakProfiles.length-1;
   $('#peakProfileSel').innerHTML = peakProfiles.map((p,i)=>'<option value="'+i+'">'+esc(p.name)+'</option>').join('');
@@ -3738,20 +3969,21 @@ $('#peakProfileAdd').onclick = ()=>{
   $('#peakWindows').value = '09:00-12:00,14:00-18:00';
   saveProfiles();
 };
-$('#peakProfileDel').onclick = async ()=>{
-  if(peakProfiles.length<=1){ alert('至少保留一套方案'); return; }
+$('#peakProfileDel').onclick = async (ev)=>{
+  if(peakProfiles.length<=1){ dtoast('至少保留一套方案'); return; }
   const name = peakProfiles[peakProfileIdx].name;
-  if(priceRules.some(r=>r.peak_profile===name)){ alert('有计价规则正在使用「'+name+'」，请先改掉那些规则的方案再删'); return; }
-  if(!confirm('删除峰谷方案「'+name+'」？')) return;
-  peakProfiles.splice(peakProfileIdx,1);
-  peakProfileIdx = 0;
-  await saveProfiles();
+  if(priceRules.some(r=>r.peak_profile===name)){ dtoast('有计价规则正在使用「'+name+'」，请先改掉那些规则的方案再删'); return; }
+  confirmBtn(ev.currentTarget, '确认删除？', async ()=>{
+    peakProfiles.splice(peakProfileIdx,1);
+    peakProfileIdx = 0;
+    await saveProfiles();
+  });
 };
 async function priceToggle(i,on){
   priceRules[i].enabled = on;
   const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
   if(r.ok){ loadPrice(); loadOv(); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 }
 let balSources = [];
 let balEditIdx = -1;
@@ -3764,7 +3996,7 @@ async function loadBal(refresh){
     const unit = x.unit!==undefined ? x.unit : (x.currency==='积分' ? '积分' : (d.unit||'元'));
     return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(x.enabled!==false?'checked':'')+' onchange="balToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+(unit?' '+esc(unit):'')):'失败')+'</td>'+
     '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
-    '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+')">删除</button></td></tr>';
+    '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+',this)">删除</button></td></tr>';
   }).join('') ||
     '<tr><td colspan="7" class="note">未配置余额监测源，点「＋ 添加监测源」开始</td></tr>';
 }
@@ -3772,14 +4004,14 @@ async function balToggle(i,on){
   balSources[i].enabled = on;
   const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
   if(r.ok){ loadBal(false); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 }
 $('#balIntervalSave').onclick = async ()=>{
   const v = parseInt($('#balInterval').value,10);
-  if(!v || v<5){ alert('间隔须为 ≥5 的整数（秒）'); return; }
+  if(!v || v<5){ dtoast('间隔须为 ≥5 的整数（秒）'); return; }
   const r = await fetch(API+'/balance-interval', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({interval:v})}).then(x=>x.json());
   if(r.ok){ loadBal(false); }
-  else alert('保存失败：'+(r.msg||'未知错误'));
+  else dtoast('保存失败：'+(r.msg||'未知错误'));
 };
 const BAL_TYPES = [
   ['auto','auto · 自动探测（官方端点/One-API 中转站）'],
@@ -3798,15 +4030,16 @@ const BAL_FIELDS = {
   rolling: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分'],['unit','显示单位(留空=无单位)','积分']]
 };
 function balFieldHtml(f){
+  const tp = (f[0]==='api_key') ? ' type="password" autocomplete="off"' : '';
   return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
-    '<input id="bf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
+    '<input id="bf_'+f[0]+'"'+tp+' style="width:100%;box-sizing:border-box;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
 }
 function balEditOpen(i){
   balEditIdx = i;
   const src = (i>=0 && balSources[i]) ? balSources[i] : {name:'',type:'auto',enabled:true};
   $('#balEditTitle').textContent = i>=0 ? '编辑监测源' : '添加监测源';
   let html = balFieldHtml(['name','名称',src.name||'']);
-  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">类型</label><select id="bf_type" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">类型</label><select id="bf_type" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
     BAL_TYPES.map(t=>'<option value="'+t[0]+'"'+(src.type===t[0]?' selected':'')+'>'+esc(t[1])+'</option>').join('')+'</select></div>';
   html += '<div id="bf_dyn"></div>';
   html += '<div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim)"><input type="checkbox" id="bf_enabled"'+(src.enabled===false?'':' checked')+'> 启用</label></div>';
@@ -3816,7 +4049,7 @@ function balEditOpen(i){
   const renderDyn = ()=>{
     const t = $('#bf_type').value;
     $('#bf_dyn').innerHTML = (BAL_FIELDS[t]||[]).map(f=>{
-      if(f[0]==='model_ref') return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label><select id="bf_model_ref" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px"><option value="">（不关联，按渠道/URL 全算）</option></select><div class="note">从 KiraAI 已配置的 LLM 模型中选择，估算消耗只统计该模型的用量（模型名+渠道匹配）</div></div>';
+      if(f[0]==='model_ref') return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label><select id="bf_model_ref" style="width:100%;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px"><option value="">（不关联，按渠道/URL 全算）</option></select><div class="note">从 KiraAI 已配置的 LLM 模型中选择，估算消耗只统计该模型的用量（模型名+渠道匹配）</div></div>';
       return balFieldHtml(f);
     }).join('');
     (BAL_FIELDS[t]||[]).forEach(f=>{
@@ -3847,7 +4080,7 @@ function balEditOpen(i){
   $('#bf_save').onclick = async ()=>{
     const t = $('#bf_type').value;
     const item = {name:$('#bf_name').value.trim(), type:t, enabled:$('#bf_enabled').checked};
-    if(!item.name){ alert('请填写名称'); return; }
+    if(!item.name){ dtoast('请填写名称'); return; }
     (BAL_FIELDS[t]||[]).forEach(f=>{
       const el = $('#bf_'+f[0]);
       if(!el) return;
@@ -3861,16 +4094,17 @@ function balEditOpen(i){
     else balSources.push(item);
     const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
     if(r.ok){ $('#balEditor').style.display='none'; loadBal(true); }
-    else alert('保存失败：'+(r.msg||'未知错误'));
+    else dtoast('保存失败：'+(r.msg||'未知错误'));
   };
   $('#balEditor').style.display='flex';
 }
-async function balDel(i){
-  if(!confirm('删除监测源「'+(balSources[i]?balSources[i].name:'')+'」？')) return;
-  balSources.splice(i,1);
-  const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
-  if(r.ok) loadBal(false);
-  else alert('删除失败：'+(r.msg||'未知错误'));
+function balDel(i, btn){
+  confirmBtn(btn, '确认删除？', async ()=>{
+    balSources.splice(i,1);
+    const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
+    if(r.ok) loadBal(false);
+    else dtoast('删除失败：'+(r.msg||'未知错误'));
+  });
 }
 $('#balRefresh').onclick = ()=>{ $('#balRefresh').disabled=true; loadBal(true).finally(()=>$('#balRefresh').disabled=false); };
 $('#balEdit').onclick = ()=>balEditOpen(-1);
@@ -3878,7 +4112,7 @@ $('#balEditClose').onclick = ()=>{ $('#balEditor').style.display='none'; };
 $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent='15'; loadRec(); };
 
 loadOv();
-setInterval(loadOv, 1000);
+setInterval(loadOv, 4000);
 // 随机背景（默认开，右下角 👕 点击关闭，localStorage 记忆）
 (function(){
   const BG_KEY = 'tsSkinBg';
@@ -3930,10 +4164,11 @@ _WIDGET_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Token 挂件</title>
 <style>
-:root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
+:root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--err:#f87171;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
 body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden;background-size:cover;background-position:center;background-attachment:fixed}
+@media (prefers-reduced-motion: reduce){ #w,#w.ball,#skinBtn{backdrop-filter:none!important;-webkit-backdrop-filter:none!important} *{transition:none!important;animation:none!important} }
 #skinBtn{position:fixed;right:10px;bottom:10px;width:28px;height:28px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:14px;z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
 #skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}
 #w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
@@ -3942,16 +4177,19 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 .ballv{display:none;font-size:14px;font-weight:700;color:var(--fg);font-variant-numeric:tabular-nums}
 #w.ball .ballv{display:block}
 #w.dragging{opacity:.85;border-color:var(--acc)}
+body.grabbing,body.grabbing *{cursor:grabbing!important}
 .head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}
-.head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none}
+.head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none;transition:background .3s,box-shadow .3s}
+.head .dot.err{background:var(--err);box-shadow:0 0 6px var(--err)}
 .head .t{font-size:12px;font-weight:600;color:var(--fg);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .head .hbtn{width:22px;height:22px;border:none;background:rgba(51,65,85,.4);color:var(--dim);border-radius:6px;cursor:pointer;font-size:12px;line-height:1;flex:none}
 .head .hbtn:hover{color:var(--fg);background:var(--line)}
 .body{padding:10px 12px 12px}
 .row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:12px}
 .row .k{color:var(--dim)}
-.row .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--fg)}
+.row .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--fg);transition:color .15s,text-shadow .15s}
 .row .v.cost{color:var(--ok)}.row .v.pts{color:var(--purple)}.row .v.in{color:var(--acc)}.row .v.out{color:var(--pink)}
+.row .v.flash{color:#fff;text-shadow:0 0 8px var(--acc)}
 .sep{height:1px;background:rgba(51,65,85,.5);margin:6px 0}
 .bal{font-size:11.5px}
 .bal .bname{color:var(--dim);max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -3967,6 +4205,7 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
     <span class="t" id="title">Token 挂件</span>
+    <button class="hbtn" id="pip" title="置顶浮窗（PiP）" style="display:none">📌</button>
     <button class="hbtn" id="pop" title="独立小窗">⧉</button>
     <button class="hbtn" id="fold" title="折叠">—</button>
   </div>
@@ -3987,38 +4226,71 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 </div>
 <script>
 const API = '/api/plugin/KiraAI_token_stats_plugin';
+const PAGE = '/page/plugin/KiraAI_token_stats_plugin';
 const $ = s=>document.querySelector(s);
 const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1000)+'K';
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
   return Math.round(v/1e9)+'B'; };
+// 双模式：URL ?pop=1 → 独立弹窗模式（window.moveBy/resizeTo 控制真实窗口）
+const IS_POP = new URLSearchParams(location.search).get('pop')==='1';
+const POS_KEY = IS_POP ? 'tsWidgetPopPos' : 'tsWidgetPos';
 let compact = localStorage.getItem('tsWidgetCompact')==='1';
-let lastTotal = 0;
 let pos = null;
-try{ pos = JSON.parse(localStorage.getItem('tsWidgetPos')||'null'); }catch(e){}
-if(pos){ $('#w').style.left=pos.x+'px'; $('#w').style.top=pos.y+'px'; }
+try{ pos = JSON.parse(localStorage.getItem(POS_KEY)||'null'); }catch(e){}
+if(pos && !IS_POP){ $('#w').style.left=pos.x+'px'; $('#w').style.top=pos.y+'px'; }
 if(compact){ $('#w').style.width='180px'; }
+if(IS_POP){ $('#pop').style.display='none'; document.title='Token 挂件 · 小窗'; }
+
+function toast(msg){
+  let t = document.getElementById('skinToast');
+  if(!t){
+    t = document.createElement('div');
+    t.id = 'skinToast';
+    t.style.cssText = 'position:fixed;left:50%;bottom:50px;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid #334155;color:#e2e8f0;padding:6px 14px;border-radius:16px;font-size:12px;z-index:99999;transition:opacity .3s;pointer-events:none;max-width:90%';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.opacity = '1';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 2000);
+}
+
+// 数值变化 150ms 闪动
+function setVal(id, txt){
+  const el = $(id);
+  if(el.textContent !== txt){
+    el.textContent = txt;
+    el.classList.add('flash');
+    setTimeout(()=>el.classList.remove('flash'), 150);
+  }
+}
 async function refresh(){
   try{
     const d = await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());
+    $('#dot').classList.remove('err');
     $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
     $('#title').textContent = 'Token · ' + (d.model||'—');
-    $('#v_sess').textContent = fmt4(d.total);
-    lastTotal = d.total; $('#ballv').textContent = fmt4(d.total);
-    $('#v_today').textContent = fmt4((d.ranges||{}).today ? d.ranges.today.v : 0);
-    $('#v_d7').textContent = fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0);
+    setVal('#v_sess', fmt4(d.total));
+    $('#ballv').textContent = fmt4(d.total);
+    setVal('#v_today', fmt4((d.ranges||{}).today ? d.ranges.today.v : 0));
+    setVal('#v_d7', fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0));
     const co = (d.costs||{}).today||{}, coT = (d.costs||{}).total||{};
     const fmtCost = c => { if(!c.matched || !c.units || !c.units.length) return '—'; return c.units.map(u=>u.unit?(u.amt+' '+u.unit):u.amt).join(' + '); };
-    $('#v_cost').textContent = fmtCost(co);
-    $('#v_cost_total').textContent = fmtCost(coT);
+    setVal('#v_cost', fmtCost(co));
+    setVal('#v_cost_total', fmtCost(coT));
     const b = d.balance||{};
     $('#bal').innerHTML = b.current ? '<div class="row"><span class="k">余额</span><span class="v">'+b.current+'</span></div>' : '';
     $('#st').textContent = '会话 '+d.rounds+' 轮 · '+(d.src||'');
-  }catch(e){ $('#st').textContent = '加载失败'; }
+  }catch(e){
+    $('#dot').classList.add('err');
+    $('#dot').style.background = '';
+    $('#st').textContent = '加载失败';
+  }
 }
 refresh();
 setInterval(refresh, 5000);
-// 随机背景（默认开，右下角 👕 点击关闭）
+// 随机背景（默认开，右下角 👕 点击关闭；图片加载失败静默回退）
 (function(){
   const BG_KEY = 'tsWidgetSkinBg';
   const bgOn = localStorage.getItem(BG_KEY) !== '0';
@@ -4032,19 +4304,6 @@ setInterval(refresh, 5000);
       document.body.style.backgroundImage = '';
     }
   };
-  const toast = msg => {
-    let t = document.getElementById('skinToast');
-    if(!t){
-      t = document.createElement('div');
-      t.id = 'skinToast';
-      t.style.cssText = 'position:fixed;left:50%;bottom:50px;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid #334155;color:#e2e8f0;padding:6px 14px;border-radius:16px;font-size:12px;z-index:9999;transition:opacity .3s;pointer-events:none';
-      document.body.appendChild(t);
-    }
-    t.textContent = msg;
-    t.style.opacity = '1';
-    clearTimeout(t._tm);
-    t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 1600);
-  };
   const syncIcon = on => { $('#skinBtn').textContent = on ? '👕' : '🚫'; $('#skinBtn').title = on ? '随机背景：开（点击关闭）' : '随机背景：关（点击开启）'; };
   applyBg(bgOn);
   syncIcon(bgOn);
@@ -4056,41 +4315,93 @@ setInterval(refresh, 5000);
     toast('随机背景：' + (!now ? '开' : '关'));
   };
 })();
-// 拖动（标题栏；球模式下整个球可拖）
-let drag=false, sx=0, sy=0, ox=0, oy=0;
+// 拖动（标题栏；球模式下整个球可拖）：弹窗模式优先 window.moveBy 移动真实窗口，失败退化页内拖拽
+let drag=false, sx=0, sy=0, ox=0, oy=0, popMove=true;
 $('#w').addEventListener('mousedown',e=>{
-  if(e.target.classList.contains('hbtn')) return;
+  if(e.target.classList.contains('hbtn') || e.target.classList.contains('go')) return;
   if(!$('#w').classList.contains('ball') && !e.target.closest('#hd')) return;
-  drag=true; sx=e.clientX; sy=e.clientY;
+  drag=true; sx=e.screenX; sy=e.screenY;
   const r=$('#w').getBoundingClientRect(); ox=r.left; oy=r.top;
   $('#w').classList.add('dragging');
+  document.body.classList.add('grabbing');
 });
 document.addEventListener('mousemove',e=>{
   if(!drag) return;
-  $('#w').style.left=Math.max(0,ox+e.clientX-sx)+'px';
-  $('#w').style.top=Math.max(0,oy+e.clientY-sy)+'px';
+  if(IS_POP && popMove){
+    try{
+      window.moveBy(e.screenX-sx, e.screenY-sy);
+      sx=e.screenX; sy=e.screenY;
+      return;
+    }catch(err){ popMove=false; sx=e.screenX; sy=e.screenY; }
+  }
+  $('#w').style.left=Math.max(0,ox+(e.screenX-sx))+'px';
+  $('#w').style.top=Math.max(0,oy+(e.screenY-sy))+'px';
 });
 document.addEventListener('mouseup',()=>{
   if(!drag) return;
   drag=false; $('#w').classList.remove('dragging');
-  const r=$('#w').getBoundingClientRect();
-  localStorage.setItem('tsWidgetPos', JSON.stringify({x:r.left,y:r.top}));
+  document.body.classList.remove('grabbing');
+  if(IS_POP && popMove){
+    try{ localStorage.setItem(POS_KEY, JSON.stringify({x:window.screenX,y:window.screenY})); }catch(e){}
+  }else{
+    const r=$('#w').getBoundingClientRect();
+    localStorage.setItem(POS_KEY, JSON.stringify({x:r.left,y:r.top}));
+  }
 });
-// 折叠（球模式：收成 56px 圆球显示总量，点击展开）
+// 折叠（球模式：收成 56px 圆球显示总量，点击展开）；弹窗模式同步 resizeTo 真实窗口
 $('#fold').onclick=()=>{
   const w=$('#w');
-  if(w.classList.contains('ball')){ w.classList.remove('ball'); $('#fold').textContent='—'; }
-  else { w.classList.add('ball'); $('#fold').textContent='+'; }
+  const toBall = !w.classList.contains('ball');
+  w.classList.toggle('ball');
+  $('#fold').textContent = toBall ? '+' : '—';
+  if(IS_POP){
+    try{ toBall ? window.resizeTo(80,80) : window.resizeTo(340,360); }catch(e){}
+  }
 };
-// 独立小窗：blob URL 打开无边框可拖动悬浮窗（绕过 window.open 空窗拦截）
+// 独立小窗：同源真实 URL + 命名窗口单例 + 记忆位置；被拦截时页内 toast 提示
 $('#pop').onclick=()=>{
-  const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden;background-size:cover;background-position:center;background-attachment:fixed}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.88);border:none;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.55);backdrop-filter:blur(10px);color:#e2e8f0;user-select:none;z-index:9999;overflow:hidden}#w.ball{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:move;background:rgba(15,23,42,.92);box-shadow:0 6px 20px rgba(0,0,0,.5)}#w.ball .head,#w.ball .body,#w.ball .foot{display:none}.ballv{display:none;font-size:14px;font-weight:700;font-variant-numeric:tabular-nums}#w.ball .ballv{display:block}.head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}.dot{width:8px;height:8px;border-radius:50%;background:#34d399;box-shadow:0 0 6px #34d399;flex:none}.t{flex:1;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hbtn{width:22px;height:22px;border:none;background:rgba(51,65,85,.4);color:#94a3b8;border-radius:6px;cursor:pointer;font-size:12px;line-height:1;flex:none}.hbtn:hover{color:#e2e8f0;background:#334155}.body{padding:10px 12px 12px}.row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:12px}.row .k{color:#94a3b8}.row .v{font-variant-numeric:tabular-nums;font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:rgba(51,65,85,.5);margin:6px 0}.foot{padding:8px 12px;border-top:1px solid rgba(51,65,85,.5);display:flex;gap:6px;align-items:center;justify-content:flex-end}.foot .st{font-size:10px;color:#94a3b8;margin-right:auto}.foot .go{border:1px solid #334155;background:#1e293b;color:#e2e8f0;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px}.foot .go:hover{border-color:#38bdf8}#skinBtn{position:fixed;right:10px;bottom:10px;width:26px;height:26px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:13px;z-index:9999;display:flex;align-items:center;justify-content:center}#skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}</style></head><body><button id="skinBtn" title="随机背景开关">👕</button><div id="w"><div class="head" id="hd"><span class="dot" id="dot"></span><span class="t" id="title">Token 挂件</span><button class="hbtn" id="fold" title="折叠">—</button></div><div class="body" id="body"><div class="row"><span class="k">本次会话</span><span class="v" id="v_sess">—</span></div><div class="row"><span class="k">今日</span><span class="v" id="v_today">—</span></div><div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div><div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div><div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div><div class="sep"></div><div class="row"><span class="k">余额</span><span class="v" id="v_bal">—</span></div></div><div class="foot"><span class="st" id="st">—</span><button class="go" id="go">打开看板</button></div><div class="ballv" id="ballv">0</div></div><script>const API="'+API+'";const $=s=>document.querySelector(s);const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ""+v;if(v<9950)return (v/1000).toFixed(1).replace(".0","")+"K";if(v<995000)return Math.round(v/1000)+"K";if(v<9950000)return (v/1e6).toFixed(1).replace(".0","")+"M";if(v<995000000)return Math.round(v/1e6)+"M";return Math.round(v/1e9)+"B"};let lastTotal=0;async function rf(){try{const d=await fetch(API+"/stats",{cache:"no-store"}).then(r=>r.json());$("#dot").style.background=d.busy?"#60a5fa":"#34d399";$("#title").textContent="Token · "+(d.model||"—");$("#v_sess").textContent=fmt4(d.total);lastTotal=d.total;$("#ballv").textContent=fmt4(d.total);$("#v_today").textContent=fmt4((d.ranges||{}).today?d.ranges.today.v:0);$("#v_d7").textContent=fmt4((d.ranges||{}).d7?d.ranges.d7.v:0);const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return "—";return c.units.map(u=>u.unit?(u.amt+" "+u.unit):u.amt).join(" + ")};$("#v_cost").textContent=fc(co);$("#v_cost_total").textContent=fc(coT);const b=d.balance||{};$("#v_bal").textContent=b.current||"—";$("#st").textContent="会话 "+d.rounds+" 轮 · "+(d.src||"");}catch(e){$("#st").textContent="加载失败";}}rf();setInterval(rf,5000);(function(){const BG_KEY="tsWidgetSkinBg";const bgOn=localStorage.getItem(BG_KEY)!=="0";const applyBg=on=>{if(on){const img=new Image();img.onload=()=>{document.body.style.backgroundImage="url('"+img.src+"')"};img.onerror=()=>{document.body.style.backgroundImage=""};img.src="https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t="+Date.now()}else{document.body.style.backgroundImage=""}};const syncIcon=on=>{$("#skinBtn").textContent=on?"👕":"🚫";$("#skinBtn").title=on?"随机背景：开（点击关闭）":"随机背景：关（点击开启）"};applyBg(bgOn);syncIcon(bgOn);$("#skinBtn").onclick=()=>{const now=localStorage.getItem(BG_KEY)!=="0";localStorage.setItem(BG_KEY,now?"0":"1");applyBg(!now);syncIcon(!now)}})();let drag=false,sx=0,sy=0,ox=0,oy=0;$("#w").addEventListener("mousedown",e=>{if(e.target.classList.contains("hbtn"))return;if(!$("#w").classList.contains("ball")&&!e.target.closest("#hd"))return;drag=true;sx=e.clientX;sy=e.clientY;const r=$("#w").getBoundingClientRect();ox=r.left;oy=r.top});document.addEventListener("mousemove",e=>{if(!drag)return;$("#w").style.left=Math.max(0,ox+e.clientX-sx)+"px";$("#w").style.top=Math.max(0,oy+e.clientY-sy)+"px"});document.addEventListener("mouseup",()=>{drag=false});$("#fold").onclick=()=>{const w=$("#w");if(w.classList.contains("ball")){w.classList.remove("ball");$("#fold").textContent="—"}else{w.classList.add("ball");$("#fold").textContent="+"}};$("#go").onclick=()=>{window.open("/page/plugin/KiraAI_token_stats_plugin/stats","_blank")};<\/script></body></html>';
-  const url = URL.createObjectURL(new Blob([html], {type:'text/html'}));
-  const w = window.open(url, '_blank', 'width=340,height=340');
-  if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
-  setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  let left = Math.max(0,(screen.availWidth||screen.width)-380), top = 80;
+  try{
+    const p = JSON.parse(localStorage.getItem('tsWidgetPopPos')||'null');
+    if(p){ left=p.x; top=p.y; }
+  }catch(e){}
+  const url = PAGE + '/stats-widget?pop=1';
+  const w = window.open(url, 'tsWidgetPop', 'popup=yes,width=340,height=360,left='+left+',top='+top);
+  if(!w){ toast('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
+  try{ w.focus(); }catch(e){}
 };
-$('#go').onclick=()=>{ const u='/page/plugin/KiraAI_token_stats_plugin/stats'; const w=window.open(u,'_blank'); if(!w){ const a=document.createElement('a'); a.href=u; a.target='_blank'; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove(); } };
+// PiP 置顶浮窗（彩蛋层）：仅弹窗模式且浏览器支持 documentPictureInPicture 时显示；失败静默
+if(IS_POP && 'documentPictureInPicture' in window){
+  $('#pip').style.display = '';
+  $('#pip').onclick = async ()=>{
+    try{
+      const pipWin = await documentPictureInPicture.requestWindow({width:340, height:360});
+      // 复制样式
+      let css = '';
+      for(const sh of document.styleSheets){
+        try{ for(const r of sh.cssRules) css += r.cssText; }catch(e){}
+      }
+      const st = pipWin.document.createElement('style');
+      st.textContent = css;
+      pipWin.document.head.appendChild(st);
+      pipWin.document.body.style.cssText = document.body.style.cssText;
+      const wEl = $('#w');
+      pipWin.document.body.appendChild(wEl);
+      const stEl = $('#st'); if(stEl) stEl.textContent = '已置顶（OS 级浮窗）';
+      pipWin.addEventListener('pagehide', ()=>{
+        document.body.appendChild(wEl);
+      }, {once:true});
+    }catch(e){ /* 用户取消或不支持，静默 */ }
+  };
+}
+// 打开看板：同源真实地址新开标签；失败时 toast + 可复制链接
+$('#go').onclick=()=>{
+  const u = PAGE + '/stats';
+  const w = window.open(u, '_blank');
+  if(!w){
+    toast('弹窗被拦截：' + location.origin + u);
+  }
+};
 </script>
 </body>
 </html>
