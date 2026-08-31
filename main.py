@@ -494,8 +494,11 @@ class TokenStatsPlugin(BasePlugin):
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
         self.enable_balance = bool(bal.get("enable_balance", True))
-        interval = bal.get("balance_interval", 1)
-        self.balance_interval = max(1, int(interval) if interval is not None else 1)
+        interval = bal.get("balance_interval", 10)
+        self.balance_interval = max(5, int(interval) if interval is not None else 10)
+        # 会话昵称解析（OneBot）缓存与适配器
+        self._ada_obj = None
+        self._name_cache = {}
         sources = bal.get("balance_sources", [])
         # 复制一份再 append，避免直接引用 cfg 原始 list（热重载时重复追加）
         self.balance_sources = list(sources) if isinstance(sources, list) else []
@@ -647,7 +650,7 @@ class TokenStatsPlugin(BasePlugin):
         # 余额轮询后台任务
         if self.enable_balance and self.balance_sources and _HAS_AIOHTTP:
             self._bal_task = asyncio.create_task(self._balance_loop())
-            logger.info(f"[token_stats] 余额轮询已启动（间隔 {self.balance_interval} 分钟）")
+            logger.info(f"[token_stats] 余额轮询已启动（间隔 {self.balance_interval} 秒）")
         elif self.enable_balance and self.balance_sources and not _HAS_AIOHTTP:
             logger.warning("[token_stats] aiohttp 未安装，余额监测不可用（pip install aiohttp）")
 
@@ -1653,7 +1656,7 @@ class TokenStatsPlugin(BasePlugin):
         try:
             while True:
                 await self._probe_all()
-                await asyncio.sleep(max(60, self.balance_interval * 60))
+                await asyncio.sleep(max(5, self.balance_interval))
         except asyncio.CancelledError:
             return
         except Exception:
@@ -2501,6 +2504,68 @@ class TokenStatsPlugin(BasePlugin):
             "bySid": dim(by_sid),
         }
 
+    # ── 会话昵称解析（OneBot，带 1 小时缓存，失败降级为 sid）──
+    def _ensure_ada(self):
+        if self._ada_obj:
+            return
+        try:
+            if hasattr(self.ctx.adapter_mgr, 'get_adapters'):
+                for name, ada in self.ctx.adapter_mgr.get_adapters().items():
+                    if hasattr(ada, 'info') and ada.info.platform == "QQ":
+                        self._ada_obj = ada
+                        return
+            if hasattr(self.ctx.adapter_mgr, '_adapters'):
+                for name, ada in self.ctx.adapter_mgr._adapters.items():
+                    if hasattr(ada, 'info') and ada.info.platform == "QQ":
+                        self._ada_obj = ada
+                        return
+        except Exception:
+            pass
+
+    async def _call_onebot(self, action: str, params: dict, timeout: float = 4.0):
+        self._ensure_ada()
+        if not self._ada_obj:
+            return None
+        try:
+            ob_client = self._ada_obj.get_client()
+            res = await ob_client.send_action(action, params, timeout=timeout)
+            return res
+        except Exception:
+            return None
+
+    async def _resolve_sid_name(self, sid: str) -> str:
+        """qq:dm:12345 → 周武(12345)；qq:gm:12345 → 群名(12345)；失败降级原样"""
+        try:
+            if ":dm:" in sid:
+                uid = sid.split(":dm:", 1)[1]
+                now = time.time()
+                hit = self._name_cache.get(("u", uid))
+                if hit and now - hit[1] < 3600:
+                    name = hit[0]
+                else:
+                    name = ""
+                    res = await self._call_onebot("get_stranger_info", {"user_id": int(uid)})
+                    if res and res.get("status") == "ok":
+                        name = (res.get("data") or {}).get("nickname", "") or ""
+                    self._name_cache[("u", uid)] = (name, now)
+                return f"{name}({uid})" if name else sid
+            if ":gm:" in sid:
+                gid = sid.split(":gm:", 1)[1]
+                now = time.time()
+                hit = self._name_cache.get(("g", gid))
+                if hit and now - hit[1] < 3600:
+                    name = hit[0]
+                else:
+                    name = ""
+                    res = await self._call_onebot("get_group_info", {"group_id": int(gid)})
+                    if res and res.get("status") == "ok":
+                        name = (res.get("data") or {}).get("group_name", "") or ""
+                    self._name_cache[("g", gid)] = (name, now)
+                return f"{name}({gid})" if name else sid
+        except Exception:
+            pass
+        return sid
+
     @register.api(method="GET", path="/sessions", auth=True)
     async def api_sessions(self, request: Request):
         """/sessions?range=today|d7|d30|total|custom&from=&to=
@@ -2577,12 +2642,17 @@ class TokenStatsPlugin(BasePlugin):
                     bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
             return " + ".join(bits) if bits else None
 
+        sess_out = []
+        for x in arr[:50]:
+            sess_out.append({
+                "sid": x["sid"], "name": await self._resolve_sid_name(x["sid"]),
+                "type": x["type"], "r": x["r"], "i": x["i"], "o": x["o"],
+                "c": x["c"], "v": x["v"], "cost": fmt_cost(x), "last_at": x["last_at"],
+            })
         return {
             "from": frm, "to": to,
             "groups": {k: {**v, "cost": fmt_cost(v)} for k, v in groups.items()},
-            "sessions": [{"sid": x["sid"], "type": x["type"], "r": x["r"], "i": x["i"], "o": x["o"],
-                           "c": x["c"], "v": x["v"], "cost": fmt_cost(x), "last_at": x["last_at"]}
-                          for x in arr[:50]],
+            "sessions": sess_out,
         }
 
     @register.api(method="GET", path="/trend", auth=True)
@@ -2775,7 +2845,7 @@ class TokenStatsPlugin(BasePlugin):
                 if v is not None:
                     item[k] = v
             sources.append(item)
-        return {"interval": max(1, self.balance_interval), "unit": self.balance_unit, "sources": sources}
+        return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
 
     @register.api(method="POST", path="/balance-config", auth=True)
     async def api_balance_config(self, request: Request):
@@ -2841,9 +2911,9 @@ class TokenStatsPlugin(BasePlugin):
         except Exception:
             return {"ok": False, "msg": "请求体不是合法 JSON"}
         try:
-            interval = max(1, int(body.get("interval") or 1))
+            interval = max(5, int(body.get("interval") or 10))
         except (TypeError, ValueError):
-            return {"ok": False, "msg": "间隔必须是正整数（分钟）"}
+            return {"ok": False, "msg": "间隔必须是正整数（秒）"}
         try:
             pm = self.ctx.plugin_mgr
             if pm is None:
@@ -3205,8 +3275,8 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="balRefresh">立即探测</button>
       <button class="btn" id="balEdit">＋ 添加监测源</button>
       <span style="color:var(--dim);font-size:12px">轮询间隔</span>
-      <input id="balInterval" type="number" min="1" style="width:64px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px;font-size:12px" value="1">
-      <span style="color:var(--dim);font-size:12px">分钟</span>
+      <input id="balInterval" type="number" min="5" style="width:64px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px;font-size:12px" value="10">
+      <span style="color:var(--dim);font-size:12px">秒</span>
       <button class="btn" id="balIntervalSave">保存</button>
       <span style="color:var(--dim);font-size:12px" id="balInfo"></span>
     </div>
@@ -3441,7 +3511,7 @@ async function loadSess(r){
   }).join('');
   const rows = (d.sessions||[]).map(x=>{
     const t = x.type==='dm'?'私聊':(x.type==='gm'?'群聊':'其他');
-    return '<tr style="cursor:pointer" data-sid="'+esc(x.sid)+'" onclick="sessRecs(this.dataset.sid)"><td>'+esc(x.sid)+'</td><td>'+t+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td><td>'+esc(x.last_at||'')+'</td></tr>';
+    return '<tr style="cursor:pointer" data-sid="'+esc(x.sid)+'" onclick="sessRecs(this.dataset.sid)"><td>'+esc(x.name||x.sid)+'</td><td>'+t+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td><td>'+esc(x.last_at||'')+'</td></tr>';
   }).join('');
   $('#sessBody').innerHTML = rows || '<tr><td colspan="9" class="note">该范围暂无会话数据</td></tr>';
 }
@@ -3650,7 +3720,7 @@ async function balToggle(i,on){
 }
 $('#balIntervalSave').onclick = async ()=>{
   const v = parseInt($('#balInterval').value,10);
-  if(!v || v<1){ alert('间隔须为 ≥1 的整数（分钟）'); return; }
+  if(!v || v<5){ alert('间隔须为 ≥5 的整数（秒）'); return; }
   const r = await fetch(API+'/balance-interval', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({interval:v})}).then(x=>x.json());
   if(r.ok){ loadBal(false); }
   else alert('保存失败：'+(r.msg||'未知错误'));
@@ -3811,6 +3881,10 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 #skinBtn{position:fixed;right:10px;bottom:10px;width:28px;height:28px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:14px;z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
 #skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}
 #w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
+#w.ball{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:move;background:var(--bg);box-shadow:0 6px 20px rgba(0,0,0,.45);border:1px solid var(--line)}
+#w.ball .head,#w.ball .body,#w.ball .foot{display:none}
+.ballv{display:none;font-size:14px;font-weight:700;color:var(--fg);font-variant-numeric:tabular-nums}
+#w.ball .ballv{display:block}
 #w.dragging{opacity:.85;border-color:var(--acc)}
 .head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}
 .head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none}
@@ -3853,6 +3927,7 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
     <span class="st" id="st">—</span>
     <button class="go" id="go">打开看板</button>
   </div>
+  <div class="ballv" id="ballv">0</div>
 </div>
 <script>
 const API = '/api/plugin/KiraAI_token_stats_plugin';
@@ -3862,6 +3937,7 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
   return Math.round(v/1e9)+'B'; };
 let compact = localStorage.getItem('tsWidgetCompact')==='1';
+let lastTotal = 0;
 let pos = null;
 try{ pos = JSON.parse(localStorage.getItem('tsWidgetPos')||'null'); }catch(e){}
 if(pos){ $('#w').style.left=pos.x+'px'; $('#w').style.top=pos.y+'px'; }
@@ -3872,6 +3948,7 @@ async function refresh(){
     $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
     $('#title').textContent = 'Token · ' + (d.model||'—');
     $('#v_sess').textContent = fmt4(d.total);
+    lastTotal = d.total; $('#ballv').textContent = fmt4(d.total);
     $('#v_today').textContent = fmt4((d.ranges||{}).today ? d.ranges.today.v : 0);
     $('#v_d7').textContent = fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0);
     const co = (d.costs||{}).today||{}, coT = (d.costs||{}).total||{};
@@ -3923,10 +4000,11 @@ setInterval(refresh, 5000);
     toast('随机背景：' + (!now ? '开' : '关'));
   };
 })();
-// 拖动
+// 拖动（标题栏；球模式下整个球可拖）
 let drag=false, sx=0, sy=0, ox=0, oy=0;
-$('#hd').addEventListener('mousedown',e=>{
+$('#w').addEventListener('mousedown',e=>{
   if(e.target.classList.contains('hbtn')) return;
+  if(!$('#w').classList.contains('ball') && !e.target.closest('#hd')) return;
   drag=true; sx=e.clientX; sy=e.clientY;
   const r=$('#w').getBoundingClientRect(); ox=r.left; oy=r.top;
   $('#w').classList.add('dragging');
@@ -3942,17 +4020,17 @@ document.addEventListener('mouseup',()=>{
   const r=$('#w').getBoundingClientRect();
   localStorage.setItem('tsWidgetPos', JSON.stringify({x:r.left,y:r.top}));
 });
-// 折叠
+// 折叠（球模式：收成 56px 圆球显示总量，点击展开）
 $('#fold').onclick=()=>{
-  const b=$('#body'), f=$('#fold');
-  if(b.style.display==='none'){ b.style.display=''; f.textContent='—'; }
-  else { b.style.display='none'; f.textContent='+'; }
+  const w=$('#w');
+  if(w.classList.contains('ball')){ w.classList.remove('ball'); $('#fold').textContent='—'; }
+  else { w.classList.add('ball'); $('#fold').textContent='+'; }
 };
-// 独立小窗：blob URL 打开可拖动迷你面板（绕过 window.open 空窗拦截）
+// 独立小窗：blob URL 打开无边框可拖动悬浮窗（绕过 window.open 空窗拦截）
 $('#pop').onclick=()=>{
-  const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.95);border:1px solid #334155;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#e2e8f0;user-select:none;z-index:9999}.head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #334155;cursor:move}.dot{width:8px;height:8px;border-radius:50%;background:#34d399}.t{flex:1;font-size:12px;font-weight:600}.hbtn{border:1px solid #334155;background:transparent;color:#94a3b8;border-radius:6px;cursor:pointer;font-size:11px;padding:2px 6px}.hbtn:hover{color:#e2e8f0;border-color:#38bdf8}.row{display:flex;justify-content:space-between;padding:5px 12px;font-size:12px}.row .k{color:#94a3b8}.row .v{font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:#334155;margin:6px 0}.foot{padding:8px 12px;font-size:10px;color:#94a3b8;border-top:1px solid #334155}</style></head><body><div id="w"><div class="head" id="hd"><span class="dot" id="dot"></span><span class="t" id="title">Token 挂件</span><button class="hbtn" id="fold">—</button></div><div id="body"><div class="row"><span class="k">本次会话</span><span class="v" id="v_sess">—</span></div><div class="row"><span class="k">今日</span><span class="v" id="v_today">—</span></div><div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div><div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div><div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div><div class="sep"></div><div class="row"><span class="k">余额</span><span class="v" id="v_bal">—</span></div></div><div class="foot" id="st">—</div></div><script>const API="'+API+'";const $=s=>document.querySelector(s);const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ""+v;if(v<9950)return (v/1000).toFixed(1).replace(".0","")+"K";if(v<995000)return Math.round(v/1000)+"K";if(v<9950000)return (v/1e6).toFixed(1).replace(".0","")+"M";if(v<995000000)return Math.round(v/1e6)+"M";return Math.round(v/1e9)+"B"};async function rf(){try{const d=await fetch(API+"/stats",{cache:"no-store"}).then(r=>r.json());$("#dot").style.background=d.busy?"#60a5fa":"#34d399";$("#title").textContent="Token · "+(d.model||"—");$("#v_sess").textContent=fmt4(d.total);$("#v_today").textContent=fmt4((d.ranges||{}).today?d.ranges.today.v:0);$("#v_d7").textContent=fmt4((d.ranges||{}).d7?d.ranges.d7.v:0);const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return "—";return c.units.map(u=>u.unit?(u.amt+" "+u.unit):u.amt).join(" + ")};$("#v_cost").textContent=fc(co);$("#v_cost_total").textContent=fc(coT);const b=d.balance||{};$("#v_bal").textContent=b.current||"—";$("#st").textContent="会话 "+d.rounds+" 轮 · "+(d.src||"");}catch(e){$("#st").textContent="加载失败";}}rf();setInterval(rf,5000);let drag=false,sx=0,sy=0,ox=0,oy=0;const hd=$("#hd");hd.addEventListener("mousedown",e=>{if(e.target.id==="fold")return;drag=true;sx=e.clientX;sy=e.clientY;const r=$("#w").getBoundingClientRect();ox=r.left;oy=r.top;hd.style.cursor="grabbing"});document.addEventListener("mousemove",e=>{if(!drag)return;$("#w").style.left=Math.max(0,ox+e.clientX-sx)+"px";$("#w").style.top=Math.max(0,oy+e.clientY-sy)+"px"});document.addEventListener("mouseup",()=>{drag=false;hd.style.cursor="move"});$("#fold").onclick=()=>{const b=$("#body"),f=$("#fold");if(b.style.display==="none"){b.style.display="";f.textContent="—"}else{b.style.display="none";f.textContent="+"}};<\/script></body></html>';
+  const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden;background-size:cover;background-position:center;background-attachment:fixed}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.88);border:none;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.55);backdrop-filter:blur(10px);color:#e2e8f0;user-select:none;z-index:9999;overflow:hidden}#w.ball{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:move;background:rgba(15,23,42,.92);box-shadow:0 6px 20px rgba(0,0,0,.5)}#w.ball .head,#w.ball .body,#w.ball .foot{display:none}.ballv{display:none;font-size:14px;font-weight:700;font-variant-numeric:tabular-nums}#w.ball .ballv{display:block}.head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}.dot{width:8px;height:8px;border-radius:50%;background:#34d399;box-shadow:0 0 6px #34d399;flex:none}.t{flex:1;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hbtn{width:22px;height:22px;border:none;background:rgba(51,65,85,.4);color:#94a3b8;border-radius:6px;cursor:pointer;font-size:12px;line-height:1;flex:none}.hbtn:hover{color:#e2e8f0;background:#334155}.body{padding:10px 12px 12px}.row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:12px}.row .k{color:#94a3b8}.row .v{font-variant-numeric:tabular-nums;font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:rgba(51,65,85,.5);margin:6px 0}.foot{padding:8px 12px;border-top:1px solid rgba(51,65,85,.5);display:flex;gap:6px;align-items:center;justify-content:flex-end}.foot .st{font-size:10px;color:#94a3b8;margin-right:auto}.foot .go{border:1px solid #334155;background:#1e293b;color:#e2e8f0;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px}.foot .go:hover{border-color:#38bdf8}#skinBtn{position:fixed;right:10px;bottom:10px;width:26px;height:26px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:13px;z-index:9999;display:flex;align-items:center;justify-content:center}#skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}</style></head><body><button id="skinBtn" title="随机背景开关">👕</button><div id="w"><div class="head" id="hd"><span class="dot" id="dot"></span><span class="t" id="title">Token 挂件</span><button class="hbtn" id="fold" title="折叠">—</button></div><div class="body" id="body"><div class="row"><span class="k">本次会话</span><span class="v" id="v_sess">—</span></div><div class="row"><span class="k">今日</span><span class="v" id="v_today">—</span></div><div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div><div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div><div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div><div class="sep"></div><div class="row"><span class="k">余额</span><span class="v" id="v_bal">—</span></div></div><div class="foot"><span class="st" id="st">—</span><button class="go" id="go">打开看板</button></div><div class="ballv" id="ballv">0</div></div><script>const API="'+API+'";const $=s=>document.querySelector(s);const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ""+v;if(v<9950)return (v/1000).toFixed(1).replace(".0","")+"K";if(v<995000)return Math.round(v/1000)+"K";if(v<9950000)return (v/1e6).toFixed(1).replace(".0","")+"M";if(v<995000000)return Math.round(v/1e6)+"M";return Math.round(v/1e9)+"B"};let lastTotal=0;async function rf(){try{const d=await fetch(API+"/stats",{cache:"no-store"}).then(r=>r.json());$("#dot").style.background=d.busy?"#60a5fa":"#34d399";$("#title").textContent="Token · "+(d.model||"—");$("#v_sess").textContent=fmt4(d.total);lastTotal=d.total;$("#ballv").textContent=fmt4(d.total);$("#v_today").textContent=fmt4((d.ranges||{}).today?d.ranges.today.v:0);$("#v_d7").textContent=fmt4((d.ranges||{}).d7?d.ranges.d7.v:0);const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return "—";return c.units.map(u=>u.unit?(u.amt+" "+u.unit):u.amt).join(" + ")};$("#v_cost").textContent=fc(co);$("#v_cost_total").textContent=fc(coT);const b=d.balance||{};$("#v_bal").textContent=b.current||"—";$("#st").textContent="会话 "+d.rounds+" 轮 · "+(d.src||"");}catch(e){$("#st").textContent="加载失败";}}rf();setInterval(rf,5000);(function(){const BG_KEY="tsWidgetSkinBg";const bgOn=localStorage.getItem(BG_KEY)!=="0";const applyBg=on=>{if(on){const img=new Image();img.onload=()=>{document.body.style.backgroundImage="url('"+img.src+"')"};img.onerror=()=>{document.body.style.backgroundImage=""};img.src="https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t="+Date.now()}else{document.body.style.backgroundImage=""}};const syncIcon=on=>{$("#skinBtn").textContent=on?"👕":"🚫";$("#skinBtn").title=on?"随机背景：开（点击关闭）":"随机背景：关（点击开启）"};applyBg(bgOn);syncIcon(bgOn);$("#skinBtn").onclick=()=>{const now=localStorage.getItem(BG_KEY)!=="0";localStorage.setItem(BG_KEY,now?"0":"1");applyBg(!now);syncIcon(!now)}})();let drag=false,sx=0,sy=0,ox=0,oy=0;$("#w").addEventListener("mousedown",e=>{if(e.target.classList.contains("hbtn"))return;if(!$("#w").classList.contains("ball")&&!e.target.closest("#hd"))return;drag=true;sx=e.clientX;sy=e.clientY;const r=$("#w").getBoundingClientRect();ox=r.left;oy=r.top});document.addEventListener("mousemove",e=>{if(!drag)return;$("#w").style.left=Math.max(0,ox+e.clientX-sx)+"px";$("#w").style.top=Math.max(0,oy+e.clientY-sy)+"px"});document.addEventListener("mouseup",()=>{drag=false});$("#fold").onclick=()=>{const w=$("#w");if(w.classList.contains("ball")){w.classList.remove("ball");$("#fold").textContent="—"}else{w.classList.add("ball");$("#fold").textContent="+"}};$("#go").onclick=()=>{window.open("/page/plugin/KiraAI_token_stats_plugin/stats","_blank")};<\/script></body></html>';
   const url = URL.createObjectURL(new Blob([html], {type:'text/html'}));
-  const w = window.open(url, '_blank', 'width=340,height=320');
+  const w = window.open(url, '_blank', 'width=340,height=340');
   if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
   setTimeout(()=>URL.revokeObjectURL(url), 60000);
 };
