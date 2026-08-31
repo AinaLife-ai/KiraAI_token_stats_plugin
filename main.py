@@ -2511,12 +2511,12 @@ class TokenStatsPlugin(BasePlugin):
         try:
             if hasattr(self.ctx.adapter_mgr, 'get_adapters'):
                 for name, ada in self.ctx.adapter_mgr.get_adapters().items():
-                    if hasattr(ada, 'info') and ada.info.platform == "QQ":
+                    if hasattr(ada, 'info') and str(getattr(ada.info, 'platform', '')).lower() == "qq":
                         self._ada_obj = ada
                         return
             if hasattr(self.ctx.adapter_mgr, '_adapters'):
                 for name, ada in self.ctx.adapter_mgr._adapters.items():
-                    if hasattr(ada, 'info') and ada.info.platform == "QQ":
+                    if hasattr(ada, 'info') and str(getattr(ada.info, 'platform', '')).lower() == "qq":
                         self._ada_obj = ada
                         return
         except Exception:
@@ -2547,7 +2547,8 @@ class TokenStatsPlugin(BasePlugin):
                     res = await self._call_onebot("get_stranger_info", {"user_id": int(uid)})
                     if res and res.get("status") == "ok":
                         name = (res.get("data") or {}).get("nickname", "") or ""
-                    self._name_cache[("u", uid)] = (name, now)
+                    if name:
+                        self._name_cache[("u", uid)] = (name, now)
                 return f"{name}({uid})" if name else sid
             if ":gm:" in sid:
                 gid = sid.split(":gm:", 1)[1]
@@ -2560,7 +2561,8 @@ class TokenStatsPlugin(BasePlugin):
                     res = await self._call_onebot("get_group_info", {"group_id": int(gid)})
                     if res and res.get("status") == "ok":
                         name = (res.get("data") or {}).get("group_name", "") or ""
-                    self._name_cache[("g", gid)] = (name, now)
+                    if name:
+                        self._name_cache[("g", gid)] = (name, now)
                 return f"{name}({gid})" if name else sid
         except Exception:
             pass
@@ -2642,10 +2644,11 @@ class TokenStatsPlugin(BasePlugin):
                     bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
             return " + ".join(bits) if bits else None
 
+        names = await asyncio.gather(*(self._resolve_sid_name(x["sid"]) for x in arr[:50]))
         sess_out = []
-        for x in arr[:50]:
+        for x, name in zip(arr[:50], names):
             sess_out.append({
-                "sid": x["sid"], "name": await self._resolve_sid_name(x["sid"]),
+                "sid": x["sid"], "name": name,
                 "type": x["type"], "r": x["r"], "i": x["i"], "o": x["o"],
                 "c": x["c"], "v": x["v"], "cost": fmt_cost(x), "last_at": x["last_at"],
             })
@@ -2905,7 +2908,7 @@ class TokenStatsPlugin(BasePlugin):
 
     @register.api(method="POST", path="/balance-interval", auth=True)
     async def api_balance_interval(self, request: Request):
-        """保存余额轮询间隔（分钟，最小 1）"""
+        """保存余额轮询间隔（秒，最小 5）"""
         try:
             body = await request.json()
         except Exception:
