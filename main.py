@@ -105,6 +105,10 @@ TOOL_ERR_RE = re.compile(
     r"失败[：:，。]|失败$",
     re.IGNORECASE)
 
+# 本插件自身工具的正常输出前缀：摘要/聚合/明细文本里含"失败/出错"字样
+# （如"工具结果失败：N 次"、"最近出错：…"）但并非工具执行失败，排除自报避免统计污染
+_SELF_TOOL_RE = re.compile(r"^(?:【Token 用量统计】|【用量·|【最近轮次】)")
+
 # AI 回注文本硬上限（正常结果 1-2K 字符，防御性兜底防 Poke 回注撑爆上下文）
 AI_OUTPUT_LIMIT = 4000
 
@@ -916,6 +920,10 @@ class TokenStatsPlugin(BasePlugin):
             return
         text = (getattr(result, "text", "") or "") or ""
         if not text:
+            return
+        # 排除本插件自身工具的正常输出：摘要/聚合/明细文本里含"失败/出错"字样
+        # （如"工具结果失败：N 次"、"最近出错：…"）但并非工具执行失败，避免自报污染统计
+        if _SELF_TOOL_RE.match(text):
             return
         if not TOOL_ERR_RE.search(text):
             return
@@ -2532,6 +2540,52 @@ class TokenStatsPlugin(BasePlugin):
     async def api_pricing(self):
         return {"rules": self.rules}
 
+    @register.api(method="POST", path="/pricing-config", auth=True)
+    async def api_pricing_config(self, request: Request):
+        """保存价格规则（WebUI 可视化编辑器）：整体替换 rules 并热重载"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        new_rules = body.get("rules")
+        if not isinstance(new_rules, list):
+            return {"ok": False, "msg": "rules 必须是数组"}
+        # 清洗：只保留合法字段，剔除空项
+        cleaned = []
+        for r in new_rules:
+            if not isinstance(r, dict):
+                continue
+            name = str(r.get("name") or "").strip()
+            if not name:
+                continue
+            item = {"name": name, "peak_enabled": bool(r.get("peak_enabled", True))}
+            for k in ("url_match", "model_match", "channel_match", "currency"):
+                v = r.get(k)
+                if v not in (None, ""):
+                    item[k] = str(v).strip()
+            for k in ("hit_peak", "hit_off", "miss_peak", "miss_off", "out_peak", "out_off"):
+                v = r.get(k)
+                if v not in (None, ""):
+                    try:
+                        item[k] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+            cleaned.append(item)
+        try:
+            pm = self.ctx.plugin_mgr
+            if pm is None:
+                return {"ok": False, "msg": "plugin_mgr 不可用"}
+            cfg = pm.get_plugin_config("KiraAI_token_stats_plugin")
+            sec = dict(cfg.get("section_pricing") or {})
+            sec["rules"] = cleaned
+            cfg["section_pricing"] = sec
+            await pm.update_plugin_config("KiraAI_token_stats_plugin", cfg)
+            self.rules = cleaned if cleaned else DEFAULT_RULES
+            return {"ok": True, "count": len(cleaned)}
+        except Exception as e:
+            logger.warning(f"[token_stats] 保存价格规则失败: {e}")
+            return {"ok": False, "msg": f"保存失败: {e}"}
+
     # ── WebUI 侧边栏页面 ──
 
     @register.page("/stats", auth=True, menu=PageMenu(label={"zh": "Token 用量"}, icon="DataLine"))
@@ -2684,7 +2738,13 @@ tr.cur td{background:rgba(52,211,153,.07)}
 </div>
 
 <div class="panel" id="p-price">
-  <div class="box" id="priceBox"><h3>价格规则</h3><div id="priceBody"></div></div>
+  <div class="box">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn" id="priceAdd">＋ 添加规则</button>
+      <span style="color:var(--dim);font-size:12px" id="priceInfo"></span>
+    </div>
+    <div id="priceBody"></div>
+  </div>
 </div>
 
 <div class="panel" id="p-bal">
@@ -2706,6 +2766,16 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="balEditClose">✕</button>
     </div>
     <div id="balEditForm"></div>
+  </div>
+</div>
+
+<div id="priceEditor" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,.7);z-index:99;align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;width:640px;max-width:94vw;max-height:88vh;overflow:auto">
+    <div style="display:flex;align-items:center;margin-bottom:14px">
+      <h3 style="margin:0;flex:1" id="priceEditTitle">添加价格规则</h3>
+      <button class="btn" id="priceEditClose">✕</button>
+    </div>
+    <div id="priceEditForm"></div>
   </div>
 </div>
 
@@ -2921,15 +2991,83 @@ async function loadRec(){
     '<tr><td colspan="9" class="note">'+(recSlotFilter?'该时段暂无记录':'暂无记录')+'</td></tr>';
   recSlotFilter = null;
 }
+let priceRules = [];
+let priceEditIdx = -1;
 async function loadPrice(){
   const d = await jget('/pricing');
-  const rules = d.rules||[];
-  $('#priceBody').innerHTML = rules.length ? '<table><thead><tr><th>名称</th><th>币种</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th></tr></thead><tbody>'+
-    rules.map(r=>'<tr><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
-    '<td>'+(r.peak_enabled?'峰谷':'恒谷')+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td></tr>').join('')+'</tbody></table>'+
-    '<div class="note">编辑入口：插件管理 → 配置 → 「价格规则」。匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；峰=工作日 9:00-12:00、14:00-18:00。双币种分别累计，不与 ¥ 混算。</div>'
-    : '<div class="note">暂无价格规则，费用显示「—」</div>';
+  priceRules = d.rules||[];
+  $('#priceInfo').textContent = '共 ' + priceRules.length + ' 条规则';
+  $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>名称</th><th>币种</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
+    priceRules.map((r,i)=>'<tr><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
+    '<td>'+(r.peak_enabled?'峰谷':'恒谷')+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
+    '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+')">删除</button></td></tr>').join('')+'</tbody></table>'+
+    '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；峰=工作日 9:00-12:00、14:00-18:00。双币种分别累计，不与 ¥ 混算。改价后全历史费用即时重算。</div>'
+    : '<div class="note">暂无价格规则，费用显示「—」。点「＋ 添加规则」配置第一条。</div>';
 }
+const PRICE_FIELDS = [
+  ['name','规则名称','如 DeepSeek V4-Flash（官方价）'],
+  ['url_match','URL 匹配（可选）','api.deepseek.com'],
+  ['model_match','模型匹配（可选）','flash'],
+  ['channel_match','渠道匹配（可选）','deepseek'],
+  ['currency','币种','CNY（或填 积分）'],
+  ['hit_peak','缓存命中·峰时价','0.10'],
+  ['hit_off','缓存命中·谷时价','0.05'],
+  ['miss_peak','未命中·峰时价','3.0'],
+  ['miss_off','未命中·谷时价','1.5'],
+  ['out_peak','输出·峰时价','9.0'],
+  ['out_off','输出·谷时价','4.5']
+];
+function priceFieldHtml(f){
+  return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
+    '<input id="pf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
+}
+function priceEditOpen(i){
+  priceEditIdx = i;
+  const r = (i>=0 && priceRules[i]) ? priceRules[i] : {name:'',currency:'CNY',peak_enabled:true};
+  $('#priceEditTitle').textContent = i>=0 ? '编辑价格规则' : '添加价格规则';
+  let html = priceFieldHtml(['name','规则名称',r.name||'']);
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷价</label><select id="pf_peak_enabled" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+    '<option value="1"'+(r.peak_enabled?' selected':'')+'>启用（工作日 9-12 / 14-18 为峰，其余谷）</option>'+
+    '<option value="0"'+(r.peak_enabled?'':' selected')+'>不启用（全天按谷价）</option></select></div>';
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">';
+  PRICE_FIELDS.slice(1).forEach(f=>{ html += priceFieldHtml(f); });
+  html += '</div>';
+  html += '<div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn" id="pf_cancel">取消</button><button class="btn on" id="pf_save">保存</button></div>';
+  $('#priceEditForm').innerHTML = html;
+  $('#pf_name').value = r.name||'';
+  PRICE_FIELDS.slice(1).forEach(f=>{
+    const v = r[f[0]];
+    if(v!=null && v!=='') $('#pf_'+f[0]).value = v;
+  });
+  $('#pf_cancel').onclick = ()=>{ $('#priceEditor').style.display='none'; };
+  $('#pf_save').onclick = async ()=>{
+    const item = {name:$('#pf_name').value.trim(), peak_enabled:$('#pf_peak_enabled').value==='1'};
+    if(!item.name){ alert('请填写规则名称'); return; }
+    PRICE_FIELDS.slice(1).forEach(f=>{
+      const el = $('#pf_'+f[0]);
+      if(!el || el.value.trim()==='') return;
+      const v = el.value.trim();
+      if(f[0]==='currency') item.currency = v;
+      else if(f[0]==='url_match'||f[0]==='model_match'||f[0]==='channel_match') item[f[0]] = v;
+      else { const n = parseFloat(v); if(!isNaN(n)) item[f[0]] = n; }
+    });
+    if(priceEditIdx>=0 && priceRules[priceEditIdx]) priceRules[priceEditIdx] = item;
+    else priceRules.push(item);
+    const r2 = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
+    if(r2.ok){ $('#priceEditor').style.display='none'; loadPrice(); loadOv(); }
+    else alert('保存失败：'+(r2.msg||'未知错误'));
+  };
+  $('#priceEditor').style.display='flex';
+}
+async function priceDel(i){
+  if(!confirm('删除价格规则「'+(priceRules[i]?priceRules[i].name:'')+'」？')) return;
+  priceRules.splice(i,1);
+  const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
+  if(r.ok){ loadPrice(); loadOv(); }
+  else alert('删除失败：'+(r.msg||'未知错误'));
+}
+$('#priceAdd').onclick = ()=>priceEditOpen(-1);
+$('#priceEditClose').onclick = ()=>{ $('#priceEditor').style.display='none'; };
 let balSources = [];
 let balEditIdx = -1;
 async function loadBal(refresh){
