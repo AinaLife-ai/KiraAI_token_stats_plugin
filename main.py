@@ -2769,7 +2769,7 @@ class TokenStatsPlugin(BasePlugin):
             if not name:
                 continue
             item = {"name": name, "peak_enabled": bool(r.get("peak_enabled", True)),
-                    "enabled": r.get("enabled", True) is not False}
+                    "enabled": r.get("enabled", True) != False}
             for k in ("url_match", "model_match", "channel_match", "currency", "peak_profile"):
                 v = r.get(k)
                 if v not in (None, ""):
@@ -2842,9 +2842,14 @@ class TokenStatsPlugin(BasePlugin):
         if not isinstance(profiles, list) or not profiles:
             return {"ok": False, "msg": "profiles 必须是数组"}
         cleaned = []
+        seen_names = set()
         for p in profiles:
             if not isinstance(p, dict) or not str(p.get("name") or "").strip():
                 continue
+            name = str(p["name"]).strip()
+            if name in seen_names:
+                return {"ok": False, "msg": f"方案名重复：{name}"}
+            seen_names.add(name)
             w = p.get("windows")
             if not isinstance(w, list) or not w:
                 continue
@@ -2857,9 +2862,17 @@ class TokenStatsPlugin(BasePlugin):
                 if sh * 60 + sm < eh * 60 + em:
                     cleaned_w.append([f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"])
             if cleaned_w:
-                cleaned.append({"name": str(p["name"]).strip(), "windows": cleaned_w})
+                cleaned.append({"name": name, "windows": cleaned_w})
         if not cleaned:
             return {"ok": False, "msg": "方案格式错误：需为 [{'name':'方案名','windows':[['09:00','12:00'],...]}] 且结束晚于开始"}
+        # 删除引用校验：被计价规则引用的方案不允许删（裸调 API 也拦）
+        old_names = {p.get("name") for p in _PEAK_PROFILES}
+        new_names = {p["name"] for p in cleaned}
+        removed = old_names - new_names
+        if removed:
+            for r in self.rules or []:
+                if r.get("peak_profile") in removed:
+                    return {"ok": False, "msg": f"方案「{r.get('peak_profile')}」正被计价规则「{r.get('name')}」引用，无法删除"}
         try:
             pm = self.ctx.plugin_mgr
             if pm is None:
@@ -3582,6 +3595,7 @@ setInterval(loadOv, 1000);
     if(on){
       const img = new Image();
       img.onload = ()=>{ document.body.style.backgroundImage = "url('" + img.src + "')"; };
+      img.onerror = ()=>{ document.body.classList.remove('bg-on'); document.body.style.backgroundImage = ''; };
       img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
     } else {
       document.body.style.backgroundImage = '';
@@ -3694,6 +3708,7 @@ setInterval(refresh, 5000);
     if(on){
       const img = new Image();
       img.onload = ()=>{ document.body.style.backgroundImage = "url('" + img.src + "')"; };
+      img.onerror = ()=>{ document.body.style.backgroundImage = ''; };
       img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
     } else {
       document.body.style.backgroundImage = '';
