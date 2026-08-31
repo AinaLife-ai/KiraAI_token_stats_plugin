@@ -112,12 +112,13 @@ _SELF_TOOL_RE = re.compile(r"^(?:【Token 用量统计】|【用量·|【最近�
 # LLM 响应内自报片段剥离：bot 转述本插件统计结果时带「出错：」字样
 # （如"最近出错：Merge facts error"、"出错标记合计：3"、"工具结果失败：2 次"、
 # "后台日志错误：…"），并非真实错误，扫描前剥离避免自增；
-# 非贪婪+标点边界：只吃到句号/换行即停，避免吞掉后面的真实错误
+# 非贪婪+标点边界：只吃到句号/感叹号/问号/换行/下一个「出错」标记即停，
+# 避免吞掉后面的真实错误；出错标记合计/工具结果失败是固定数字格式，精确匹配不吞内容
 _SELF_REPORT_RE = re.compile(
-    r"最近出错：[^\n]*?(?=[。\n]|$)"
-    r"|出错标记合计：[^\n]*?(?=[。\n]|$)"
-    r"|工具结果失败：[^\n]*?(?=[。\n]|$)"
-    r"|后台日志错误：[^\n]*?(?=[。\n]|$)"
+    r"最近出错：[^\n]*?(?=[。！？\n]|出错[：:]|$)"
+    r"|出错标记合计：\d+"
+    r"|工具结果失败：\d+\s*次"
+    r"|后台日志错误：[^\n]*?(?=[。！？\n]|出错[：:]|$)"
 )
 
 # AI 回注文本硬上限（正常结果 1-2K 字符，防御性兜底防 Poke 回注撑爆上下文）
@@ -409,7 +410,8 @@ class TokenStatsPlugin(BasePlugin):
         # ── 价格规则 ──
         pr = cfg.get("section_pricing", {})
         rules = pr.get("rules", None)
-        self.rules = rules if isinstance(rules, list) and rules else DEFAULT_RULES
+        # 空数组也保留（用户删光规则 → 费用显示「—」），仅 None/非 list 回退默认
+        self.rules = rules if isinstance(rules, list) else DEFAULT_RULES
 
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
@@ -2598,7 +2600,7 @@ class TokenStatsPlugin(BasePlugin):
             sec["rules"] = cleaned
             cfg["section_pricing"] = sec
             await pm.update_plugin_config("KiraAI_token_stats_plugin", cfg)
-            self.rules = cleaned if cleaned else DEFAULT_RULES
+            # 注意：update_plugin_config 触发热重载，旧实例已被替换，无需（也不能）改 self.rules
             return {"ok": True, "count": len(cleaned)}
         except Exception as e:
             logger.warning(f"[token_stats] 保存价格规则失败: {e}")
@@ -3017,7 +3019,7 @@ async function loadPrice(){
   $('#priceInfo').textContent = '共 ' + priceRules.length + ' 条规则';
   $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>名称</th><th>币种</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
     priceRules.map((r,i)=>'<tr><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
-    '<td>'+(r.peak_enabled?'峰谷':'恒谷')+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
+    '<td>'+(r.peak_enabled!==false?'峰谷':'恒谷')+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
     '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+')">删除</button></td></tr>').join('')+'</tbody></table>'+
     '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；峰=工作日 9:00-12:00、14:00-18:00。双币种分别累计，不与 ¥ 混算。改价后全历史费用即时重算。</div>'
     : '<div class="note">暂无价格规则，费用显示「—」。点「＋ 添加规则」配置第一条。</div>';
@@ -3042,11 +3044,12 @@ function priceFieldHtml(f){
 function priceEditOpen(i){
   priceEditIdx = i;
   const r = (i>=0 && priceRules[i]) ? priceRules[i] : {name:'',currency:'CNY',peak_enabled:true};
+  const pe = r.peak_enabled !== undefined ? r.peak_enabled : true; // 旧规则无该字段按启用处理
   $('#priceEditTitle').textContent = i>=0 ? '编辑价格规则' : '添加价格规则';
   let html = priceFieldHtml(['name','规则名称',r.name||'']);
   html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷价</label><select id="pf_peak_enabled" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
-    '<option value="1"'+(r.peak_enabled?' selected':'')+'>启用（工作日 9-12 / 14-18 为峰，其余谷）</option>'+
-    '<option value="0"'+(r.peak_enabled?'':' selected')+'>不启用（全天按谷价）</option></select></div>';
+    '<option value="1"'+(pe?' selected':'')+'>启用（工作日 9-12 / 14-18 为峰，其余谷）</option>'+
+    '<option value="0"'+(pe?'':' selected')+'>不启用（全天按谷价）</option></select></div>';
   html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">';
   PRICE_FIELDS.slice(1).forEach(f=>{ html += priceFieldHtml(f); });
   html += '</div>';
