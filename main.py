@@ -3255,6 +3255,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   t.classList.add('on'); $('#p-'+t.dataset.p).classList.add('on');
   if(t.dataset.p==='trend') loadTrend(curTr);
   if(t.dataset.p==='dim') loadDim(curDim);
+  if(t.dataset.p==='sess') loadSess(curSessRange);
   if(t.dataset.p==='rec') loadRec();
   if(t.dataset.p==='price') loadPrice();
   if(t.dataset.p==='bal') loadBal(false);
@@ -3947,8 +3948,14 @@ $('#fold').onclick=()=>{
   if(b.style.display==='none'){ b.style.display=''; f.textContent='—'; }
   else { b.style.display='none'; f.textContent='+'; }
 };
-// 独立小窗：直接打开看板页（新标签页），避免 window.open 空窗被拦截
-$('#pop').onclick=()=>{ window.open('/page/plugin/KiraAI_token_stats_plugin/stats','_blank'); };
+// 独立小窗：blob URL 打开可拖动迷你面板（绕过 window.open 空窗拦截）
+$('#pop').onclick=()=>{
+  const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.95);border:1px solid #334155;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#e2e8f0;user-select:none;z-index:9999}.head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #334155;cursor:move}.dot{width:8px;height:8px;border-radius:50%;background:#34d399}.t{flex:1;font-size:12px;font-weight:600}.hbtn{border:1px solid #334155;background:transparent;color:#94a3b8;border-radius:6px;cursor:pointer;font-size:11px;padding:2px 6px}.hbtn:hover{color:#e2e8f0;border-color:#38bdf8}.row{display:flex;justify-content:space-between;padding:5px 12px;font-size:12px}.row .k{color:#94a3b8}.row .v{font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:#334155;margin:6px 0}.foot{padding:8px 12px;font-size:10px;color:#94a3b8;border-top:1px solid #334155}</style></head><body><div id="w"><div class="head" id="hd"><span class="dot" id="dot"></span><span class="t" id="title">Token 挂件</span><button class="hbtn" id="fold">—</button></div><div id="body"><div class="row"><span class="k">本次会话</span><span class="v" id="v_sess">—</span></div><div class="row"><span class="k">今日</span><span class="v" id="v_today">—</span></div><div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div><div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div><div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div><div class="sep"></div><div class="row"><span class="k">余额</span><span class="v" id="v_bal">—</span></div></div><div class="foot" id="st">—</div></div><script>const API="'+API+'";const $=s=>document.querySelector(s);const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ""+v;if(v<9950)return (v/1000).toFixed(1).replace(".0","")+"K";if(v<995000)return Math.round(v/1000)+"K";if(v<9950000)return (v/1e6).toFixed(1).replace(".0","")+"M";if(v<995000000)return Math.round(v/1e6)+"M";return Math.round(v/1e9)+"B"};async function rf(){try{const d=await fetch(API+"/stats",{cache:"no-store"}).then(r=>r.json());$("#dot").style.background=d.busy?"#60a5fa":"#34d399";$("#title").textContent="Token · "+(d.model||"—");$("#v_sess").textContent=fmt4(d.total);$("#v_today").textContent=fmt4((d.ranges||{}).today?d.ranges.today.v:0);$("#v_d7").textContent=fmt4((d.ranges||{}).d7?d.ranges.d7.v:0);const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return "—";return c.units.map(u=>u.unit?(u.amt+" "+u.unit):u.amt).join(" + ")};$("#v_cost").textContent=fc(co);$("#v_cost_total").textContent=fc(coT);const b=d.balance||{};$("#v_bal").textContent=b.current||"—";$("#st").textContent="会话 "+d.rounds+" 轮 · "+(d.src||"");}catch(e){$("#st").textContent="加载失败";}}rf();setInterval(rf,5000);let drag=false,sx=0,sy=0,ox=0,oy=0;const hd=$("#hd");hd.addEventListener("mousedown",e=>{drag=true;sx=e.clientX;sy=e.clientY;const r=$("#w").getBoundingClientRect();ox=r.left;oy=r.top;hd.style.cursor="grabbing"});document.addEventListener("mousemove",e=>{if(!drag)return;$("#w").style.left=Math.max(0,ox+e.clientX-sx)+"px";$("#w").style.top=Math.max(0,oy+e.clientY-sy)+"px"});document.addEventListener("mouseup",()=>{drag=false;hd.style.cursor="move"});$("#fold").onclick=()=>{const b=$("#body"),f=$("#fold");if(b.style.display==="none"){b.style.display="";f.textContent="—"}else{b.style.display="none";f.textContent="+"}};<\/script></body></html>';
+  const url = URL.createObjectURL(new Blob([html], {type:'text/html'}));
+  const w = window.open(url, '_blank', 'width=340,height=320');
+  if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
+  setTimeout(()=>URL.revokeObjectURL(url), 60000);
+};
 $('#go').onclick=()=>{ window.open('/page/plugin/KiraAI_token_stats_plugin/stats','_blank'); };
 </script>
 </body>
