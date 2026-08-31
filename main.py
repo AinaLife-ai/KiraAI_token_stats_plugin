@@ -3324,8 +3324,13 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 .card.errbox{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),var(--card)}
 body{background:var(--bg);color:var(--fg);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;padding:20px;font-size:14px;background-size:cover;background-position:center;background-attachment:fixed}
 body.bg-on #app{background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-radius:16px;padding:20px;border:1px solid rgba(51,65,85,.5);box-shadow:0 8px 32px rgba(0,0,0,.35)}
-#skinBtn{position:fixed;right:14px;bottom:14px;width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:rgba(30,41,59,.7);color:var(--dim);cursor:pointer;font-size:16px;z-index:999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
-#skinBtn:hover{color:var(--fg);border-color:var(--acc)}
+body::before{content:'';position:fixed;inset:0;background-image:var(--userbg,none);background-size:cover;background-position:center;opacity:0;transition:opacity .4s ease;pointer-events:none;z-index:0}
+body.hasbg::before{opacity:1;box-shadow:inset 0 0 0 9999px rgba(11,18,32,.45)}
+#app{position:relative;z-index:1}
+@media (prefers-reduced-motion: reduce){body::before{transition:none!important}}
+#skinBtn,#bgBtn{position:fixed;right:14px;bottom:14px;width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:rgba(30,41,59,.7);color:var(--dim);cursor:pointer;font-size:16px;z-index:999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+#bgBtn{right:56px}
+#skinBtn:hover,#bgBtn:hover{color:var(--fg);border-color:var(--acc)}
 .sw{position:relative;display:inline-block;width:34px;height:18px;vertical-align:middle;cursor:pointer}
 .sw input{opacity:0;width:0;height:0}
 .sw i{position:absolute;inset:0;background:#334155;border-radius:999px;transition:.2s}
@@ -3399,6 +3404,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
 </head>
 <body>
 <button id="skinBtn" title="随机背景开关">👕</button>
+<button id="bgBtn" title="自定义背景：单击选择图片（1-10 张），双击清除">🖼</button>
 <div id="app">
 <h1><span class="dot" id="dot"></span>Token 用量统计</h1>
 <div class="sub" id="sub">加载中…</div>
@@ -4161,19 +4167,34 @@ document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadOv(
 
 loadOv();
 setInterval(loadOv, 4000);
-// 随机背景（默认开，右下角 👕 点击关闭，localStorage 记忆）
+// 随机背景（默认开，右下角 👕 点击关闭）+ 自定义背景池（🖼 单击选图、双击清除；与挂件共享 localStorage）
 (function(){
-  const BG_KEY = 'tsSkinBg';
-  const bgOn = localStorage.getItem(BG_KEY) !== '0';
+  const BG_KEY = 'tsWidgetSkinBg', CBG_KEY = 'tsWidgetCustomBg';
+  let bgTimer = null;
+  const customPool = ()=>{ try{ return JSON.parse(localStorage.getItem(CBG_KEY)||'[]'); }catch(e){ return []; } };
+  // 经 body::before 叠层绘制（400ms 淡入过渡）
+  const paintBg = url => {
+    document.body.style.setProperty('--userbg', url ? 'url("'+url+'")' : 'none');
+    document.body.classList.toggle('hasbg', !!url);
+  };
   const applyBg = on => {
+    clearInterval(bgTimer); bgTimer = null;
     document.body.classList.toggle('bg-on', on);
-    if(on){
-      const img = new Image();
-      img.onload = ()=>{ document.body.style.backgroundImage = "url('" + img.src + "')"; };
-      img.onerror = ()=>{ document.body.classList.remove('bg-on'); document.body.style.backgroundImage = ''; };
-      img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
+    if(!on){ paintBg(''); return; }
+    const pool = customPool();
+    if(pool.length){
+      // 自定义池：加载随机选一张 + 每 60s 随机轮换
+      paintBg(pool[Math.floor(Math.random()*pool.length)]);
+      bgTimer = setInterval(()=>{
+        const p = customPool();
+        if(p.length) paintBg(p[Math.floor(Math.random()*p.length)]);
+      }, 60000);
     } else {
-      document.body.style.backgroundImage = '';
+      // 线上随机图；加载失败静默回退
+      const img = new Image();
+      img.onload = ()=>paintBg(img.src);
+      img.onerror = ()=>{ paintBg(''); document.body.classList.remove('bg-on'); };
+      img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
     }
   };
   const toast = msg => {
@@ -4190,10 +4211,66 @@ setInterval(loadOv, 4000);
     t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 1600);
   };
   const syncIcon = on => { $('#skinBtn').textContent = on ? '👕' : '🚫'; $('#skinBtn').title = on ? '随机背景：开（点击关闭）' : '随机背景：关（点击开启）'; };
-  applyBg(bgOn);
-  syncIcon(bgOn);
+  // 自定义背景：选 1-10 张图，canvas 压缩（长边≤1280 JPEG q0.8，超限降档 960/q0.7 再逐张减少）存 localStorage
+  const compressImg = (file, maxSide, q) => new Promise((res, rej)=>{
+    const r = new FileReader();
+    r.onerror = rej;
+    r.onload = ()=>{
+      const img = new Image();
+      img.onerror = rej;
+      img.onload = ()=>{
+        let w = img.naturalWidth, h = img.naturalHeight;
+        const sc = Math.min(1, maxSide/Math.max(w,h));
+        w = Math.max(1, Math.round(w*sc)); h = Math.max(1, Math.round(h*sc));
+        const cv = document.createElement('canvas');
+        cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        res(cv.toDataURL('image/jpeg', q));
+      };
+      img.src = r.result;
+    };
+    r.readAsDataURL(file);
+  });
+  const fileIn = document.createElement('input');
+  fileIn.type = 'file'; fileIn.accept = 'image/*'; fileIn.multiple = true; fileIn.style.display = 'none';
+  document.body.appendChild(fileIn);
+  const bgOn = ()=>localStorage.getItem(BG_KEY) !== '0';
+  const trySave = arr => { try{ localStorage.setItem(CBG_KEY, JSON.stringify(arr)); return true; }catch(e){ return false; } };
+  fileIn.onchange = async ()=>{
+    const files = Array.from(fileIn.files||[]);
+    fileIn.value = '';
+    if(!files.length) return;
+    if(files.length > 10) toast('最多 10 张，仅取前 10 张');
+    const list = files.slice(0, 10);
+    let saved = 0;
+    outer:
+    for(const [ms, q] of [[1280, 0.8], [960, 0.7]]){
+      const urls = [];
+      for(const f of list){ try{ urls.push(await compressImg(f, ms, q)); }catch(e){} }
+      while(urls.length){
+        if(trySave(urls)){ saved = urls.length; break outer; }
+        urls.pop();
+      }
+    }
+    if(saved){
+      applyBg(bgOn());
+      toast('自定义背景已保存（'+saved+' 张）' + (saved < list.length ? '，图片过大仅保存前 '+saved+' 张' : ''));
+    }else{
+      toast('图片过大，无法保存自定义背景');
+    }
+  };
+  let clickTm = null;
+  $('#bgBtn').onclick = ()=>{ clearTimeout(clickTm); clickTm = setTimeout(()=>fileIn.click(), 260); };
+  $('#bgBtn').ondblclick = ()=>{
+    clearTimeout(clickTm);
+    localStorage.removeItem(CBG_KEY);
+    applyBg(bgOn());
+    toast('已清除自定义背景，恢复线上随机图');
+  };
+  applyBg(bgOn());
+  syncIcon(bgOn());
   $('#skinBtn').onclick = ()=>{
-    const now = localStorage.getItem(BG_KEY) !== '0';
+    const now = bgOn();
     localStorage.setItem(BG_KEY, now ? '0' : '1');
     applyBg(!now);
     syncIcon(!now);
@@ -4216,9 +4293,12 @@ _WIDGET_HTML = r"""<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
 body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden;background-size:cover;background-position:center;background-attachment:fixed}
-@media (prefers-reduced-motion: reduce){ #w,#w.ball,#skinBtn{backdrop-filter:none!important;-webkit-backdrop-filter:none!important} *{transition:none!important;animation:none!important} }
-#skinBtn{position:fixed;right:10px;bottom:10px;width:28px;height:28px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:14px;z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
-#skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}
+body::before{content:'';position:fixed;inset:0;background-image:var(--userbg,none);background-size:cover;background-position:center;opacity:0;transition:opacity .4s ease;pointer-events:none;z-index:0}
+body.hasbg::before{opacity:1}
+@media (prefers-reduced-motion: reduce){ #w,#w.ball,#skinBtn{backdrop-filter:none!important;-webkit-backdrop-filter:none!important} *{transition:none!important;animation:none!important} body::before{transition:none!important} }
+#skinBtn,#bgBtn{position:fixed;right:10px;bottom:10px;width:28px;height:28px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:14px;z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+#bgBtn{right:46px}
+#skinBtn:hover,#bgBtn:hover{color:#e2e8f0;border-color:#38bdf8}
 #w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
 #w.ball{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:move;background:var(--bg);box-shadow:0 6px 20px rgba(0,0,0,.45);border:1px solid var(--line)}
 #w.ball .head,#w.ball .body,#w.ball .foot{display:none}
