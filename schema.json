@@ -151,7 +151,7 @@
             "out_off": 13.5
           }
         ],
-        "hint": "推荐在 WebUI 侧边栏「Token 用量 → 价格规则」页可视化编辑（添加/编辑/删除），无需手写 JSON。字段说明：每条规则 = {name, url_match(可选), channel_match(可选), model_match(可选), currency(可选：CNY=元/百万tokens 默认，积分=积分/百万tokens 如京东积分制渠道), peak_enabled, peak_profile(可选：峰谷方案名，默认「默认工作日」), enabled(可选：false=禁用该规则), hit_peak, hit_off, miss_peak, miss_off, out_peak, out_off}。匹配加权：URL命中=4分，模型=2分，渠道名=1分，取最高分规则（禁用规则不参与匹配）。峰谷方案库在 WebUI 价格规则页管理（peak_profiles 字段，格式 [{\"name\":\"方案名\",\"windows\":[[\"09:00\",\"12:00\"],...]}]，每条规则可选自己的方案）。双币种费用分桶累计，永不混算。建议按 URL（endpoint 域名）配置"
+        "hint": "推荐在 WebUI 侧边栏「Token 用量 → 价格规则」页可视化编辑（添加/编辑/删除），无需手写 JSON。字段说明：每条规则 = {name, url_match(可选), channel_match(可选), model_match(可选), currency(可选：CNY=元/百万tokens 默认，积分=积分/百万tokens 如京东积分制渠道), unit(可选：显示单位，留空=只显示数字，默认 CNY→¥、积分→积分), peak_enabled, peak_profile(可选：峰谷方案名，默认「默认工作日」), enabled(可选：false=禁用该规则), hit_peak, hit_off, miss_peak, miss_off, out_peak, out_off}。匹配加权：URL命中=4分，模型=2分，渠道名=1分，取最高分规则（禁用规则不参与匹配）。峰谷方案库在 WebUI 价格规则页管理（peak_profiles 字段，格式 [{\"name\":\"方案名\",\"windows\":[[\"09:00\",\"12:00\"],...]}]，每条规则可选自己的方案）。双币种费用分桶累计，永不混算。建议按 URL（endpoint 域名）配置"
       }
     }
   },
@@ -189,7 +189,7 @@
         "type": "json",
         "name": "余额监测源（高级/自定义）",
         "default": [],
-        "hint": "推荐在 WebUI 侧边栏「Token 用量 → 余额监测」页可视化编辑（添加/编辑/删除），无需手写 JSON。类型怎么选：auto=自动探测（填官方或中转站地址+Key 即可，最省事）；custom=自定义接口（填接口地址，可选 json_path 指定余额字段）；newapi=New-API 站点（填地址+系统令牌+纯数字用户ID）；preset=固定钱包型（额度用一点少一点、不会自动恢复，填「当前余额(对表)」= 现在后台看到的真实余额，之后每次调用按价格规则自动扣减）；daily=每日重置积分（每天固定发 N 积分，当天用完第二天重置，填「每日额度」+「刷新时刻 HH:mm」）；rolling=每日累计滚存积分（每天发 N 积分，用不完的累积到下一天，填「每日额度」+「刷新时刻」+「当前余额(对表)」= 现在后台看到的真实余额作为基准）。估算型（preset/daily/rolling）可填「关联模型 model_ref」（格式 provider:model，如 deepseek:deepseek-chat）只统计该模型的用量来估算消耗，留空则按渠道/URL 匹配全算。注意：api_key 为明文存储。常用官方平台（DeepSeek/Kimi/硅基/智谱）无需在此配置，直接填下方对应分区的 API Key 即可；New-API 中转站也可用下方「简易文本格式」每行 名称;地址;令牌;用户ID;换算比例 快速添加"
+        "hint": "推荐在 WebUI 侧边栏「Token 用量 → 余额监测」页可视化编辑（添加/编辑/删除），无需手写 JSON。类型怎么选：auto=自动探测（填官方或中转站地址+Key 即可，最省事）；custom=自定义接口（填接口地址，可选 json_path 指定余额字段）；newapi=New-API 站点（填地址+系统令牌+纯数字用户ID）；preset=固定钱包型（额度用一点少一点、不会自动恢复，填「当前余额(对表)」= 现在后台看到的真实余额，之后每次调用按价格规则自动扣减）；daily=每日重置积分（每天固定发 N 积分，当天用完第二天重置，填「每日额度」+「刷新时刻 HH:mm」）；rolling=每日累计滚存积分（每天发 N 积分，用不完的累积到下一天，填「每日额度」+「刷新时刻」+「当前余额(对表)」= 现在后台看到的真实余额作为基准）。估算型（preset/daily/rolling）可填「关联模型 model_ref」（格式 provider:model，如 deepseek:deepseek-chat）只统计该模型的用量来估算消耗，留空则按渠道/URL 匹配全算。每个源可自定义「显示单位 unit」（如 元/美元/美刀/额度，留空=只显示数字），默认积分制源显示「积分」、其余用全局余额单位。注意：api_key 为明文存储。常用官方平台（DeepSeek/Kimi/硅基/智谱）无需在此配置，直接填下方对应分区的 API Key 即可；New-API 中转站也可用下方「简易文本格式」每行 名称;地址;令牌;用户ID;换算比例 快速添加"
       }
     }
   },
