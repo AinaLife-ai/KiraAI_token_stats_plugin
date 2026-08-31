@@ -97,7 +97,7 @@ LOG_ERR_LABELS = {"xml": "XML解析", "model": "模型调用", "tool": "工具�
 # 注意：error 字段值须为非零数字（含负数/小数）/非空字符串/true 才算失败
 # （{"error": 0} 是很多 API 的成功约定）；不匹配裸 403（"第403条"会误报）
 TOOL_ERR_RE = re.compile(
-    r"\{['\"]?error['\"]?\s*:\s*(?:-?(?:[1-9]\d*(?:\.\d+)?|0\.\d*[1-9]\d*)|['\"][^'\"]+['\"]|true|True)\s*[,}]|"
+    r"\{['\"]?error['\"]?\s*:\s*(?:-?(?:[1-9]\d*(?:\.\d+)?|0\.\d*[1-9]\d*)|['\"](?![+-]?0+(?:\.0+)?['\"])[^'\"]+['\"]|true|True)\s*[,}]|"
     r"Error\s*:|Permission denied|Access denied|权限不足|无权限|拒绝访问|"
     r"Forbidden|HTTP\s*403|status\s*[=:]\s*403|not allowed|timed out|超时|"
     r"Failed to call tool|not implemented|"
@@ -825,7 +825,7 @@ class TokenStatsPlugin(BasePlugin):
         text = "".join(e.text for e in event.message.chain if isinstance(e, Text))
         if text:
             self._sweep_stale_sessions()
-            self._pending[sid] = {"text": text, "source": None, "steps": 0, "at": time.time()}
+            self._pending[sid] = {"text": text, "source": None, "steps": 0, "at": time.time(), "new_msg": True}
 
         if not self.enable_command:
             return
@@ -898,6 +898,11 @@ class TokenStatsPlugin(BasePlugin):
             self._last_err_at = datetime.now()
 
         # 来源：第一轮（新用户消息）自动判定，工具续轮继承
+        # 新用户消息到达（on_im_message 置位）：重置步数重新判定——
+        # 关键词规则按「消息包含关键词」逐条生效，而非会话首条消息锁定
+        if pending.get("new_msg"):
+            pending["steps"] = 0
+            pending["new_msg"] = False
         pending["steps"] += 1
         if pending["steps"] <= 1 or pending.get("source") is None:
             src = self._classify_source(sid, event)
@@ -1857,8 +1862,8 @@ class TokenStatsPlugin(BasePlugin):
 
     async def _build_query_reply(self, arg: str) -> str:
         arg = arg.strip().lower()
-        aliases = {"本次": "session", "今天": "today", "7天": "d7", "30天": "d30", "累计": "total",
-                   "余额": "balance"}
+        aliases = {"本次": "session", "今天": "today", "7天": "d7", "近7天": "d7",
+                   "30天": "d30", "近30天": "d30", "累计": "total", "余额": "balance"}
         key = aliases.get(arg, arg)
         if key in RANGES:
             text = self._build_summary_text(key)
@@ -2541,6 +2546,9 @@ class TokenStatsPlugin(BasePlugin):
                 item["refresh_time"] = str(s["refresh_time"]).strip()
             if s.get("anchor_at"):
                 item["anchor_at"] = str(s["anchor_at"]).strip()
+            elif s.get("anchor_balance") not in (None, ""):
+                # WebUI 表单无 anchor_at 输入：填了「当前余额(对表)」但没给时间时，锚定时间取当前
+                item["anchor_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             cleaned.append(item)
         try:
             pm = self.ctx.plugin_mgr
