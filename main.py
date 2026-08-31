@@ -281,6 +281,16 @@ def _rule_currency(r: dict) -> str:
     return "积分" if str(cur).strip() == "积分" else "CNY"
 
 
+def _rule_unit(r: dict) -> str:
+    """规则显示单位：显式 unit 优先（含空串=无单位只显示数字）；
+    默认 CNY→¥、积分→积分"""
+    if r is None:
+        return ""
+    if "unit" in r:
+        return str(r.get("unit") or "").strip()
+    return "¥" if _rule_currency(r) != "积分" else "积分"
+
+
 def _rule_cost_ex(r: dict, input_t: int, output_t: int, cached_t: int, t: datetime):
     """按规则算费用 → (金额, 币种)；无规则/未匹配返回 (None, 'CNY')"""
     if r is None:
@@ -1051,9 +1061,10 @@ class TokenStatsPlugin(BasePlugin):
                 r += ds["r"]; e += ds["e"]
         return {"v": v, "i": i, "o": o, "c": c, "r": r, "e": e}
 
-    def _aggs_cost_ex(self, aggs: dict):
-        """聚合桶 → (cny_total, pts_total, matched)。双币种分桶累计，永不混算"""
-        cny, pts, matched = 0.0, 0.0, False
+    def _aggs_cost_units(self, aggs: dict):
+        """聚合桶 → ({f"{cur}|{unit}": amt}, matched)。按 (币种, 显示单位) 分桶，永不混算"""
+        units = {}
+        matched = False
         for mkey, slots in aggs.items():
             parts = mkey.split("\u001F")
             model = parts[0] if len(parts) > 0 else ""
@@ -1063,6 +1074,8 @@ class TokenStatsPlugin(BasePlugin):
             if rule is None:
                 continue
             cur = _rule_currency(rule)
+            unit = _rule_unit(rule)
+            key = f"{cur}|{unit}"
             for is_peak, agg in ((False, slots[0]), (True, slots[1])):
                 if agg is None:
                     continue
@@ -1071,16 +1084,24 @@ class TokenStatsPlugin(BasePlugin):
                 miss = rule.get("miss_peak" if pk else "miss_off", 0) or 0
                 out = rule.get("out_peak" if pk else "out_off", 0) or 0
                 amt = (agg["c"] * hit + max(0, agg["i"] - agg["c"]) * miss + agg["o"] * out) / 1_000_000
-                if cur == "积分":
-                    pts += amt
-                else:
-                    cny += amt
+                units[key] = units.get(key, 0.0) + amt
                 matched = True
+        return units, matched
+
+    def _aggs_cost_ex(self, aggs: dict):
+        """聚合桶 → (cny_total, pts_total, matched)。双币种分桶累计，永不混算（旧接口兼容）"""
+        units, matched = self._aggs_cost_units(aggs)
+        cny = sum(v for k, v in units.items() if k.startswith("CNY|"))
+        pts = sum(v for k, v in units.items() if k.startswith("积分|"))
         return cny, pts, matched
 
     def _range_cost_ex(self, from_date: str, to_date: str):
         return self._aggs_cost_ex({k: v["aggs"] for k, v in self._days.items()
                                    if from_date <= k <= to_date})
+
+    def _range_cost_units(self, from_date: str, to_date: str):
+        return self._aggs_cost_units({k: v["aggs"] for k, v in self._days.items()
+                                      if from_date <= k <= to_date})
 
     def _range_cost(self, from_date: str, to_date: str):
         """旧接口兼容：仅 CNY"""
@@ -1089,6 +1110,9 @@ class TokenStatsPlugin(BasePlugin):
 
     def _session_cost_ex(self):
         return self._aggs_cost_ex(self._sess["aggs"])
+
+    def _session_cost_units(self):
+        return self._aggs_cost_units(self._sess["aggs"])
 
     def _session_cost(self):
         cny, _, matched = self._session_cost_ex()
@@ -1186,6 +1210,13 @@ class TokenStatsPlugin(BasePlugin):
         if (src.get("type") or "").strip().lower() in POINT_TYPES:
             return "积分"
         return fallback
+
+    def _src_unit(self, src: dict) -> str:
+        """余额源显示单位：显式 unit 优先（含空串=无单位只显示数字）；
+        默认积分→积分、其余→全局 balance_unit"""
+        if "unit" in src:
+            return str(src.get("unit") or "").strip()
+        return "积分" if self._src_currency(src) == "积分" else self.balance_unit
 
     def _resolve_balance_state(self, src: dict) -> dict:
         """当前额度：估算型（preset/daily/rolling）按公式本地推算；
@@ -1877,13 +1908,23 @@ class TokenStatsPlugin(BasePlugin):
     # ── 查询回复构建（命令 / 工具共用）──
 
     def _fmt_cost_part(self, cny, pts, matched):
-        """双币种费用文本：分别展示，永不混算"""
+        """双币种费用文本：分别展示，永不混算（旧接口兼容）"""
         parts = []
         if matched:
             if cny:
                 parts.append(f"费用 ¥{cny:.4f}")
             if pts:
                 parts.append(f"积分 {pts:,.4f}")
+        return " · ".join(parts)
+
+    def _fmt_cost_units(self, units: dict) -> str:
+        """按 (币种, 显示单位) 分桶的费用文本：单位留空=只显示数字"""
+        parts = []
+        for key, amt in units.items():
+            if not amt:
+                continue
+            _, _, unit = key.partition("|")
+            parts.append(f"{unit} {amt:,.4f}" if unit else f"{amt:,.4f}")
         return " · ".join(parts)
 
     def _build_summary_text(self, range_key: str = "") -> str:
@@ -1897,9 +1938,9 @@ class TokenStatsPlugin(BasePlugin):
 
         if want("session"):
             s = self._sess
-            cny, pts, matched = self._session_cost_ex()
+            units, matched = self._session_cost_units()
             line = f"本次会话：{_fmt_num(s['v'])} tokens · 输入 {_fmt_num(s['i'])} · 输出 {_fmt_num(s['o'])} · 缓存 {_fmt_num(s['c'])} · {s['r']} 轮"
-            cp = self._fmt_cost_part(cny, pts, matched)
+            cp = self._fmt_cost_units(units)
             if cp:
                 line += " · " + cp
             if s["e"] > 0:
@@ -1916,9 +1957,9 @@ class TokenStatsPlugin(BasePlugin):
             if not want(key):
                 continue
             agg = self._range_agg(frm, to)
-            cny, pts, matched = self._range_cost_ex(frm, to)
+            units, matched = self._range_cost_units(frm, to)
             line = f"{label}：{_fmt_num(agg['v'])} tokens · 输入 {_fmt_num(agg['i'])} · 输出 {_fmt_num(agg['o'])} · 缓存 {_fmt_num(agg['c'])} · {agg['r']} 轮"
-            cp = self._fmt_cost_part(cny, pts, matched)
+            cp = self._fmt_cost_units(units)
             if cp:
                 line += " · " + cp
             if agg["e"] > 0:
@@ -1934,9 +1975,8 @@ class TokenStatsPlugin(BasePlugin):
                     st = self._resolve_balance_state(src)
                     name = src.get("name", "")
                     if st["ok"]:
-                        # 积分制源显示「积分」，其余用全局余额单位
-                        unit = "积分" if self._src_currency(src) == "积分" else self.balance_unit
-                        sb.append(f"- {name}：{st['balance']:.4f} {unit}（{st.get('msg', '')[:40]}）")
+                        unit = self._src_unit(src)
+                        sb.append(f"- {name}：{st['balance']:.4f}" + (f" {unit}" if unit else "") + f"（{st.get('msg', '')[:40]}）")
                     else:
                         sb.append(f"- {name}：探测失败（{st['msg']}）")
             except Exception:
@@ -1971,8 +2011,8 @@ class TokenStatsPlugin(BasePlugin):
                 st = self._resolve_balance_state(src)
                 name = src.get("name", "")
                 if st["ok"]:
-                    unit = "积分" if self._src_currency(src) == "积分" else self.balance_unit
-                    lines.append(f"- {name}：{st['balance']:.4f} {unit}（{st.get('msg', '')[:40]}）")
+                    unit = self._src_unit(src)
+                    lines.append(f"- {name}：{st['balance']:.4f}" + (f" {unit}" if unit else "") + f"（{st.get('msg', '')[:40]}）")
                 else:
                     lines.append(f"- {name}：探测失败（{st['msg']}）")
             return "\n".join(lines)
@@ -2045,13 +2085,11 @@ class TokenStatsPlugin(BasePlugin):
                 key = r.get("m", "") if d == "model" else (r.get("s", "") or "未知") if d == "source" else day if d == "day" else (r.get("ch", "") or "未知")
                 if not key:
                     key = "未知"
-                a = map_agg.setdefault(key, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "cny": 0.0, "pts": 0.0, "matched": False})
+                a = map_agg.setdefault(key, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False})
                 a["r"] += 1; a["i"] += i; a["o"] += o; a["c"] += c; a["v"] += v
                 if amt is not None:
-                    if cur == "积分":
-                        a["pts"] += amt
-                    else:
-                        a["cny"] += amt
+                    ukey = f"{cur}|{_rule_unit(rule) if rule else ''}"
+                    a["units"][ukey] = a["units"].get(ukey, 0.0) + amt
                     a["matched"] = True
                     if cur == "积分":
                         pts_tot += amt
@@ -2073,10 +2111,9 @@ class TokenStatsPlugin(BasePlugin):
                 cost_txt = "—"
                 if a["matched"]:
                     bits = []
-                    if a["cny"]:
-                        bits.append(f"¥{a['cny']:.4f}")
-                    if a["pts"]:
-                        bits.append(f"积分 {a['pts']:,.4f}")
+                    for ukey, uamt in a["units"].items():
+                        _, _, uu = ukey.partition("|")
+                        bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
                     cost_txt = " + ".join(bits)
                 sb.append(f"{k} | {a['r']} | {_fmt_num(a['i'])} | {_fmt_num(a['o'])} | {_fmt_num(a['c'])} | {_fmt_num(a['v'])} | {cost_txt}")
             if len(map_agg) > cap:
@@ -2131,7 +2168,8 @@ class TokenStatsPlugin(BasePlugin):
                 amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t_dt) if t_dt and rule else (None, "CNY")
                 cost_txt = "—"
                 if amt is not None:
-                    cost_txt = f"¥{amt:.4f}" if cur != "积分" else f"积分 {amt:,.4f}"
+                    uu = _rule_unit(rule) if rule else ""
+                    cost_txt = f"{uu} {amt:,.4f}" if uu else f"{amt:,.4f}"
                 ts = t_dt.strftime("%m-%d %H:%M:%S") if t_dt else r.get("t", "")
                 row = f"{ts} | {r.get('m', '') or '未知'} | {r.get('s', '') or '未知'} | {r.get('ch', '') or '未知'} | " \
                       f"{_fmt_num(r.get('i', 0))} | {_fmt_num(r.get('o', 0))} | {_fmt_num(r.get('c', 0))} | {_fmt_num(r.get('v', 0))} | {cost_txt}"
@@ -2264,8 +2302,8 @@ class TokenStatsPlugin(BasePlugin):
                 st = self._resolve_balance_state(src)
                 name = src.get("name", "")
                 if st["ok"]:
-                    unit = "积分" if self._src_currency(src) == "积分" else self.balance_unit
-                    lines.append(f"- {name}：{st['balance']:.4f} {unit}（{st.get('msg', '')[:40]}）")
+                    unit = self._src_unit(src)
+                    lines.append(f"- {name}：{st['balance']:.4f}" + (f" {unit}" if unit else "") + f"（{st.get('msg', '')[:40]}）")
                 else:
                     lines.append(f"- {name}：探测失败（{st['msg']}）")
             return "\n".join(lines)
@@ -2289,19 +2327,19 @@ class TokenStatsPlugin(BasePlugin):
             "d30": self._range_agg(d30, today),
             "total": self._range_agg("0000-01-01", "9999-12-31"),
         }
-        # 双币种费用：cny / pts 分列，前端按需展示
+        # 费用：按 (币种, 显示单位) 分桶，前端按需展示
         def _cost_pair(k):
-            cny, pts, matched = k
-            return {"cny": f"{cny:.4f}" if matched and cny else None,
-                    "pts": f"{pts:,.4f}" if matched and pts else None,
-                    "matched": matched}
+            units, matched = k
+            arr = [{"unit": uu, "amt": f"{uamt:,.4f}"} for ukey, uamt in units.items() if uamt
+                   for uu in [ukey.partition("|")[2]]]
+            return {"units": arr, "matched": matched}
 
         costs = {
-            "session": _cost_pair(self._session_cost_ex()),
-            "today": _cost_pair(self._range_cost_ex(today, today)),
-            "d7": _cost_pair(self._range_cost_ex(d7, today)),
-            "d30": _cost_pair(self._range_cost_ex(d30, today)),
-            "total": _cost_pair(self._range_cost_ex("0000-01-01", "9999-12-31")),
+            "session": _cost_pair(self._session_cost_units()),
+            "today": _cost_pair(self._range_cost_units(today, today)),
+            "d7": _cost_pair(self._range_cost_units(d7, today)),
+            "d30": _cost_pair(self._range_cost_units(d30, today)),
+            "total": _cost_pair(self._range_cost_units("0000-01-01", "9999-12-31")),
         }
         errors = {
             "session": s.get("e", 0),
@@ -2392,6 +2430,7 @@ class TokenStatsPlugin(BasePlugin):
                 "h": r.get("h", ""), "sid": r.get("sid", ""),
                 "co": f"{amt:.4f}" if amt is not None else None,
                 "cur": cur,
+                "unit": _rule_unit(rule) if rule else "",
             })
         return {"recs": out}
 
@@ -2413,7 +2452,7 @@ class TokenStatsPlugin(BasePlugin):
         to = request.query_params.get("to") or to
 
         by_source, by_channel, by_model, by_sid = {}, {}, {}, {}
-        total = {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "cny": 0.0, "pts": 0.0, "matched": False}
+        total = {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False}
         for r in self._read_records():
             try:
                 t = _parse_ts(r["t"])
@@ -2427,16 +2466,14 @@ class TokenStatsPlugin(BasePlugin):
             amt, cur = _rule_cost_ex(rule, i, o, c, t) if rule else (None, "CNY")
 
             def add(d, k):
-                a = d.setdefault(k, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "cny": 0.0, "pts": 0.0, "matched": False, "last_at": ""})
+                a = d.setdefault(k, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "last_at": ""})
                 a["r"] += 1; a["i"] += i; a["o"] += o; a["c"] += c; a["v"] += v
                 _ts = t.strftime("%Y-%m-%d %H:%M:%S")
                 if _ts > a["last_at"]:
                     a["last_at"] = _ts
                 if amt is not None:
-                    if cur == "积分":
-                        a["pts"] += amt
-                    else:
-                        a["cny"] += amt
+                    ukey = f"{cur}|{_rule_unit(rule) if rule else ''}"
+                    a["units"][ukey] = a["units"].get(ukey, 0.0) + amt
                     a["matched"] = True
 
             add(by_source, r.get("s", "") or "未知")
@@ -2445,10 +2482,8 @@ class TokenStatsPlugin(BasePlugin):
             add(by_sid, r.get("sid", "") or "未知")
             total["r"] += 1; total["i"] += i; total["o"] += o; total["c"] += c; total["v"] += v
             if amt is not None:
-                if cur == "积分":
-                    total["pts"] += amt
-                else:
-                    total["cny"] += amt
+                ukey = f"{cur}|{_rule_unit(rule) if rule else ''}"
+                total["units"][ukey] = total["units"].get(ukey, 0.0) + amt
                 total["matched"] = True
 
         def dim(d):
@@ -2459,10 +2494,9 @@ class TokenStatsPlugin(BasePlugin):
         def fmt_cost(a):
             bits = []
             if a.get("matched"):
-                if a.get("cny"):
-                    bits.append(f"¥{a['cny']:.4f}")
-                if a.get("pts"):
-                    bits.append(f"积分 {a['pts']:,.4f}")
+                for ukey, uamt in (a.get("units") or {}).items():
+                    _, _, uu = ukey.partition("|")
+                    bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
             return " + ".join(bits) if bits else None
 
         return {
@@ -2654,6 +2688,7 @@ class TokenStatsPlugin(BasePlugin):
                 "ok": st["ok"],
                 "balance": f"{st['balance']:.4f}" if st["ok"] else "",
                 "currency": st.get("currency", "CNY"),
+                "unit": self._src_unit(src),
                 "at": st.get("at", ""),
                 "msg": st.get("msg", ""),
             }
@@ -2686,7 +2721,7 @@ class TokenStatsPlugin(BasePlugin):
                 continue
             item = {"name": name, "type": (str(s.get("type") or "auto").strip().lower() or "auto"),
                     "enabled": bool(s.get("enabled", True))}
-            for k in ("url", "api_key", "api_user", "json_path", "currency", "model_ref"):
+            for k in ("url", "api_key", "api_user", "json_path", "currency", "model_ref", "unit"):
                 v = s.get(k)
                 if v not in (None, ""):
                     item[k] = str(v).strip()
@@ -2770,7 +2805,7 @@ class TokenStatsPlugin(BasePlugin):
                 continue
             item = {"name": name, "peak_enabled": bool(r.get("peak_enabled", True)),
                     "enabled": r.get("enabled", True) != False}
-            for k in ("url_match", "model_match", "channel_match", "currency", "peak_profile"):
+            for k in ("url_match", "model_match", "channel_match", "currency", "peak_profile", "unit"):
                 v = r.get(k)
                 if v not in (None, ""):
                     item[k] = str(v).strip()
@@ -3158,7 +3193,7 @@ async function loadOv(){
     const rate = rg.i>0 ? (rg.c/rg.i*100).toFixed(1)+'%' : '—';
     const errs = (d.errors||{})[k]||0;
     const costBits = [];
-    if(co.matched){ if(co.cny) costBits.push('¥'+co.cny); if(co.pts) costBits.push('<span class="pts">'+co.pts+' 积分</span>'); }
+    if(co.matched && co.units){ co.units.forEach(u=>{ costBits.push(u.unit?('<span class="pts">'+u.amt+' '+esc(u.unit)+'</span>'):u.amt); }); }
     // 迷你走势（非本次会话）：近14天分布
     let sp = '';
     if(k!=='session') sp = '<div class="spark">'+sparkHtml(dayVols.slice(-14))+'</div>';
@@ -3313,7 +3348,7 @@ async function loadRec(){
   }
   $('#recBody').innerHTML = recs.map(x=>
     '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+esc(x.s)+'</td><td>'+esc(x.ch)+'</td>'+
-    '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.cur==='积分'?x.co+' 积分':'¥'+x.co):'—')+'</td></tr>').join('') ||
+    '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
     '<tr><td colspan="9" class="note">'+(recSlotFilter?'该时段暂无记录':'暂无记录')+'</td></tr>';
   recSlotFilter = null;
 }
@@ -3332,8 +3367,8 @@ async function loadPrice(){
   sel.value = peakProfileIdx;
   $('#peakProfileName').value = peakProfiles[peakProfileIdx].name;
   $('#peakWindows').value = peakProfiles[peakProfileIdx].windows.map(x=>x[0]+'-'+x[1]).join(',');
-  $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>启用</th><th>名称</th><th>币种</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷方案</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
-    priceRules.map((r,i)=>'<tr'+(r.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(r.enabled!==false?'checked':'')+' onchange="priceToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
+  $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>启用</th><th>名称</th><th>币种</th><th>单位</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷方案</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
+    priceRules.map((r,i)=>'<tr'+(r.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(r.enabled!==false?'checked':'')+' onchange="priceToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.unit!==undefined?r.unit:(r.currency==='积分'?'积分':'¥'))+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
     '<td>'+(r.peak_enabled===false?'恒谷':esc(r.peak_profile||'默认工作日'))+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
     '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+')">删除</button></td></tr>').join('')+'</tbody></table>'+
     '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；每条规则可选自己的峰谷方案（上方方案库管理）。双币种分别累计，不与 ¥ 混算。改价/改方案后全历史费用即时重算。</div>'
@@ -3345,6 +3380,7 @@ const PRICE_FIELDS = [
   ['model_match','模型匹配（可选）','flash'],
   ['channel_match','渠道匹配（可选）','deepseek'],
   ['currency','币种','CNY（或填 积分）'],
+  ['unit','显示单位(留空=无单位)','¥'],
   ['hit_peak','缓存命中·峰时价','0.10'],
   ['hit_off','缓存命中·谷时价','0.05'],
   ['miss_peak','未命中·峰时价','3.0'],
@@ -3388,7 +3424,7 @@ function priceEditOpen(i){
       if(!el || el.value.trim()==='') return;
       const v = el.value.trim();
       if(f[0]==='currency') item.currency = v;
-      else if(f[0]==='url_match'||f[0]==='model_match'||f[0]==='channel_match') item[f[0]] = v;
+      else if(f[0]==='url_match'||f[0]==='model_match'||f[0]==='channel_match'||f[0]==='unit') item[f[0]] = v;
       else { const n = parseFloat(v); if(!isNaN(n)) item[f[0]] = n; }
     });
     if(priceEditIdx>=0 && priceRules[priceEditIdx]) priceRules[priceEditIdx] = item;
@@ -3471,8 +3507,8 @@ async function loadBal(refresh){
   $('#balInterval').value = d.interval;
   $('#balInfo').textContent = balSources.length + ' 个源';
   $('#balBody').innerHTML = balSources.map((x,i)=>{
-    const unit = x.currency==='积分' ? '积分' : (d.unit||'元');
-    return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(x.enabled!==false?'checked':'')+' onchange="balToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</td>'+
+    const unit = x.unit!==undefined ? x.unit : (x.currency==='积分' ? '积分' : (d.unit||'元'));
+    return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(x.enabled!==false?'checked':'')+' onchange="balToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+(unit?' '+esc(unit):'')):'失败')+'</td>'+
     '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
     '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+')">删除</button></td></tr>';
   }).join('') ||
@@ -3500,12 +3536,12 @@ const BAL_TYPES = [
   ['rolling','rolling · 每日累计滚存积分']
 ];
 const BAL_FIELDS = {
-  auto: [['url','站点/接口地址','https://api.deepseek.com'],['api_key','API Key','']],
-  custom: [['url','接口地址','https://myproxy.example.com'],['api_key','API Key',''],['json_path','余额字段路径(可选)','balance_infos.0.total_balance']],
-  newapi: [['url','站点地址','https://newapi.example.com'],['api_key','系统访问令牌',''],['api_user','用户ID(纯数字)',''],['quota_conversion','换算比例(默认500000)','500000']],
-  preset: [['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种(CNY/积分)','CNY']],
-  daily: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表,可选)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分']],
-  rolling: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分']]
+  auto: [['url','站点/接口地址','https://api.deepseek.com'],['api_key','API Key',''],['unit','显示单位(留空=无单位)','元']],
+  custom: [['url','接口地址','https://myproxy.example.com'],['api_key','API Key',''],['json_path','余额字段路径(可选)','balance_infos.0.total_balance'],['unit','显示单位(留空=无单位)','元']],
+  newapi: [['url','站点地址','https://newapi.example.com'],['api_key','系统访问令牌',''],['api_user','用户ID(纯数字)',''],['quota_conversion','换算比例(默认500000)','500000'],['unit','显示单位(留空=无单位)','元']],
+  preset: [['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种(CNY/积分)','CNY'],['unit','显示单位(留空=无单位)','元']],
+  daily: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表,可选)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分'],['unit','显示单位(留空=无单位)','积分']],
+  rolling: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分'],['unit','显示单位(留空=无单位)','积分']]
 };
 function balFieldHtml(f){
   return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
@@ -3691,8 +3727,9 @@ async function refresh(){
     $('#v_today').textContent = fmt4((d.ranges||{}).today ? d.ranges.today.v : 0);
     $('#v_d7').textContent = fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0);
     const co = (d.costs||{}).today||{}, coT = (d.costs||{}).total||{};
-    $('#v_cost').textContent = co.matched ? (co.cny?('¥'+co.cny):(co.pts?co.pts+' 积分':'—')) : '—';
-    $('#v_cost_total').textContent = coT.matched ? (coT.cny?('¥'+coT.cny):(coT.pts?coT.pts+' 积分':'—')) : '—';
+    const fmtCost = c => { if(!c.matched || !c.units || !c.units.length) return '—'; return c.units.map(u=>u.unit?(u.amt+' '+u.unit):u.amt).join(' + '); };
+    $('#v_cost').textContent = fmtCost(co);
+    $('#v_cost_total').textContent = fmtCost(coT);
     const b = d.balance||{};
     $('#bal').innerHTML = b.current ? '<div class="row"><span class="k">余额</span><span class="v">'+b.current+'</span></div>' : '';
     $('#st').textContent = '会话 '+d.rounds+' 轮 · '+(d.src||'');
@@ -3750,7 +3787,7 @@ $('#fold').onclick=()=>{
 $('#pop').onclick=()=>{
   const w=window.open('', '_blank', 'width=340,height=300');
   if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
-  w.document.write('<html><head><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.95);border:1px solid #334155;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#e2e8f0;user-select:none;z-index:9999}.row{display:flex;justify-content:space-between;padding:5px 12px;font-size:12px}.row .k{color:#94a3b8}.row .v{font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:#334155;margin:6px 0}.foot{padding:8px 12px;font-size:10px;color:#94a3b8;border-top:1px solid #334155}</style></head><body><div id="w"></div><script>const API='"+API+"';const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ''+v;if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K';if(v<995000)return Math.round(v/1000)+'K';if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M';if(v<995000000)return Math.round(v/1e6)+'M';return Math.round(v/1e9)+'B'};async function rf(){try{const d=await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const b=d.balance||{};document.getElementById('w').innerHTML='<div class=row><span class=k>本次会话</span><span class=v>'+fmt4(d.total)+'</span></div><div class=row><span class=k>今日</span><span class=v>'+fmt4((d.ranges||{}).today?d.ranges.today.v:0)+'</span></div><div class=row><span class=k>近7天</span><span class=v>'+fmt4((d.ranges||{}).d7?d.ranges.d7.v:0)+'</span></div><div class=row><span class=k>费用(今日)</span><span class="v cost">'+(co.matched?(co.cny?('¥'+co.cny):(co.pts?co.pts+' 积分':'—')):'—')+'</span></div><div class=row><span class=k>费用(累计)</span><span class="v cost">'+(coT.matched?(coT.cny?('¥'+coT.cny):(coT.pts?coT.pts+' 积分':'—')):'—')+'</span></div>'+(b.current?'<div class=sep></div><div class=row><span class=k>余额</span><span class=v>'+b.current+'</span></div>':'')+'<div class=foot>会话 '+d.rounds+' 轮 · '+(d.src||'')+'</div>';}catch(e){document.getElementById('w').innerHTML='<div class=foot>加载失败</div>';}}rf();setInterval(rf,5000);<\/script></body></html>');
+  w.document.write('<html><head><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.95);border:1px solid #334155;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#e2e8f0;user-select:none;z-index:9999}.row{display:flex;justify-content:space-between;padding:5px 12px;font-size:12px}.row .k{color:#94a3b8}.row .v{font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:#334155;margin:6px 0}.foot{padding:8px 12px;font-size:10px;color:#94a3b8;border-top:1px solid #334155}</style></head><body><div id="w"></div><script>const API='"+API+"';const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ''+v;if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K';if(v<995000)return Math.round(v/1000)+'K';if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M';if(v<995000000)return Math.round(v/1e6)+'M';return Math.round(v/1e9)+'B'};async function rf(){try{const d=await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const b=d.balance||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return '—';return c.units.map(u=>u.unit?(u.amt+' '+u.unit):u.amt).join(' + ')};document.getElementById('w').innerHTML='<div class=row><span class=k>本次会话</span><span class=v>'+fmt4(d.total)+'</span></div><div class=row><span class=k>今日</span><span class=v>'+fmt4((d.ranges||{}).today?d.ranges.today.v:0)+'</span></div><div class=row><span class=k>近7天</span><span class=v>'+fmt4((d.ranges||{}).d7?d.ranges.d7.v:0)+'</span></div><div class=row><span class=k>费用(今日)</span><span class="v cost">'+fc(co)+'</span></div><div class=row><span class=k>费用(累计)</span><span class="v cost">'+fc(coT)+'</span></div>'+(b.current?'<div class=sep></div><div class=row><span class=k>余额</span><span class=v>'+b.current+'</span></div>':'')+'<div class=foot>会话 '+d.rounds+' 轮 · '+(d.src||'')+'</div>';}catch(e){document.getElementById('w').innerHTML='<div class=foot>加载失败</div>';}}rf();setInterval(rf,5000);<\/script></body></html>');
   w.document.close();
 };
 $('#go').onclick=()=>{ window.open('/page/plugin/KiraAI_token_stats_plugin/stats','_blank'); };
