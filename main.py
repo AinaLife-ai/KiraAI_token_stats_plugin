@@ -3172,9 +3172,9 @@ class TokenStatsPlugin(BasePlugin):
         if not self.enable_widget:
             return PluginPage.from_html(
                 f"<!DOCTYPE html><html lang=\"zh-CN\"><body style=\"background:#0f172a;color:#94a3b8;font-family:sans-serif;padding:24px;font-size:13px\">"
-                f"<p style=\"color:#e2e8f0;font-weight:600;margin-bottom:8px\">Token 挂件已启用（默认开启）</p>"
-                f"<p>此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球），适合浏览器小窗钉角落。<br>"
-                f"如需关闭：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 关闭「启用挂件」。</p>"
+                f"<p style=\"color:#e2e8f0;font-weight:600;margin-bottom:8px\">Token 挂件已停用</p>"
+                f"<p>此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球，可弹独立小窗），当前在配置中被关闭。<br>"
+                f"如需开启：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 打开「启用挂件」。</p>"
                 f"</body></html>")
         # 后端「紧凑模式」配置注入为前端默认值；localStorage 有记忆时以用户为准
         html = _WIDGET_HTML.replace(
@@ -3986,10 +3986,11 @@ _WIDGET_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Token 挂件</title>
 <style>
-:root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
+:root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--err:#f87171;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
 body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden;background-size:cover;background-position:center;background-attachment:fixed}
+@media (prefers-reduced-motion: reduce){ #w,#w.ball,#skinBtn{backdrop-filter:none!important;-webkit-backdrop-filter:none!important} *{transition:none!important;animation:none!important} }
 #skinBtn{position:fixed;right:10px;bottom:10px;width:28px;height:28px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:14px;z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
 #skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}
 #w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
@@ -3998,16 +3999,19 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 .ballv{display:none;font-size:14px;font-weight:700;color:var(--fg);font-variant-numeric:tabular-nums}
 #w.ball .ballv{display:block}
 #w.dragging{opacity:.85;border-color:var(--acc)}
+body.grabbing,body.grabbing *{cursor:grabbing!important}
 .head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}
-.head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none}
+.head .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);flex:none;transition:background .3s,box-shadow .3s}
+.head .dot.err{background:var(--err);box-shadow:0 0 6px var(--err)}
 .head .t{font-size:12px;font-weight:600;color:var(--fg);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .head .hbtn{width:22px;height:22px;border:none;background:rgba(51,65,85,.4);color:var(--dim);border-radius:6px;cursor:pointer;font-size:12px;line-height:1;flex:none}
 .head .hbtn:hover{color:var(--fg);background:var(--line)}
 .body{padding:10px 12px 12px}
 .row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:12px}
 .row .k{color:var(--dim)}
-.row .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--fg)}
+.row .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--fg);transition:color .15s,text-shadow .15s}
 .row .v.cost{color:var(--ok)}.row .v.pts{color:var(--purple)}.row .v.in{color:var(--acc)}.row .v.out{color:var(--pink)}
+.row .v.flash{color:#fff;text-shadow:0 0 8px var(--acc)}
 .sep{height:1px;background:rgba(51,65,85,.5);margin:6px 0}
 .bal{font-size:11.5px}
 .bal .bname{color:var(--dim);max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -4023,6 +4027,7 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
     <span class="t" id="title">Token 挂件</span>
+    <button class="hbtn" id="pip" title="置顶浮窗（PiP）" style="display:none">📌</button>
     <button class="hbtn" id="pop" title="独立小窗">⧉</button>
     <button class="hbtn" id="fold" title="折叠">—</button>
   </div>
@@ -4043,38 +4048,71 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 </div>
 <script>
 const API = '/api/plugin/KiraAI_token_stats_plugin';
+const PAGE = '/page/plugin/KiraAI_token_stats_plugin';
 const $ = s=>document.querySelector(s);
 const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1000)+'K';
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
   return Math.round(v/1e9)+'B'; };
+// 双模式：URL ?pop=1 → 独立弹窗模式（window.moveBy/resizeTo 控制真实窗口）
+const IS_POP = new URLSearchParams(location.search).get('pop')==='1';
+const POS_KEY = IS_POP ? 'tsWidgetPopPos' : 'tsWidgetPos';
 let compact = localStorage.getItem('tsWidgetCompact')==='1';
-let lastTotal = 0;
 let pos = null;
-try{ pos = JSON.parse(localStorage.getItem('tsWidgetPos')||'null'); }catch(e){}
-if(pos){ $('#w').style.left=pos.x+'px'; $('#w').style.top=pos.y+'px'; }
+try{ pos = JSON.parse(localStorage.getItem(POS_KEY)||'null'); }catch(e){}
+if(pos && !IS_POP){ $('#w').style.left=pos.x+'px'; $('#w').style.top=pos.y+'px'; }
 if(compact){ $('#w').style.width='180px'; }
+if(IS_POP){ $('#pop').style.display='none'; document.title='Token 挂件 · 小窗'; }
+
+function toast(msg){
+  let t = document.getElementById('skinToast');
+  if(!t){
+    t = document.createElement('div');
+    t.id = 'skinToast';
+    t.style.cssText = 'position:fixed;left:50%;bottom:50px;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid #334155;color:#e2e8f0;padding:6px 14px;border-radius:16px;font-size:12px;z-index:99999;transition:opacity .3s;pointer-events:none;max-width:90%';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.opacity = '1';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 2000);
+}
+
+// 数值变化 150ms 闪动
+function setVal(id, txt){
+  const el = $(id);
+  if(el.textContent !== txt){
+    el.textContent = txt;
+    el.classList.add('flash');
+    setTimeout(()=>el.classList.remove('flash'), 150);
+  }
+}
 async function refresh(){
   try{
     const d = await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());
+    $('#dot').classList.remove('err');
     $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
     $('#title').textContent = 'Token · ' + (d.model||'—');
-    $('#v_sess').textContent = fmt4(d.total);
-    lastTotal = d.total; $('#ballv').textContent = fmt4(d.total);
-    $('#v_today').textContent = fmt4((d.ranges||{}).today ? d.ranges.today.v : 0);
-    $('#v_d7').textContent = fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0);
+    setVal('#v_sess', fmt4(d.total));
+    $('#ballv').textContent = fmt4(d.total);
+    setVal('#v_today', fmt4((d.ranges||{}).today ? d.ranges.today.v : 0));
+    setVal('#v_d7', fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0));
     const co = (d.costs||{}).today||{}, coT = (d.costs||{}).total||{};
     const fmtCost = c => { if(!c.matched || !c.units || !c.units.length) return '—'; return c.units.map(u=>u.unit?(u.amt+' '+u.unit):u.amt).join(' + '); };
-    $('#v_cost').textContent = fmtCost(co);
-    $('#v_cost_total').textContent = fmtCost(coT);
+    setVal('#v_cost', fmtCost(co));
+    setVal('#v_cost_total', fmtCost(coT));
     const b = d.balance||{};
     $('#bal').innerHTML = b.current ? '<div class="row"><span class="k">余额</span><span class="v">'+b.current+'</span></div>' : '';
     $('#st').textContent = '会话 '+d.rounds+' 轮 · '+(d.src||'');
-  }catch(e){ $('#st').textContent = '加载失败'; }
+  }catch(e){
+    $('#dot').classList.add('err');
+    $('#dot').style.background = '';
+    $('#st').textContent = '加载失败';
+  }
 }
 refresh();
 setInterval(refresh, 5000);
-// 随机背景（默认开，右下角 👕 点击关闭）
+// 随机背景（默认开，右下角 👕 点击关闭；图片加载失败静默回退）
 (function(){
   const BG_KEY = 'tsWidgetSkinBg';
   const bgOn = localStorage.getItem(BG_KEY) !== '0';
@@ -4088,19 +4126,6 @@ setInterval(refresh, 5000);
       document.body.style.backgroundImage = '';
     }
   };
-  const toast = msg => {
-    let t = document.getElementById('skinToast');
-    if(!t){
-      t = document.createElement('div');
-      t.id = 'skinToast';
-      t.style.cssText = 'position:fixed;left:50%;bottom:50px;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid #334155;color:#e2e8f0;padding:6px 14px;border-radius:16px;font-size:12px;z-index:9999;transition:opacity .3s;pointer-events:none';
-      document.body.appendChild(t);
-    }
-    t.textContent = msg;
-    t.style.opacity = '1';
-    clearTimeout(t._tm);
-    t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 1600);
-  };
   const syncIcon = on => { $('#skinBtn').textContent = on ? '👕' : '🚫'; $('#skinBtn').title = on ? '随机背景：开（点击关闭）' : '随机背景：关（点击开启）'; };
   applyBg(bgOn);
   syncIcon(bgOn);
@@ -4112,41 +4137,93 @@ setInterval(refresh, 5000);
     toast('随机背景：' + (!now ? '开' : '关'));
   };
 })();
-// 拖动（标题栏；球模式下整个球可拖）
-let drag=false, sx=0, sy=0, ox=0, oy=0;
+// 拖动（标题栏；球模式下整个球可拖）：弹窗模式优先 window.moveBy 移动真实窗口，失败退化页内拖拽
+let drag=false, sx=0, sy=0, ox=0, oy=0, popMove=true;
 $('#w').addEventListener('mousedown',e=>{
-  if(e.target.classList.contains('hbtn')) return;
+  if(e.target.classList.contains('hbtn') || e.target.classList.contains('go')) return;
   if(!$('#w').classList.contains('ball') && !e.target.closest('#hd')) return;
-  drag=true; sx=e.clientX; sy=e.clientY;
+  drag=true; sx=e.screenX; sy=e.screenY;
   const r=$('#w').getBoundingClientRect(); ox=r.left; oy=r.top;
   $('#w').classList.add('dragging');
+  document.body.classList.add('grabbing');
 });
 document.addEventListener('mousemove',e=>{
   if(!drag) return;
-  $('#w').style.left=Math.max(0,ox+e.clientX-sx)+'px';
-  $('#w').style.top=Math.max(0,oy+e.clientY-sy)+'px';
+  if(IS_POP && popMove){
+    try{
+      window.moveBy(e.screenX-sx, e.screenY-sy);
+      sx=e.screenX; sy=e.screenY;
+      return;
+    }catch(err){ popMove=false; sx=e.screenX; sy=e.screenY; }
+  }
+  $('#w').style.left=Math.max(0,ox+(e.screenX-sx))+'px';
+  $('#w').style.top=Math.max(0,oy+(e.screenY-sy))+'px';
 });
 document.addEventListener('mouseup',()=>{
   if(!drag) return;
   drag=false; $('#w').classList.remove('dragging');
-  const r=$('#w').getBoundingClientRect();
-  localStorage.setItem('tsWidgetPos', JSON.stringify({x:r.left,y:r.top}));
+  document.body.classList.remove('grabbing');
+  if(IS_POP && popMove){
+    try{ localStorage.setItem(POS_KEY, JSON.stringify({x:window.screenX,y:window.screenY})); }catch(e){}
+  }else{
+    const r=$('#w').getBoundingClientRect();
+    localStorage.setItem(POS_KEY, JSON.stringify({x:r.left,y:r.top}));
+  }
 });
-// 折叠（球模式：收成 56px 圆球显示总量，点击展开）
+// 折叠（球模式：收成 56px 圆球显示总量，点击展开）；弹窗模式同步 resizeTo 真实窗口
 $('#fold').onclick=()=>{
   const w=$('#w');
-  if(w.classList.contains('ball')){ w.classList.remove('ball'); $('#fold').textContent='—'; }
-  else { w.classList.add('ball'); $('#fold').textContent='+'; }
+  const toBall = !w.classList.contains('ball');
+  w.classList.toggle('ball');
+  $('#fold').textContent = toBall ? '+' : '—';
+  if(IS_POP){
+    try{ toBall ? window.resizeTo(80,80) : window.resizeTo(340,360); }catch(e){}
+  }
 };
-// 独立小窗：blob URL 打开无边框可拖动悬浮窗（绕过 window.open 空窗拦截）
+// 独立小窗：同源真实 URL + 命名窗口单例 + 记忆位置；被拦截时页内 toast 提示
 $('#pop').onclick=()=>{
-  const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden;background-size:cover;background-position:center;background-attachment:fixed}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.88);border:none;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,.55);backdrop-filter:blur(10px);color:#e2e8f0;user-select:none;z-index:9999;overflow:hidden}#w.ball{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:move;background:rgba(15,23,42,.92);box-shadow:0 6px 20px rgba(0,0,0,.5)}#w.ball .head,#w.ball .body,#w.ball .foot{display:none}.ballv{display:none;font-size:14px;font-weight:700;font-variant-numeric:tabular-nums}#w.ball .ballv{display:block}.head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}.dot{width:8px;height:8px;border-radius:50%;background:#34d399;box-shadow:0 0 6px #34d399;flex:none}.t{flex:1;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hbtn{width:22px;height:22px;border:none;background:rgba(51,65,85,.4);color:#94a3b8;border-radius:6px;cursor:pointer;font-size:12px;line-height:1;flex:none}.hbtn:hover{color:#e2e8f0;background:#334155}.body{padding:10px 12px 12px}.row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:12px}.row .k{color:#94a3b8}.row .v{font-variant-numeric:tabular-nums;font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:rgba(51,65,85,.5);margin:6px 0}.foot{padding:8px 12px;border-top:1px solid rgba(51,65,85,.5);display:flex;gap:6px;align-items:center;justify-content:flex-end}.foot .st{font-size:10px;color:#94a3b8;margin-right:auto}.foot .go{border:1px solid #334155;background:#1e293b;color:#e2e8f0;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px}.foot .go:hover{border-color:#38bdf8}#skinBtn{position:fixed;right:10px;bottom:10px;width:26px;height:26px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:13px;z-index:9999;display:flex;align-items:center;justify-content:center}#skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}</style></head><body><button id="skinBtn" title="随机背景开关">👕</button><div id="w"><div class="head" id="hd"><span class="dot" id="dot"></span><span class="t" id="title">Token 挂件</span><button class="hbtn" id="fold" title="折叠">—</button></div><div class="body" id="body"><div class="row"><span class="k">本次会话</span><span class="v" id="v_sess">—</span></div><div class="row"><span class="k">今日</span><span class="v" id="v_today">—</span></div><div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div><div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div><div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div><div class="sep"></div><div class="row"><span class="k">余额</span><span class="v" id="v_bal">—</span></div></div><div class="foot"><span class="st" id="st">—</span><button class="go" id="go">打开看板</button></div><div class="ballv" id="ballv">0</div></div><script>const API="'+API+'";const $=s=>document.querySelector(s);const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ""+v;if(v<9950)return (v/1000).toFixed(1).replace(".0","")+"K";if(v<995000)return Math.round(v/1000)+"K";if(v<9950000)return (v/1e6).toFixed(1).replace(".0","")+"M";if(v<995000000)return Math.round(v/1e6)+"M";return Math.round(v/1e9)+"B"};let lastTotal=0;async function rf(){try{const d=await fetch(API+"/stats",{cache:"no-store"}).then(r=>r.json());$("#dot").style.background=d.busy?"#60a5fa":"#34d399";$("#title").textContent="Token · "+(d.model||"—");$("#v_sess").textContent=fmt4(d.total);lastTotal=d.total;$("#ballv").textContent=fmt4(d.total);$("#v_today").textContent=fmt4((d.ranges||{}).today?d.ranges.today.v:0);$("#v_d7").textContent=fmt4((d.ranges||{}).d7?d.ranges.d7.v:0);const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return "—";return c.units.map(u=>u.unit?(u.amt+" "+u.unit):u.amt).join(" + ")};$("#v_cost").textContent=fc(co);$("#v_cost_total").textContent=fc(coT);const b=d.balance||{};$("#v_bal").textContent=b.current||"—";$("#st").textContent="会话 "+d.rounds+" 轮 · "+(d.src||"");}catch(e){$("#st").textContent="加载失败";}}rf();setInterval(rf,5000);(function(){const BG_KEY="tsWidgetSkinBg";const bgOn=localStorage.getItem(BG_KEY)!=="0";const applyBg=on=>{if(on){const img=new Image();img.onload=()=>{document.body.style.backgroundImage="url('"+img.src+"')"};img.onerror=()=>{document.body.style.backgroundImage=""};img.src="https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t="+Date.now()}else{document.body.style.backgroundImage=""}};const syncIcon=on=>{$("#skinBtn").textContent=on?"👕":"🚫";$("#skinBtn").title=on?"随机背景：开（点击关闭）":"随机背景：关（点击开启）"};applyBg(bgOn);syncIcon(bgOn);$("#skinBtn").onclick=()=>{const now=localStorage.getItem(BG_KEY)!=="0";localStorage.setItem(BG_KEY,now?"0":"1");applyBg(!now);syncIcon(!now)}})();let drag=false,sx=0,sy=0,ox=0,oy=0;$("#w").addEventListener("mousedown",e=>{if(e.target.classList.contains("hbtn"))return;if(!$("#w").classList.contains("ball")&&!e.target.closest("#hd"))return;drag=true;sx=e.clientX;sy=e.clientY;const r=$("#w").getBoundingClientRect();ox=r.left;oy=r.top});document.addEventListener("mousemove",e=>{if(!drag)return;$("#w").style.left=Math.max(0,ox+e.clientX-sx)+"px";$("#w").style.top=Math.max(0,oy+e.clientY-sy)+"px"});document.addEventListener("mouseup",()=>{drag=false});$("#fold").onclick=()=>{const w=$("#w");if(w.classList.contains("ball")){w.classList.remove("ball");$("#fold").textContent="—"}else{w.classList.add("ball");$("#fold").textContent="+"}};$("#go").onclick=()=>{window.open("/page/plugin/KiraAI_token_stats_plugin/stats","_blank")};<\/script></body></html>';
-  const url = URL.createObjectURL(new Blob([html], {type:'text/html'}));
-  const w = window.open(url, '_blank', 'width=340,height=340');
-  if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
-  setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  let left = Math.max(0,(screen.availWidth||screen.width)-380), top = 80;
+  try{
+    const p = JSON.parse(localStorage.getItem('tsWidgetPopPos')||'null');
+    if(p){ left=p.x; top=p.y; }
+  }catch(e){}
+  const url = PAGE + '/stats-widget?pop=1';
+  const w = window.open(url, 'tsWidgetPop', 'popup=yes,width=340,height=360,left='+left+',top='+top);
+  if(!w){ toast('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
+  try{ w.focus(); }catch(e){}
 };
-$('#go').onclick=()=>{ const u='/page/plugin/KiraAI_token_stats_plugin/stats'; const w=window.open(u,'_blank'); if(!w){ const a=document.createElement('a'); a.href=u; a.target='_blank'; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove(); } };
+// PiP 置顶浮窗（彩蛋层）：仅弹窗模式且浏览器支持 documentPictureInPicture 时显示；失败静默
+if(IS_POP && 'documentPictureInPicture' in window){
+  $('#pip').style.display = '';
+  $('#pip').onclick = async ()=>{
+    try{
+      const pipWin = await documentPictureInPicture.requestWindow({width:340, height:360});
+      // 复制样式
+      let css = '';
+      for(const sh of document.styleSheets){
+        try{ for(const r of sh.cssRules) css += r.cssText; }catch(e){}
+      }
+      const st = pipWin.document.createElement('style');
+      st.textContent = css;
+      pipWin.document.head.appendChild(st);
+      pipWin.document.body.style.cssText = document.body.style.cssText;
+      const wEl = $('#w');
+      pipWin.document.body.appendChild(wEl);
+      const stEl = $('#st'); if(stEl) stEl.textContent = '已置顶（OS 级浮窗）';
+      pipWin.addEventListener('pagehide', ()=>{
+        document.body.appendChild(wEl);
+      }, {once:true});
+    }catch(e){ /* 用户取消或不支持，静默 */ }
+  };
+}
+// 打开看板：同源真实地址新开标签；失败时 toast + 可复制链接
+$('#go').onclick=()=>{
+  const u = PAGE + '/stats';
+  const w = window.open(u, '_blank');
+  if(!w){
+    toast('弹窗被拦截：' + location.origin + u);
+  }
+};
 </script>
 </body>
 </html>
