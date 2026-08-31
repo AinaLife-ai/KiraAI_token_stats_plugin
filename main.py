@@ -2522,21 +2522,6 @@ class TokenStatsPlugin(BasePlugin):
                 total["units"][ukey] = total["units"].get(ukey, 0.0) + amt
                 total["matched"] = True
 
-        def dim(d):
-            arr = [{"k": k, **v} for k, v in d.items()]
-            arr.sort(key=lambda x: x["v"], reverse=True)
-            return arr[:20]
-
-        async def dim_sid(d):
-            arr = [{"k": k, **v} for k, v in d.items()]
-            arr.sort(key=lambda x: x["v"], reverse=True)
-            out = arr[:20]
-            uniq = sorted({x["k"] for x in out if x["k"]})
-            nmap = dict(zip(uniq, await asyncio.gather(*(self._resolve_sid_name(s) for s in uniq))))
-            for x in out:
-                x["name"] = nmap.get(x["k"], "")
-            return out
-
         def fmt_cost(a):
             bits = []
             if a.get("matched"):
@@ -2544,6 +2529,21 @@ class TokenStatsPlugin(BasePlugin):
                     _, _, uu = ukey.partition("|")
                     bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
             return " + ".join(bits) if bits else None
+
+        def dim(d):
+            arr = [{"k": k, **v, "cost": fmt_cost(v)} for k, v in d.items()]
+            arr.sort(key=lambda x: x["v"], reverse=True)
+            return arr[:20]
+
+        async def dim_sid(d):
+            arr = [{"k": k, **v, "cost": fmt_cost(v)} for k, v in d.items()]
+            arr.sort(key=lambda x: x["v"], reverse=True)
+            out = arr[:20]
+            uniq = sorted({x["k"] for x in out if x["k"]})
+            nmap = dict(zip(uniq, await asyncio.gather(*(self._resolve_sid_name(s) for s in uniq))))
+            for x in out:
+                x["name"] = nmap.get(x["k"], "")
+            return out
 
         return {
             "from": frm, "to": to,
@@ -2732,7 +2732,7 @@ class TokenStatsPlugin(BasePlugin):
                     "r": hr["r"], "v": hr["v"], "i": hr["i"], "o": hr["o"], "c": hr["c"], "e": hr["e"],
                     "models": self._bucket_fee_models(hr["aggs"]),
                 })
-            top = self._all_top_models()
+            top = self._all_top_models(day, day)
             return {"from": day, "to": day, "day": day, "unit": "hour", "days": hours, "topModels": top}
 
         if day and hour_s.isdigit() and day in self._mins:
@@ -2745,7 +2745,7 @@ class TokenStatsPlugin(BasePlugin):
                         if not mb:
                             continue
                         buckets.append({
-                            "d": f"{day} {h:02d}:{m5 * 5:02d}", "m": m5,
+                            "d": f"{day} {h:02d}:{m5 * 5:02d}", "h": h, "m": m5,
                             "r": mb["r"], "v": mb["v"], "i": mb["i"], "o": mb["o"], "c": mb["c"], "e": mb["e"],
                             "models": self._bucket_fee_models(mb["aggs"]),
                         })
@@ -2753,9 +2753,12 @@ class TokenStatsPlugin(BasePlugin):
                 return {"from": day, "to": day, "day": day, "hour": h, "unit": "min5",
                         "days": buckets, "topModels": top}
 
-        # 按天（原逻辑）
+        # 按天（内存按天聚合 self._days 现算，零磁盘扫描；缺天补 0 桶；total 超 62 天按月聚合）
         if range_key == "total" or range_key == "all":
-            frm, to = "0000-01-01", "9999-12-31"
+            if self._days:
+                frm, to = min(self._days.keys()), max(self._days.keys())
+            else:
+                frm, to = today, today
         elif range_key == "d30":
             frm, to = (now - timedelta(days=29)).strftime("%Y-%m-%d"), today
         elif range_key == "today":
@@ -2763,33 +2766,61 @@ class TokenStatsPlugin(BasePlugin):
         else:
             frm, to = (now - timedelta(days=6)).strftime("%Y-%m-%d"), today
 
-        buckets = {}
+        day_keys = sorted(k for k in self._days if frm <= k <= to)
+        span = len(day_keys)
         top_models = {}
-        for r in self._read_records():
+        if span > 62:
+            # 累计且跨度大 → 按月聚合（避免上百根柱）
+            mbuckets = {}
+            for dk in day_keys:
+                mk2 = dk[:7]
+                b = mbuckets.setdefault(mk2, {"d": mk2, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
+                                              "_aggs": {}, "_models": {}})
+                src = self._days[dk]
+                for kk in ("r", "v", "i", "o", "c", "e"):
+                    b[kk] += src[kk]
+                for m in self._bucket_fee_models(src["aggs"]):
+                    bm = b["_models"].setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
+                    bm["cny"] += m["cny"]; bm["pts"] += m["pts"]
+                    tm = top_models.setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
+                    tm["cny"] += m["cny"]; tm["pts"] += m["pts"]
+            days = []
+            for mk2 in sorted(mbuckets.keys()):
+                b = mbuckets[mk2]
+                b["models"] = sorted(b.pop("_models").values(),
+                                     key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
+                b.pop("_aggs", None)
+                days.append(b)
+            unit = "month"
+        else:
+            # 从 frm 到 to 逐日补齐 0 值桶（漏天不错位）
+            days = []
             try:
-                t = _parse_ts(r["t"])
-            except Exception:
-                continue
-            d = t.strftime("%Y-%m-%d")
-            if d < frm or d > to:
-                continue
-            i, o, c, v = r.get("i", 0), r.get("o", 0), r.get("c", 0), r.get("v", 0)
-            rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
-            amt, cur = _rule_cost_ex(rule, i, o, c, t) if rule else (None, "CNY")
-            b = buckets.setdefault(d, {"d": d, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0})
-            b["r"] += 1; b["v"] += v; b["i"] += i; b["o"] += o; b["c"] += c
-            b["e"] += max(0, int(r.get("e", 0) or 0))
-            mk = r.get("m", "") or "未知"
-            tm = top_models.setdefault(mk, {"name": mk, "cny": 0.0, "pts": 0.0})
-            if amt is not None:
-                if cur == "积分":
-                    tm["pts"] += amt
-                else:
-                    tm["cny"] += amt
-
-        days = [buckets[k] for k in sorted(buckets.keys())]
+                d0 = datetime.strptime(frm, "%Y-%m-%d")
+                d1 = datetime.strptime(to, "%Y-%m-%d")
+                cur_d = d0
+                while cur_d <= d1:
+                    dk = cur_d.strftime("%Y-%m-%d")
+                    src = self._days.get(dk)
+                    if src:
+                        models_l = self._bucket_fee_models(src["aggs"])
+                        days.append({"d": dk, "r": src["r"], "v": src["v"], "i": src["i"],
+                                     "o": src["o"], "c": src["c"], "e": src["e"], "models": models_l})
+                        for m in models_l:
+                            tm = top_models.setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
+                            tm["cny"] += m["cny"]; tm["pts"] += m["pts"]
+                    else:
+                        days.append({"d": dk, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "models": []})
+                    cur_d += timedelta(days=1)
+            except ValueError:
+                for dk in day_keys:
+                    src = self._days[dk]
+                    days.append({"d": dk, "r": src["r"], "v": src["v"], "i": src["i"],
+                                 "o": src["o"], "c": src["c"], "e": src["e"],
+                                 "models": self._bucket_fee_models(src["aggs"])})
+            unit = "day"
         models = sorted(top_models.values(), key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
-        return {"from": frm, "to": to, "unit": "day", "days": days, "topModels": models}
+        return {"from": frm, "to": to, "unit": unit, "days": days, "topModels": models}
 
     def _bucket_fee_models(self, aggs: dict):
         """桶内按模型聚合费用（内存 aggs 现算，无磁盘扫描）→ [{name,cny,pts}] Top8"""
@@ -2819,14 +2850,18 @@ class TokenStatsPlugin(BasePlugin):
         arr = sorted(per.values(), key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
         return [x for x in arr if x["cny"] or x["pts"]]
 
-    def _all_top_models(self):
-        """全局 Top8 模型（费用分色图例用）"""
+    def _all_top_models(self, frm: str = "", to: str = ""):
+        """Top8 模型（费用分色图例用）；frm/to 非空时只统计该日期范围（按天）"""
         top = {}
         for r in self._read_records():
             try:
                 t = _parse_ts(r["t"])
             except Exception:
                 continue
+            if frm or to:
+                d = t.strftime("%Y-%m-%d")
+                if (frm and d < frm) or (to and d > to):
+                    continue
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
             amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t) if rule else (None, "CNY")
             if amt is None:
@@ -3218,9 +3253,13 @@ tr.cur td{background:rgba(52,211,153,.07)}
 .trend{display:flex;align-items:flex-end;gap:3px;height:150px;padding:6px 0 0;position:relative}
 .trend .col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;position:relative;cursor:pointer;min-width:0}
 .trend .col:hover .tip{opacity:1}
-.trend .stack{border-radius:2px 2px 0 0;width:100%}
+.trend .stk{display:flex;flex-direction:column;justify-content:flex-end;width:100%}
+.trend .stack{border-radius:2px 2px 0 0;width:100%;transition:filter .15s}
+.trend .col:hover .stack{filter:brightness(1.3)}
+.trend .hitsvg{position:absolute;left:0;top:6px;width:100%;height:calc(100% - 22px);pointer-events:none;overflow:visible}
 .trend .tlbl{text-align:center;font-size:10px;color:var(--dim);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .trend .tip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11px;white-space:nowrap;opacity:0;transition:.15s;z-index:20;pointer-events:none;color:var(--fg)}
+.trend .tip.flip{left:auto;right:0;transform:none}
 .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--dim)}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 .hitline{position:absolute;left:0;right:0;height:1px;background:rgba(167,139,250,.4);pointer-events:none}
@@ -3485,49 +3524,66 @@ async function loadTrend(r){
   if(curDay && curHour===null) url = '/trend?day='+curDay;   // 后端按天(day=)返回小时桶
   if(curDay && curHour!==null) url = '/trend?day='+curDay+'&hour='+curHour; // 后端按小时(day+hour=)返回5分钟桶
   const d = await jget(url);
-  const isDay = !!curDay && curHour===null, isMin = !!curDay && curHour!==null;
+  const isDay = !!curDay && curHour===null, isMin = !!curDay && curHour!==null, isMonth = !curDay && d.unit==='month';
   $('#trendRange').textContent = isMin ? ('单小时 '+curDay+' '+String(curHour).padStart(2,'0')+':00 按5分钟（点柱 → 查看该时段记录）')
     : isDay ? ('单天 '+curDay+' 按小时（点柱 → 下钻5分钟/看记录）')
+    : isMonth ? (d.from+' ~ '+d.to+'（按月聚合）')
     : (d.from+' ~ '+d.to+'（点柱 → 下钻该天按小时）');
   $('#trendBack').style.display = (curDay||curHour!==null) ? '' : 'none';
   const days = d.days||[], models = d.topModels||[];
   if(!days.length){ $('#trend').innerHTML='<div class="note" style="padding:20px">该范围暂无数据</div>'; $('#trendLegend').innerHTML=''; $('#trendNote').textContent=''; return; }
   const maxV = Math.max(...days.map(x=>x.v),1);
+  // 图例色与柱色统一：按 topModels 顺序建立 name→color 映射
+  const colorOf = {};
+  models.forEach((m,i)=>{ colorOf[m.name] = MODEL_COLORS[i%8]; });
   const legend = [];
-  models.forEach((m,i)=>{ if(m.cny||m.pts) legend.push('<span><i style="background:'+MODEL_COLORS[i%8]+'"></i>'+esc(m.name)+'</span>'); });
+  models.forEach(m=>{ if(m.cny||m.pts) legend.push('<span><i style="background:'+colorOf[m.name]+'"></i>'+esc(m.name)+'</span>'); });
   legend.push('<span><i style="background:#334155"></i>未计价</span>');
+  legend.push('<span><i style="background:transparent;border-top:2px dashed var(--purple);border-radius:0;height:0;width:14px;vertical-align:2px"></i>缓存命中率</span>');
   $('#trendLegend').innerHTML = legend.join('');
-  $('#trendNote').textContent = '柱高=总量，堆叠色=Top8 模型费用分色；紫色虚线=缓存命中率（右轴 0-100%）。'+(isMin?'当前为单小时按5分钟桶。':(isDay?'当前为单天按小时桶。':''))+'点柱：'+(isMin?'→ 查看该时段记录':(isDay?'→ 下钻该小时按5分钟':'→ 下钻该天按小时'))+'；「← 返回」逐级回退。';
-  const rows = days.map(x=>{
+  $('#trendNote').textContent = '柱高=总量，堆叠色=Top8 模型费用分色；紫色虚线=缓存命中率（右轴 0-100%）。'+(isMin?'当前为单小时按5分钟桶。':(isDay?'当前为单天按小时桶。':(isMonth?'当前为按月聚合，不可下钻。':'')))+(isMonth?'':'点柱：'+(isMin?'→ 查看该时段记录':(isDay?'→ 下钻该小时按5分钟':'→ 下钻该天按小时'))+'；「← 返回」逐级回退。');
+  const N = days.length;
+  const rows = days.map((x,xi)=>{
     const stack = [];
     const bm = x.models||[];
     if(bm.length){
       const total = bm.reduce((s,m)=>s+m.cny+(m.pts||0)/500,0);
       if(total>0){
-        bm.forEach((m,i)=>{
+        bm.forEach(m=>{
           const w = (m.cny+(m.pts||0)/500)/total*100;
           if(w<0.3) return;
-          stack.push('<div class="stack" style="height:'+w+'%;background:'+MODEL_COLORS[i%8]+'" title="'+esc(m.name)+'"></div>');
+          stack.push('<div class="stack" style="height:'+w+'%;background:'+(colorOf[m.name]||'#334155')+'" title="'+esc(m.name)+'"></div>');
         });
       }
     }
     if(!stack.length) stack.push('<div class="stack" style="height:100%;background:#334155"></div>');
     const rate = x.i>0 ? (x.c/x.i*100) : 0;
     const costLine = bm.length ? bm.slice(0,3).map(m=>esc(m.name)+' ¥'+m.cny.toFixed(2)).join(' · ') : '';
-    const tip = '<div class="tip">'+(x.d)+(x.h!=null?' 时':'')+(x.m!=null?':'+String(x.m*5).padStart(2,'0'):'')+'<br>'+(x.r)+' 轮 · '+fmt4(x.v)+' Token<br>输入 '+fmt(x.i)+' · 输出 '+fmt(x.o)+' · 缓存 '+fmt(x.c)+'<br>命中率 <span class="rate">'+rate.toFixed(1)+'%</span>'+(x.e?' · 出错 '+x.e:'')+(costLine?'<br>'+costLine:'')+'</div>';
-    return '<div class="col" data-d="'+esc(x.d)+'" data-h="'+(x.h!=null?x.h:'')+'" data-m="'+(x.m!=null?x.m:'')+'">'+tip+'<div style="display:flex;flex-direction:column;justify-content:flex-end;height:100%">'+
+    const tip = '<div class="tip'+(xi>=N*0.7?' flip':'')+'">'+(x.d)+(x.h!=null&&isDay?' 时':'')+(x.m!=null?':'+String(x.m*5).padStart(2,'0'):'')+'<br>'+(x.r)+' 轮 · '+fmt4(x.v)+' Token<br>输入 '+fmt(x.i)+' · 输出 '+fmt(x.o)+' · 缓存 '+fmt(x.c)+'<br>命中率 <span class="rate">'+rate.toFixed(1)+'%</span>'+(x.e?' · 出错 '+x.e:'')+(costLine?'<br>'+costLine:'')+'</div>';
+    const hgt = x.v>0 ? Math.max(2, x.v/maxV*100) : 0;
+    const lbl = isMonth ? x.d : (x.d.length>10?x.d.slice(x.d.length-5):x.d);
+    return '<div class="col" data-d="'+esc(x.d)+'" data-h="'+(x.h!=null?x.h:'')+'" data-m="'+(x.m!=null?x.m:'')+'">'+tip+'<div class="stk" style="height:'+hgt+'%">'+
       (stack.join(''))+'</div>'+
-      '<div class="tlbl">'+esc(x.d.length>10?x.d.slice(x.d.length-5):x.d)+'</div></div>';
+      '<div class="tlbl">'+esc(lbl)+'</div></div>';
   }).join('');
-  $('#trend').innerHTML = rows;
-  document.querySelectorAll('#trend .col').forEach(c=>c.onclick=()=>{
-    const d = c.dataset.d, h = c.dataset.h, m = c.dataset.m;
-    if(!curDay){ curDay = d.slice(0,10); loadTrend(); }
-    else if(curDay && curHour===null && h!==''){ curHour = parseInt(h,10); loadTrend(); }
-    else { // 5分钟桶 → 跳记录并过滤该时段
-      showTab('rec');
-      filterRecBySlot(d.slice(0,10), parseInt(h,10), m===''?null:parseInt(m,10));
-    }
+  // 缓存命中率折线（内联 SVG，紫色虚线，右轴 0-100%）
+  const hitPts = days.map((x,xi)=>{
+    const rate = x.i>0 ? (x.c/x.i*100) : 0;
+    return ((xi+0.5)/N*100).toFixed(2)+','+(100-Math.min(100,rate)).toFixed(2);
+  }).join(' ');
+  const hitSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+hitPts+'" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 2" vector-effect="non-scaling-stroke" opacity=".85"/></svg>';
+  $('#trend').innerHTML = rows + hitSvg;
+  document.querySelectorAll('#trend .col').forEach(c=>{
+    if(isMonth) return; // 按月聚合不可下钻
+    c.onclick=()=>{
+      const d = c.dataset.d, h = c.dataset.h, m = c.dataset.m;
+      if(!curDay){ curDay = d.slice(0,10); loadTrend(); }
+      else if(curDay && curHour===null && h!==''){ curHour = parseInt(h,10); loadTrend(); }
+      else { // 5分钟桶 → 跳记录并过滤该时段
+        showTab('rec');
+        filterRecBySlot(d.slice(0,10), h===''?null:parseInt(h,10), m===''?null:parseInt(m,10));
+      }
+    };
   });
 }
 
