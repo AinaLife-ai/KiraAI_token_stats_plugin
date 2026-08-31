@@ -151,7 +151,7 @@
             "out_off": 13.5
           }
         ],
-        "hint": "推荐在 WebUI 侧边栏「Token 用量 → 价格规则」页可视化编辑（添加/编辑/删除），无需手写 JSON。字段说明：每条规则 = {name, url_match(可选), channel_match(可选), model_match(可选), currency(可选：CNY=元/百万tokens 默认，积分=积分/百万tokens 如京东积分制渠道), peak_enabled, hit_peak, hit_off, miss_peak, miss_off, out_peak, out_off}。匹配加权：URL命中=4分，模型=2分，渠道名=1分，取最高分规则。峰谷时段可在 WebUI 价格规则页自定义（peak_windows 字段，格式 [[\"09:00\",\"12:00\"],...]，默认工作日 09:00-12:00、14:00-18:00 为峰，其余谷）。双币种费用分桶累计，永不混算。建议按 URL（endpoint 域名）配置"
+        "hint": "推荐在 WebUI 侧边栏「Token 用量 → 价格规则」页可视化编辑（添加/编辑/删除），无需手写 JSON。字段说明：每条规则 = {name, url_match(可选), channel_match(可选), model_match(可选), currency(可选：CNY=元/百万tokens 默认，积分=积分/百万tokens 如京东积分制渠道), peak_enabled, peak_profile(可选：峰谷方案名，默认「默认工作日」), enabled(可选：false=禁用该规则), hit_peak, hit_off, miss_peak, miss_off, out_peak, out_off}。匹配加权：URL命中=4分，模型=2分，渠道名=1分，取最高分规则（禁用规则不参与匹配）。峰谷方案库在 WebUI 价格规则页管理（peak_profiles 字段，格式 [{\"name\":\"方案名\",\"windows\":[[\"09:00\",\"12:00\"],...]}]，每条规则可选自己的方案）。双币种费用分桶累计，永不混算。建议按 URL（endpoint 域名）配置"
       }
     }
   },
@@ -177,7 +177,7 @@
         "name": "轮询间隔（分钟）",
         "default": 1,
         "minimum": 1,
-        "hint": "默认 1 分钟，最小 1 分钟。工具/命令查询时会先即时探测，不受此间隔限制"
+        "hint": "默认 1 分钟，最小 1 分钟。可在 WebUI 侧边栏「Token 用量 → 余额监测」页直接修改。工具/命令查询时会先即时探测，不受此间隔限制"
       },
       "balance_unit": {
         "type": "string",
@@ -314,8 +314,8 @@
       "enable_widget": {
         "type": "switch",
         "name": "启用挂件",
-        "default": false,
-        "hint": "默认关闭。开启后侧边栏出现「Token 挂件」页：迷你悬浮卡片（实时会话/今日 tokens、费用、余额），可拖动（位置记忆）、可折叠成小球、可弹出独立小窗（⧉ 按钮，浏览器允许弹窗后即成为真正可拖动的独立挂件窗口），适合浏览器小窗钉角落常驻或 OBS 采集"
+        "default": true,
+        "hint": "默认开启。侧边栏出现「Token 挂件」页：迷你悬浮卡片（实时会话/今日 tokens、费用、余额），可拖动（位置记忆）、可折叠成小球、可弹出独立小窗（⧉ 按钮，浏览器允许弹窗后即成为真正可拖动的独立挂件窗口），适合浏览器小窗钉角落常驻或 OBS 采集"
       },
       "widget_compact": {
         "type": "switch",
