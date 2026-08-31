@@ -2577,7 +2577,7 @@ class TokenStatsPlugin(BasePlugin):
             }
             # 配置字段（可视化编辑器回填用，含禁用源）
             for k in ("url", "api_key", "api_user", "json_path", "quota_conversion",
-                      "daily_quota", "anchor_balance", "refresh_time", "anchor_at"):
+                      "daily_quota", "anchor_balance", "refresh_time", "anchor_at", "model_ref"):
                 v = src.get(k)
                 if v is not None:
                     item[k] = v
