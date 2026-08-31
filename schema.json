@@ -36,22 +36,22 @@
     "collapsed": true,
     "fields": {
       "source_default": {
-        "type": "string",
-        "name": "默认来源名",
-        "default": "system",
-        "hint": "无法判定来源时的兜底标签"
+        "type": "list",
+        "name": "默认来源标签（可多填）",
+        "default": ["system"],
+        "hint": "无法判定来源时的兜底标签。支持多填：第一个为主标签（实际归类用），其余作为备选/别名。兼容旧配置的单个字符串"
       },
       "source_group": {
-        "type": "string",
-        "name": "群聊来源名",
-        "default": "gm",
-        "hint": "群聊消息用量的来源标签（默认对齐 KiraAI 会话类型 gm，可自定义）"
+        "type": "list",
+        "name": "群聊来源标签（可多填）",
+        "default": ["gm"],
+        "hint": "群聊消息用量的来源标签（默认对齐 KiraAI 会话类型 gm，可自定义）。支持多填：第一个为主标签，其余为别名。兼容旧配置的单个字符串"
       },
       "source_dm": {
-        "type": "string",
-        "name": "私聊来源名",
-        "default": "dm",
-        "hint": "私聊消息用量的来源标签"
+        "type": "list",
+        "name": "私聊来源标签（可多填）",
+        "default": ["dm"],
+        "hint": "私聊消息用量的来源标签。支持多填：第一个为主标签，其余为别名。兼容旧配置的单个字符串"
       }
     }
   },
