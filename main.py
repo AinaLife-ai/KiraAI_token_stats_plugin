@@ -518,7 +518,8 @@ class TokenStatsPlugin(BasePlugin):
 
         # 工具结果失败统计（on.tool_result 钩子）：{day: count}
         self._tool_err_hist = {}
-        self._tool_err_last = {"at": "", "tool": "", "text": ""}
+        # 注：ToolResult 无工具名字段，只记时间+文本
+        self._tool_err_last = {"at": "", "text": ""}
 
         # exact_match 透传：模块级 flag（单实例插件可接受），匹配器全插件生效
         global _EXACT_MATCH
@@ -922,7 +923,6 @@ class TokenStatsPlugin(BasePlugin):
         self._tool_err_hist[day] = self._tool_err_hist.get(day, 0) + 1
         self._tool_err_last = {
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "tool": "",
             "text": text.replace("\r", " ").replace("\n", " ").strip()[:160],
         }
         if self.debug_log:
