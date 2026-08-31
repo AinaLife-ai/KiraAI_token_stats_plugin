@@ -3372,7 +3372,6 @@ tr.cur td{background:rgba(52,211,153,.07)}
 .trend .tip.flip{left:auto;right:0;transform:none}
 .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--dim)}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
-.hitline{position:absolute;left:0;right:0;height:1px;background:rgba(167,139,250,.4);pointer-events:none}
 </style>
 </head>
 <body>
