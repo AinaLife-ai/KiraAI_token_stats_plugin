@@ -1907,16 +1907,6 @@ class TokenStatsPlugin(BasePlugin):
 
     # ── 查询回复构建（命令 / 工具共用）──
 
-    def _fmt_cost_part(self, cny, pts, matched):
-        """双币种费用文本：分别展示，永不混算（旧接口兼容）"""
-        parts = []
-        if matched:
-            if cny:
-                parts.append(f"费用 ¥{cny:.4f}")
-            if pts:
-                parts.append(f"积分 {pts:,.4f}")
-        return " · ".join(parts)
-
     def _fmt_cost_units(self, units: dict) -> str:
         """按 (币种, 显示单位) 分桶的费用文本：单位留空=只显示数字"""
         parts = []
@@ -2374,9 +2364,8 @@ class TokenStatsPlugin(BasePlugin):
             if st["ok"]:
                 bal_summary["ok"] += 1
                 if not bal_summary["current"]:
-                    cur = st.get("currency") or "CNY"
-                    unit = "积分" if cur == "积分" else self.balance_unit
-                    bal_summary["current"] = f"{src.get('name', '')} {st['balance']:.2f} {unit}"
+                    unit = self._src_unit(src)
+                    bal_summary["current"] = f"{src.get('name', '')} {st['balance']:.2f}" + (f" {unit}" if unit else "")
 
         return {
             "model": model,
@@ -2721,10 +2710,12 @@ class TokenStatsPlugin(BasePlugin):
                 continue
             item = {"name": name, "type": (str(s.get("type") or "auto").strip().lower() or "auto"),
                     "enabled": bool(s.get("enabled", True))}
-            for k in ("url", "api_key", "api_user", "json_path", "currency", "model_ref", "unit"):
+            for k in ("url", "api_key", "api_user", "json_path", "currency", "model_ref"):
                 v = s.get(k)
                 if v not in (None, ""):
                     item[k] = str(v).strip()
+            if "unit" in s and s.get("unit") is not None:
+                item["unit"] = str(s.get("unit") or "").strip()
             for k in ("quota_conversion", "daily_quota", "anchor_balance"):
                 v = s.get(k)
                 if v not in (None, ""):
@@ -2805,10 +2796,12 @@ class TokenStatsPlugin(BasePlugin):
                 continue
             item = {"name": name, "peak_enabled": bool(r.get("peak_enabled", True)),
                     "enabled": r.get("enabled", True) != False}
-            for k in ("url_match", "model_match", "channel_match", "currency", "peak_profile", "unit"):
+            for k in ("url_match", "model_match", "channel_match", "currency", "peak_profile"):
                 v = r.get(k)
                 if v not in (None, ""):
                     item[k] = str(v).strip()
+            if "unit" in r and r.get("unit") is not None:
+                item["unit"] = str(r.get("unit") or "").strip()
             for k in ("hit_peak", "hit_off", "miss_peak", "miss_off", "out_peak", "out_off"):
                 v = r.get(k)
                 if v not in (None, ""):
@@ -3421,10 +3414,12 @@ function priceEditOpen(i){
     if(!item.name){ alert('请填写规则名称'); return; }
     PRICE_FIELDS.slice(1).forEach(f=>{
       const el = $('#pf_'+f[0]);
-      if(!el || el.value.trim()==='') return;
+      if(!el) return;
       const v = el.value.trim();
+      if(f[0]==='unit'){ item.unit = v; return; }
+      if(v==='') return;
       if(f[0]==='currency') item.currency = v;
-      else if(f[0]==='url_match'||f[0]==='model_match'||f[0]==='channel_match'||f[0]==='unit') item[f[0]] = v;
+      else if(f[0]==='url_match'||f[0]==='model_match'||f[0]==='channel_match') item[f[0]] = v;
       else { const n = parseFloat(v); if(!isNaN(n)) item[f[0]] = n; }
     });
     if(priceEditIdx>=0 && priceRules[priceEditIdx]) priceRules[priceEditIdx] = item;
@@ -3596,7 +3591,10 @@ function balEditOpen(i){
     if(!item.name){ alert('请填写名称'); return; }
     (BAL_FIELDS[t]||[]).forEach(f=>{
       const el = $('#bf_'+f[0]);
-      if(el && el.value.trim()!=='') item[f[0]] = el.value.trim();
+      if(!el) return;
+      const v = el.value.trim();
+      if(f[0]==='unit'){ item.unit = v; return; }
+      if(v!=='') item[f[0]] = v;
     });
     const ha = $('#bf_anchor_at');
     if(ha && ha.value) item.anchor_at = ha.value;
