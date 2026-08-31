@@ -109,6 +109,17 @@ TOOL_ERR_RE = re.compile(
 # （如"工具结果失败：N 次"、"最近出错：…"）但并非工具执行失败，排除自报避免统计污染
 _SELF_TOOL_RE = re.compile(r"^(?:【Token 用量统计】|【用量·|【最近轮次】)")
 
+# LLM 响应内自报片段剥离：bot 转述本插件统计结果时带「出错：」字样
+# （如"最近出错：Merge facts error"、"出错标记合计：3"、"工具结果失败：2 次"、
+# "后台日志错误：…"），并非真实错误，扫描前剥离避免自增；
+# 非贪婪+标点边界：只吃到句号/换行即停，避免吞掉后面的真实错误
+_SELF_REPORT_RE = re.compile(
+    r"最近出错：[^\n]*?(?=[。\n]|$)"
+    r"|出错标记合计：[^\n]*?(?=[。\n]|$)"
+    r"|工具结果失败：[^\n]*?(?=[。\n]|$)"
+    r"|后台日志错误：[^\n]*?(?=[。\n]|$)"
+)
+
 # AI 回注文本硬上限（正常结果 1-2K 字符，防御性兜底防 Poke 回注撑爆上下文）
 AI_OUTPUT_LIMIT = 4000
 
@@ -867,6 +878,8 @@ class TokenStatsPlugin(BasePlugin):
 
         # 错误统计（errScanPos：位置游标，工具循环同一段「出错：」不重复计数）
         text = (resp.text_response or "") or ""
+        # 剥离本插件统计结果的自报片段（bot 转述"最近出错：…/出错标记合计：N"不算真实错误）
+        text = _SELF_REPORT_RE.sub("", text)
         pending = self._pending.get(sid)
         if pending is None:
             pending = self._pending[sid] = {"text": "", "source": None, "steps": 0, "at": time.time()}
