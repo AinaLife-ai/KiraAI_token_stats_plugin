@@ -313,6 +313,16 @@ def _rule_cost(r: dict, input_t: int, output_t: int, cached_t: int, t: datetime)
 _IO_LOCK = threading.RLock()
 
 
+def _mask_api_key(key: str) -> str:
+    """API Key 掩码：sk-****xxxx（短 key 全掩码）"""
+    if not key:
+        return ""
+    if len(key) <= 7:
+        return "****"
+    head = key[:3] if "-" not in key[:6] else key[:key.index("-") + 1]
+    return f"{head}****{key[-4:]}"
+
+
 def _read_jsonl(path: Path):
     recs = []
     if not path.exists():
@@ -332,36 +342,61 @@ def _read_jsonl(path: Path):
     return recs
 
 
+# JSONL 行数内存计数（启动时数一次，此后增量），避免每写一条全量读盘
+_JSONL_LINES: dict = {}
+# 发生过裁剪的日志文件集合（估算余额据此提示早期计费缺失）
+_LOG_TRIMMED: set = set()
+
+
 def _append_jsonl(path: Path, rec: dict, max_size: int = 0):
     try:
         with _IO_LOCK:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            # 裁剪：超过 max_size 条时保留最新（0 = 不裁剪）
+            # 裁剪：超过 max_size 20% 才裁一次，只保留尾部（0 = 不裁剪）；
+            # 行数走内存计数（首次读一次盘），避免每条都全量读盘 + O(N²) 重写
             if max_size and max_size > 0:
-                lines = path.read_text(encoding="utf-8").splitlines()
-                if len(lines) > max_size:
-                    path.write_text("\n".join(lines[-max_size:]) + "\n", encoding="utf-8")
+                key = str(path)
+                n = _JSONL_LINES.get(key)
+                if n is None:
+                    try:
+                        n = len(path.read_text(encoding="utf-8").splitlines())
+                    except Exception:
+                        n = 0
+                n += 1
+                if n > max_size * 1.2:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                    if len(lines) > max_size:
+                        path.write_text("\n".join(lines[-max_size:]) + "\n", encoding="utf-8")
+                        _LOG_TRIMMED.add(key)
+                        n = max_size
+                _JSONL_LINES[key] = n
     except Exception as e:
         logger.warning(f"[token_stats] 日志写入失败: {e}")
 
 
 def _parse_ts(s: str):
-    """日志时间戳解析：兼容 3/6 位微秒（Python 3.10- 的 fromisoformat 只认 6 位）"""
+    """日志时间戳解析：兼容 3/6 位微秒（Python 3.10- 的 fromisoformat 只认 6 位）；
+    带时区的 aware 时间统一去 tzinfo（丢弃偏移），避免与本地 naive 时间比较炸 TypeError"""
     if not s:
         raise ValueError("empty timestamp")
+    dt = None
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except ValueError:
         pass
-    if "." in s:
+    if dt is None and "." in s:
         try:
             head, frac = s.split(".", 1)
             frac = (frac + "000000")[:6]
-            return datetime.fromisoformat(f"{head}.{frac}")
+            dt = datetime.fromisoformat(f"{head}.{frac}")
         except ValueError:
             pass
-    raise ValueError(f"bad timestamp: {s}")
+    if dt is None:
+        raise ValueError(f"bad timestamp: {s}")
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
 
 
 def _fmt_ts(dt: datetime) -> str:
@@ -402,15 +437,17 @@ def _last_refresh(now: datetime, refresh_time: str) -> datetime:
 
 
 def _grant_count(since: datetime, now: datetime, refresh_time: str) -> int:
-    """since（严格大于）之后到 now 的刷新发放次数"""
+    """since（严格大于）之后到 now 的刷新发放次数（除法直算，不逐日循环）"""
     h, m = _parse_hhmm(refresh_time)
-    count = 0
-    t = since.replace(hour=h, minute=m, second=0, microsecond=0)
-    while t <= now:
-        if t > since:
-            count += 1
-        t += timedelta(days=1)
-    return count
+    first = since.replace(hour=h, minute=m, second=0, microsecond=0)
+    if first <= since:
+        first += timedelta(days=1)
+    last = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if last > now:
+        last -= timedelta(days=1)
+    if first > last:
+        return 0
+    return (last.date() - first.date()).days + 1
 # ────────────────────────────────────────────────────────────
 # 插件主类
 # ────────────────────────────────────────────────────────────
@@ -578,12 +615,16 @@ class TokenStatsPlugin(BasePlugin):
         self._hours = {}
         # 5 分钟桶：{day: [None]*24 each [None]*12 each {r,v,i,o,c,e, aggs}}（时间趋势最深层下钻）
         self._mins = {}
-        # 会话窗口（滚动）：
+        # 会话窗口（滚动）：按 sid 各维护一个有界 LRU 窗口（多群交替互不清零）；
+        # self._sess 始终指向最近活跃会话的窗口（/stats 展示用）
+        self._sess_map = {}
+        self._sess_map_max = 20
         self._sess = {
             "start": time.time(), "last": time.time(),
             "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
             "aggs": {}, "sid": "",
         }
+        self._sess_map[""] = self._sess
         self._last_err_text = ""
         self._last_err_at = None
         self._cur_source = self.source_default
@@ -601,7 +642,11 @@ class TokenStatsPlugin(BasePlugin):
 
         # 热读缓存（4.9.x）：按 mtime+length 判失效；多端点轮询共享
         self._rec_cache = {"path": None, "mtime": None, "len": -1, "list": None}
-        self._rec_cache_lock = asyncio.Lock()
+
+        # 费用/估算计算缓存：记录数+最大时间戳+规则 hash 未变则直接复用（H1/H3）
+        self._rules_hash = ""
+        self._since_cost_cache = {}   # (url,name,model_ref,since_iso) → (fingerprint, cny, pts, matched)
+        self._range_scan_cache = {}   # (frm,to) → (fingerprint, result)
 
         # 出错统计游标（errScanPos）：{sid: (prev_text, prev_end)}，工具循环续轮不重复计数
         self._err_cursor = {}
@@ -706,6 +751,19 @@ class TokenStatsPlugin(BasePlugin):
     def _invalidate_rec_cache(self):
         self._rec_cache["list"] = None
 
+    def _calc_fingerprint(self, recs=None):
+        """计算结果缓存指纹：记录数 + 最新时间戳 + 规则内容 hash，任一变化即失效重算"""
+        if recs is None:
+            recs = self._read_records()
+        try:
+            rh = hash(json.dumps(self.rules or [], sort_keys=True, ensure_ascii=False))
+        except Exception:
+            rh = id(self.rules)
+        if rh != self._rules_hash:
+            self._rules_hash = rh
+        last_t = recs[-1].get("t", "") if recs else ""
+        return (len(recs), last_t, rh)
+
     def _apply_rec(self, rec: dict):
         try:
             t = _parse_ts(rec.get("t", ""))
@@ -759,17 +817,25 @@ class TokenStatsPlugin(BasePlugin):
 
     def _apply_session(self, rec: dict):
         now = time.time()
-        # 会话窗口滚动：超过 idle 分钟无新记录 → 重置
         sid = rec.get("sid", "") or ""
-        # 会话窗口滚动：超过 idle 分钟无新记录，或切换到其他会话 → 重置
-        if (now - self._sess["last"] > self.session_idle_minutes * 60) or (sid and sid != self._sess.get("sid")):
-            self._sess = {
+        # 按 sid 各维护会话窗口（LRU）：多群交替互不清零；同会话超 idle 才重置
+        s = self._sess_map.get(sid)
+        if s is None:
+            s = {
                 "start": now, "last": now,
                 "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}, "sid": sid,
             }
-        self._sess["last"] = now
-        self._sess["sid"] = sid
-        s = self._sess
+            self._sess_map[sid] = s
+        else:
+            # LRU：移到末尾（最近活跃）
+            self._sess_map[sid] = self._sess_map.pop(sid)
+            if now - s["last"] > self.session_idle_minutes * 60:
+                s.update({"start": now, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}})
+        while len(self._sess_map) > self._sess_map_max:
+            self._sess_map.pop(next(iter(self._sess_map)))
+        s["last"] = now
+        s["sid"] = sid
+        self._sess = s
         s["r"] += 1
         s["v"] += rec["v"]; s["i"] += rec["i"]; s["o"] += rec["o"]; s["c"] += rec["c"]
         s["e"] += rec.get("e", 0)
@@ -799,8 +865,9 @@ class TokenStatsPlugin(BasePlugin):
 
     def _save_bal_states(self):
         try:
-            self._bal_state_path.write_text(
-                json.dumps(self._bal_states, ensure_ascii=False), encoding="utf-8")
+            tmp = self._bal_state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._bal_states, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._bal_state_path)  # 原子写：防中途断电写坏
         except Exception:
             pass
 
@@ -1126,7 +1193,13 @@ class TokenStatsPlugin(BasePlugin):
 
     def _channel_cost_ex(self, url: str, name: str, model_ref: str = ""):
         """某渠道（URL/渠道名包含匹配）在全部历史里的计费 → (cny, pts, matched)；
-        model_ref 非空时只统计关联模型（provider:model）的用量"""
+        model_ref 非空时只统计关联模型（provider:model）的用量。
+        带缓存：记录数/最新时间戳/规则 hash 未变直接复用"""
+        fp = self._calc_fingerprint()
+        ckey = ("all", url, name, model_ref)
+        hit = self._since_cost_cache.get(ckey)
+        if hit and hit[0] == fp:
+            return hit[1], hit[2], hit[3]
         merged = {}
         for ds in self._days.values():
             for mkey, slots in ds["aggs"].items():
@@ -1148,8 +1221,10 @@ class TokenStatsPlugin(BasePlugin):
                     slots2[i]["o"] += slots[i]["o"]
                     slots2[i]["c"] += slots[i]["c"]
         if not merged:
+            self._since_cost_cache[ckey] = (fp, 0.0, 0.0, False)
             return 0.0, 0.0, False
         cny, pts, matched = self._aggs_cost_ex(merged)
+        self._since_cost_cache[ckey] = (fp, cny, pts, matched)
         return cny, pts, matched
 
     def _channel_cost(self, url: str, name: str) -> float:
@@ -1159,9 +1234,16 @@ class TokenStatsPlugin(BasePlugin):
 
     def _channel_cost_since_ex(self, url: str, name: str, since: datetime, model_ref: str = ""):
         """自 since 时刻以来（含）的渠道计费 → (cny, pts, matched)。
-        逐条扫日志，按 t >= since 过滤；双币种分开累计。"""
+        逐条扫日志，按 t >= since 过滤；双币种分开累计。
+        带缓存：记录数/最新时间戳/规则 hash 未变直接复用（余额估算高频调用）"""
+        recs = self._read_records()
+        fp = self._calc_fingerprint(recs)
+        ckey = ("since", url, name, model_ref, since.isoformat())
+        hit = self._since_cost_cache.get(ckey)
+        if hit and hit[0] == fp:
+            return hit[1], hit[2], hit[3]
         cny, pts, matched = 0.0, 0.0, False
-        for r in self._read_records():
+        for r in recs:
             try:
                 t = _parse_ts(r["t"])
             except Exception:
@@ -1182,6 +1264,9 @@ class TokenStatsPlugin(BasePlugin):
             else:
                 cny += amt
             matched = True
+        self._since_cost_cache[ckey] = (fp, cny, pts, matched)
+        if len(self._since_cost_cache) > 64:
+            self._since_cost_cache.clear()  # 有界：键含 since/url 组合，防止无限增长
         return cny, pts, matched
 
     # ── 余额探测 ──
@@ -1230,7 +1315,7 @@ class TokenStatsPlugin(BasePlugin):
           当前 = 设定的「当前余额(对表)」− 自设定时刻以来计费（按价格规则现算，改价即时重估）；
           preset 无锚定时回落 初始额度 − 全历史计费；
           daily 无锚定时 = 每日额度 − 上次刷新以来计费；
-          rolling 无锚定时 = 初始额度(基准) − 全历史计费 + 发放次数 × 每日额度"""
+          rolling 必须先锚定（当前 = 设定余额 − 其后计费 + 发放次数 × 每日额度）"""
         s_type = (src.get("type") or "auto").strip().lower()
         name = src.get("name", "")
         if s_type not in EST_TYPES:
@@ -1262,6 +1347,9 @@ class TokenStatsPlugin(BasePlugin):
         def _fmt(v):
             return f"{v:0.6f}".rstrip("0").rstrip(".")
 
+        # M3：日志发生过裁剪 → 早期计费记录缺失，估算可能偏高，msg 附警告
+        tw = "（⚠ 日志曾裁剪，早期计费缺失，估算可能偏高）" if str(self._log_path) in _LOG_TRIMMED else ""
+
         try:
             if anchor is not None and anchor_dt is not None:
                 # 锚定：设定值 − 其后计费（daily/rolling 另加此后发放；daily 跨刷新自动回落）
@@ -1274,17 +1362,17 @@ class TokenStatsPlugin(BasePlugin):
                     cur = daily - c2
                     return {"balance": cur, "currency": currency,
                             "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                            "msg": f"每日重置：每日额度 {_fmt(daily)} − 本周期计费 {_fmt(c2)} = 当前 {_fmt(cur)}（锚定已跨刷新失效，回落每日额度模型）"}
+                            "msg": f"每日重置：每日额度 {_fmt(daily)} − 本周期计费 {_fmt(c2)} = 当前 {_fmt(cur)}（锚定已跨刷新失效，回落每日额度模型）{tw}"}
                 if s_type == "rolling":
                     grants = _grant_count(anchor_dt, now, refresh)
                     cur = anchor + grants * daily - cost
                     return {"balance": cur, "currency": currency,
                             "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                            "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} + 已发放 {grants} 期 × {_fmt(daily)} = 当前 {_fmt(cur)}（按价格规则估算）"}
+                            "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} + 已发放 {grants} 期 × {_fmt(daily)} = 当前 {_fmt(cur)}（按价格规则估算）{tw}"}
                 cur = anchor - cost
                 return {"balance": cur, "currency": currency,
                         "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                        "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）"}
+                        "msg": f"设定余额 {_fmt(anchor)}（{anchor_dt.strftime('%m-%d %H:%M')} 对表）− 其后计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）{tw}"}
 
             if s_type == "daily":
                 if daily <= 0:
@@ -1295,19 +1383,11 @@ class TokenStatsPlugin(BasePlugin):
                 cur = daily - cost
                 return {"balance": cur, "currency": currency,
                         "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                        "msg": f"每日重置：每日额度 {_fmt(daily)} − 上次刷新以来计费 {_fmt(cost)} = 当前 {_fmt(cur)}（刷新 {refresh}）"}
+                        "msg": f"每日重置：每日额度 {_fmt(daily)} − 上次刷新以来计费 {_fmt(cost)} = 当前 {_fmt(cur)}（刷新 {refresh}）{tw}"}
 
             if s_type == "rolling":
-                if anchor is None or anchor_dt is None:
-                    return {"balance": 0, "currency": currency, "at": "", "ok": False,
-                            "msg": "rolling 源需先填「当前余额(对表)」建立基准（当前 = 设定余额 − 计费 + 每日发放，没用完的结转滚存）"}
-                grants = _grant_count(anchor_dt, now, refresh)
-                cny, pts, matched = self._channel_cost_ex(src.get("url", ""), name, model_ref)
-                cost = pts if currency == "积分" else cny
-                cur = anchor + grants * daily - cost
-                return {"balance": cur, "currency": currency,
-                        "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                        "msg": f"每日累计：设定余额 {_fmt(anchor)} − 累计计费 {_fmt(cost)} + 发放 {grants} 期 × {_fmt(daily)} = 当前 {_fmt(cur)}（结转滚存，刷新 {refresh}）"}
+                return {"balance": 0, "currency": currency, "at": "", "ok": False,
+                        "msg": "rolling 源需先填「当前余额(对表)」建立基准（当前 = 设定余额 − 计费 + 每日发放，没用完的结转滚存）"}
 
             # preset
             if initial is None:
@@ -1318,7 +1398,7 @@ class TokenStatsPlugin(BasePlugin):
             cur = initial - cost
             return {"balance": cur, "currency": currency,
                     "at": now.strftime("%Y-%m-%d %H:%M:%S"), "ok": True,
-                    "msg": f"预设扣减：初始额度 {_fmt(initial)} − 累计计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）"}
+                    "msg": f"预设扣减：初始额度 {_fmt(initial)} − 累计计费 {_fmt(cost)} = 当前 {_fmt(cur)}（按价格规则估算）{tw}"}
         except Exception as e:
             return {"balance": 0, "currency": currency, "at": "", "ok": False, "msg": f"估算失败: {e}"}
 
@@ -2331,9 +2411,16 @@ class TokenStatsPlugin(BasePlugin):
             return {"units": arr, "matched": matched}
 
         # 兜底：内存 aggs 未匹配到规则时，直接遍历记录现算（保证历史费用一定显示）
+        # H3：按 (frm,to,记录数,最新时间戳,规则hash) 缓存，轮询不再每秒全扫
         def _cost_pair_scan(frm, to):
+            recs = self._read_records()
+            fp = self._calc_fingerprint(recs)
+            ck = (frm, to)
+            hit = self._range_scan_cache.get(ck)
+            if hit and hit[0] == fp:
+                return hit[1]
             units, matched = {}, False
-            for r in self._read_records():
+            for r in recs:
                 try:
                     t = _parse_ts(r["t"])
                 except Exception:
@@ -2352,7 +2439,11 @@ class TokenStatsPlugin(BasePlugin):
                 matched = True
             arr = [{"unit": uu, "amt": f"{uamt:,.4f}"} for ukey, uamt in units.items() if uamt
                    for uu in [ukey.partition("|")[2]]]
-            return {"units": arr, "matched": matched}
+            result = {"units": arr, "matched": matched}
+            self._range_scan_cache[ck] = (fp, result)
+            if len(self._range_scan_cache) > 16:
+                self._range_scan_cache.clear()  # 有界
+            return result
 
         def _cost_any(k, frm, to):
             cp = _cost_pair(k)
@@ -2927,11 +3018,13 @@ class TokenStatsPlugin(BasePlugin):
                 "at": st.get("at", ""),
                 "msg": st.get("msg", ""),
             }
-            # 配置字段（可视化编辑器回填用，含禁用源）
+            # 配置字段（可视化编辑器回填用，含禁用源）；api_key 掩码回传防明文泄露
             for k in ("url", "api_key", "api_user", "json_path", "quota_conversion",
                       "daily_quota", "anchor_balance", "refresh_time", "anchor_at", "model_ref"):
                 v = src.get(k)
                 if v is not None:
+                    if k == "api_key" and v:
+                        v = _mask_api_key(str(v))
                     item[k] = v
             sources.append(item)
         return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
@@ -2977,6 +3070,12 @@ class TokenStatsPlugin(BasePlugin):
                 # 仅估算型源：WebUI 表单无 anchor_at 输入，填了「当前余额(对表)」但没给时间时锚定取当前；
                 # 编辑已有源时前端会回填原 anchor_at（见 balEditOpen），不会漂移
                 item["anchor_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # api_key 未改动（值等于掩码）时保留原值，防掩码覆盖真 key
+            if "api_key" in item and "****" in item["api_key"]:
+                for old in self.balance_sources:
+                    if old.get("name") == name and old.get("api_key"):
+                        item["api_key"] = old["api_key"]
+                        break
             cleaned.append(item)
         try:
             pm = self.ctx.plugin_mgr
@@ -3457,12 +3556,12 @@ async function loadOv(){
     // 迷你走势（非本次会话）：近14天分布
     let sp = '';
     if(k!=='session') sp = '<div class="spark">'+sparkHtml(dayVols.slice(-14))+'</div>';
-    cards.push('<div class="card"><div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
+    cards.push({k:k, html:'<div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
       '<div class="d">'+fmt(rg.r)+' 轮 · 输入 '+fmt(rg.i)+' · 输出 '+fmt(rg.o)+' · 缓存 '+fmt(rg.c)+' · 命中率 <span class="rate">'+rate+'</span></div>'+
-      '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div></div>');
+      '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div>'});
   }
   const er = d.errors||{};
-  if (er.last) cards.push('<div class="card errbox"><div class="k">最近出错</div><div class="d">'+esc(er.last)+'</div></div>');
+  if (er.last) cards.push({k:'errLast', cls:'errbox', html:'<div class="k">最近出错</div><div class="d">'+esc(er.last)+'</div>'});
   const lg = er.log||{};
   const lgNames = {xml:'XML解析',model:'模型调用',tool:'工具执行',net:'网络/超时',traceback:'异常堆栈',other:'其他'};
   const lgBits = [];
@@ -3472,15 +3571,37 @@ async function loadOv(){
   if (lgBits.length){
     let lgTxt = '后台日志错误（近7天）：'+lgBits.join(' · ');
     if (er.logLast && er.logLast.text) lgTxt += '｜最近：'+esc(er.logLast.text.slice(0,60));
-    cards.push('<div class="card errbox"><div class="k">后台日志 ERROR</div><div class="d">'+lgTxt+'</div></div>');
+    cards.push({k:'errLog', cls:'errbox', html:'<div class="k">后台日志 ERROR</div><div class="d">'+lgTxt+'</div>'});
   }
   if (er.tool){
     let tt = '工具结果失败（近7天）：'+er.tool+' 次';
     if (er.toolLast && er.toolLast.text) tt += '｜最近：'+esc(er.toolLast.text.slice(0,60));
-    cards.push('<div class="card errbox"><div class="k">工具结果失败</div><div class="d">'+tt+'</div></div>');
+    cards.push({k:'errTool', cls:'errbox', html:'<div class="k">工具结果失败</div><div class="d">'+tt+'</div>'});
   }
-  $('#cards').innerHTML = cards.join('');
+  renderCards(cards);
   loadHist(hist); loadHours();
+}
+// M1：cards 按 data-k 增量更新——内容签名未变不动 DOM，避免轮询全量 innerHTML 重建
+let _cardEls = {};
+function renderCards(cards){
+  const box = $('#cards');
+  const seen = {};
+  cards.forEach(c=>{
+    seen[c.k] = 1;
+    const el0 = _cardEls[c.k];
+    if(el0 && el0._sig === c.html) return;
+    if(el0){ el0.className = 'card'+(c.cls?' '+c.cls:''); el0.innerHTML = c.html; el0._sig = c.html; return; }
+    const el = document.createElement('div');
+    el.className = 'card'+(c.cls?' '+c.cls:'');
+    el.dataset.k = c.k;
+    el.innerHTML = c.html;
+    el._sig = c.html;
+    box.appendChild(el);
+    _cardEls[c.k] = el;
+  });
+  for(const k in _cardEls){
+    if(!seen[k]){ _cardEls[k].remove(); delete _cardEls[k]; }
+  }
 }
 async function loadHist(hist){
   const d = hist || await jget('/history');
@@ -3854,8 +3975,9 @@ const BAL_FIELDS = {
   rolling: [['daily_quota','每日额度','1000'],['refresh_time','刷新时刻 HH:mm','00:00'],['anchor_balance','当前余额(对表)',''],['model_ref','关联模型(可选)',''],['currency','币种','积分'],['unit','显示单位(留空=无单位)','积分']]
 };
 function balFieldHtml(f){
+  const tp = (f[0]==='api_key') ? ' type="password" autocomplete="off"' : '';
   return '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">'+esc(f[1])+'</label>'+
-    '<input id="bf_'+f[0]+'" style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
+    '<input id="bf_'+f[0]+'"'+tp+' style="width:100%;box-sizing:border-box;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px" placeholder="'+esc(f[2])+'"></div>';
 }
 function balEditOpen(i){
   balEditIdx = i;
@@ -3934,7 +4056,7 @@ $('#balEditClose').onclick = ()=>{ $('#balEditor').style.display='none'; };
 $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent='15'; loadRec(); };
 
 loadOv();
-setInterval(loadOv, 1000);
+setInterval(loadOv, 4000);
 // 随机背景（默认开，右下角 👕 点击关闭，localStorage 记忆）
 (function(){
   const BG_KEY = 'tsSkinBg';
