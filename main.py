@@ -2546,8 +2546,9 @@ class TokenStatsPlugin(BasePlugin):
                 item["refresh_time"] = str(s["refresh_time"]).strip()
             if s.get("anchor_at"):
                 item["anchor_at"] = str(s["anchor_at"]).strip()
-            elif s.get("anchor_balance") not in (None, ""):
-                # WebUI 表单无 anchor_at 输入：填了「当前余额(对表)」但没给时间时，锚定时间取当前
+            elif (s.get("type") or "auto").strip().lower() in EST_TYPES and s.get("anchor_balance") not in (None, ""):
+                # 仅估算型源：WebUI 表单无 anchor_at 输入，填了「当前余额(对表)」但没给时间时锚定取当前；
+                # 编辑已有源时前端会回填原 anchor_at（见 balEditOpen），不会漂移
                 item["anchor_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             cleaned.append(item)
         try:
@@ -3152,6 +3153,8 @@ function balEditOpen(i){
     });
   };
   renderDyn();
+  // 编辑已有源：回填 anchor_at（表单无输入框，用隐藏字段原样保留，避免锚定基准漂移）
+  if(i>=0 && src.anchor_at) $('#bf_dyn').insertAdjacentHTML('beforeend', '<input type="hidden" id="bf_anchor_at" value="'+esc(src.anchor_at)+'">');
   $('#bf_type').onchange = renderDyn;
   $('#bf_cancel').onclick = ()=>{ $('#balEditor').style.display='none'; };
   $('#bf_save').onclick = async ()=>{
@@ -3162,6 +3165,8 @@ function balEditOpen(i){
       const el = $('#bf_'+f[0]);
       if(el && el.value.trim()!=='') item[f[0]] = el.value.trim();
     });
+    const ha = $('#bf_anchor_at');
+    if(ha && ha.value) item.anchor_at = ha.value;
     if(balEditIdx>=0 && balSources[balEditIdx]) balSources[balEditIdx] = item;
     else balSources.push(item);
     const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
