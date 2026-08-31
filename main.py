@@ -200,21 +200,40 @@ def _parse_hhmm(s, default_h=0, default_m=0):
         return default_h, default_m
 
 
-# 全局峰谷窗口（工作日）：默认 09:00-12:00 / 14:00-18:00 为峰，其余谷；
-# 可在 WebUI「价格规则」页自定义（格式 [["HH:MM","HH:MM"], ...]），热重载后历史按新窗口重分桶
-_PEAK_WINDOWS = [("09:00", "12:00"), ("14:00", "18:00")]
+# 峰谷方案库：每条计价规则通过 peak_profile 字段引用方案名（留空=默认方案）。
+# 方案格式：{"name": "默认工作日", "windows": [["09:00","12:00"],["14:00","18:00"]]}
+# 可在 WebUI「价格规则」页管理方案库；热重载后历史按各规则引用的方案重新分桶计价
+_PEAK_PROFILES = [
+    {"name": "默认工作日", "windows": [("09:00", "12:00"), ("14:00", "18:00")]},
+]
 
 
-def _is_peak(t: datetime) -> bool:
+def _is_peak_in(t: datetime, windows) -> bool:
+    """按窗口列表判断是否峰时（分钟级精度）；周末恒谷"""
     if t.weekday() >= 5:
         return False
     tm = t.hour * 60 + t.minute
-    for ws, we in _PEAK_WINDOWS:
+    for ws, we in windows or []:
         sh, sm = _parse_hhmm(ws)
         eh, em = _parse_hhmm(we)
         if sh * 60 + sm <= tm < eh * 60 + em:
             return True
     return False
+
+
+def _windows_for_rule(r: dict):
+    """规则引用的峰谷方案窗口；未指定/找不到 → 默认方案"""
+    ref = (r or {}).get("peak_profile") or ""
+    if ref:
+        for p in _PEAK_PROFILES:
+            if p.get("name") == ref:
+                return p.get("windows") or []
+    return _PEAK_PROFILES[0]["windows"] if _PEAK_PROFILES else []
+
+
+def _is_peak(t: datetime) -> bool:
+    """默认方案判断（兼容旧调用）"""
+    return _is_peak_in(t, _PEAK_PROFILES[0]["windows"] if _PEAK_PROFILES else [])
 
 
 def _url_loose_match(candidate: str, pattern: str) -> bool:
@@ -234,6 +253,8 @@ def _match_rule(rules: list, channel: str, model: str, url: str):
     exact = _EXACT_MATCH
     best, best_score = None, 0
     for r in rules or []:
+        if r.get("enabled") is False:
+            continue
         score = 0
         if exact:
             if r.get("url_match") and str(url or "") == str(r.get("url_match") or ""):
@@ -264,7 +285,7 @@ def _rule_cost_ex(r: dict, input_t: int, output_t: int, cached_t: int, t: dateti
     """按规则算费用 → (金额, 币种)；无规则/未匹配返回 (None, 'CNY')"""
     if r is None:
         return None, "CNY"
-    peak = bool(r.get("peak_enabled", True)) and _is_peak(t)
+    peak = bool(r.get("peak_enabled", True)) and _is_peak_in(t, _windows_for_rule(r))
     hit = r.get("hit_peak" if peak else "hit_off", 0) or 0
     miss = r.get("miss_peak" if peak else "miss_off", 0) or 0
     out = r.get("out_peak" if peak else "out_off", 0) or 0
@@ -422,20 +443,43 @@ class TokenStatsPlugin(BasePlugin):
         rules = pr.get("rules", None)
         # 空数组也保留（用户删光规则 → 费用显示「—」），仅 None/非 list 回退默认
         self.rules = rules if isinstance(rules, list) else DEFAULT_RULES
-        # 峰谷窗口（全局）：默认工作日 09:00-12:00 / 14:00-18:00 为峰，其余谷
-        global _PEAK_WINDOWS
-        pw = pr.get("peak_windows", None)
-        if isinstance(pw, list) and pw:
-            cleaned_w = []
-            for item in pw:
-                if not (isinstance(item, (list, tuple)) and len(item) == 2):
+        # 峰谷方案库：每条规则可选引用（peak_profile 字段）；兼容旧 peak_windows 全局配置
+        global _PEAK_PROFILES
+        profiles = pr.get("peak_profiles", None)
+        if isinstance(profiles, list) and profiles:
+            cleaned_p = []
+            for p in profiles:
+                if not isinstance(p, dict) or not str(p.get("name") or "").strip():
                     continue
-                sh, sm = _parse_hhmm(item[0])
-                eh, em = _parse_hhmm(item[1])
-                if sh * 60 + sm < eh * 60 + em:
-                    cleaned_w.append((f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"))
-            if cleaned_w:
-                _PEAK_WINDOWS = cleaned_w
+                w = p.get("windows")
+                if not isinstance(w, list) or not w:
+                    continue
+                cleaned_w = []
+                for item in w:
+                    if not (isinstance(item, (list, tuple)) and len(item) == 2):
+                        continue
+                    sh, sm = _parse_hhmm(item[0])
+                    eh, em = _parse_hhmm(item[1])
+                    if sh * 60 + sm < eh * 60 + em:
+                        cleaned_w.append((f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"))
+                if cleaned_w:
+                    cleaned_p.append({"name": str(p["name"]).strip(), "windows": cleaned_w})
+            if cleaned_p:
+                _PEAK_PROFILES = cleaned_p
+        else:
+            # 兼容旧配置：全局 peak_windows → 默认方案
+            pw = pr.get("peak_windows", None)
+            if isinstance(pw, list) and pw:
+                cleaned_w = []
+                for item in pw:
+                    if not (isinstance(item, (list, tuple)) and len(item) == 2):
+                        continue
+                    sh, sm = _parse_hhmm(item[0])
+                    eh, em = _parse_hhmm(item[1])
+                    if sh * 60 + sm < eh * 60 + em:
+                        cleaned_w.append((f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"))
+                if cleaned_w:
+                    _PEAK_PROFILES = [{"name": "默认工作日", "windows": cleaned_w}]
 
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
@@ -504,7 +548,7 @@ class TokenStatsPlugin(BasePlugin):
 
         # ── 挂件（WebUI 悬浮小卡片，默认关闭）──
         wid = cfg.get("section_widget", {})
-        self.enable_widget = bool(wid.get("enable_widget", False))
+        self.enable_widget = bool(wid.get("enable_widget", True))
         self.widget_compact = bool(wid.get("widget_compact", False))
 
         # ── 余额探测 ssl ──
@@ -660,7 +704,9 @@ class TokenStatsPlugin(BasePlugin):
         o = int(rec.get("o", 0) or 0)
         c = int(rec.get("c", 0) or 0)
         e = int(rec.get("e", 0) or 0)
-        peak = _is_peak(t)
+        # 分桶按该记录命中的规则所引用的峰谷方案（改方案后热重载 → 历史重分桶）
+        _rule = _match_rule(self.rules, rec.get("ch", ""), rec.get("m", ""), rec.get("h", ""))
+        peak = bool(_rule.get("peak_enabled", True)) and _is_peak_in(t, _windows_for_rule(_rule)) if _rule else _is_peak(t)
         key = f"{rec.get('m', '')}\u001F{rec.get('ch', '')}\u001F{rec.get('h', '')}"
 
         ds = self._days.setdefault(day, {"r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}})
@@ -717,7 +763,8 @@ class TokenStatsPlugin(BasePlugin):
             rec_t = _parse_ts(rec["t"])
         except Exception:
             rec_t = datetime.now()
-        peak = _is_peak(rec_t)
+        _rule = _match_rule(self.rules, rec.get("ch", ""), rec.get("m", ""), rec.get("h", ""))
+        peak = bool(_rule.get("peak_enabled", True)) and _is_peak_in(rec_t, _windows_for_rule(_rule)) if _rule else _is_peak(rec_t)
         agg = slots[1 if peak else 0]
         if agg is None:
             agg = slots[1 if peak else 0] = {"i": 0, "o": 0, "c": 0}
@@ -2193,6 +2240,38 @@ class TokenStatsPlugin(BasePlugin):
         except Exception as e:
             logger.exception("[token_stats] tool records failed")
             return f"查询失败：{e}"
+
+    @register.tool(
+        name="query_balance",
+        description="查询已配置的 API 账户余额（DeepSeek/Kimi/硅基/智谱官方、One-API/New-API 中转站、估算型钱包/积分等）。用户问「余额多少/还剩多少钱/额度够不够/账户还有多少」时调用，只查余额不查用量。",
+        params={
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    )
+    async def query_balance(self, event: KiraMessageBatchEvent) -> str:
+        if not self.enabled:
+            return "Token 统计未启用（插件配置页 → 基础设置）"
+        if not self.enable_balance or not self.balance_sources:
+            return "未启用余额监测或未配置余额源（插件配置页 → 余额监测）"
+        try:
+            await self._probe_all(wait=True)
+            lines = ["💳 账户余额："]
+            for src in self.balance_sources:
+                if not src.get("enabled", True):
+                    continue
+                st = self._resolve_balance_state(src)
+                name = src.get("name", "")
+                if st["ok"]:
+                    unit = "积分" if self._src_currency(src) == "积分" else self.balance_unit
+                    lines.append(f"- {name}：{st['balance']:.4f} {unit}（{st.get('msg', '')[:40]}）")
+                else:
+                    lines.append(f"- {name}：探测失败（{st['msg']}）")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.exception("[token_stats] tool balance failed")
+            return f"查询失败：{e}"
     # ── WebUI API（FastAPI 参数注入：query 参数按签名自动解析）──
 
     @register.api(method="GET", path="/stats", auth=True)
@@ -2348,8 +2427,11 @@ class TokenStatsPlugin(BasePlugin):
             amt, cur = _rule_cost_ex(rule, i, o, c, t) if rule else (None, "CNY")
 
             def add(d, k):
-                a = d.setdefault(k, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "cny": 0.0, "pts": 0.0, "matched": False})
+                a = d.setdefault(k, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "cny": 0.0, "pts": 0.0, "matched": False, "last_at": ""})
                 a["r"] += 1; a["i"] += i; a["o"] += o; a["c"] += c; a["v"] += v
+                _ts = t.strftime("%Y-%m-%d %H:%M:%S")
+                if _ts > a["last_at"]:
+                    a["last_at"] = _ts
                 if amt is not None:
                     if cur == "积分":
                         a["pts"] += amt
@@ -2638,9 +2720,35 @@ class TokenStatsPlugin(BasePlugin):
             logger.warning(f"[token_stats] 保存余额配置失败: {e}")
             return {"ok": False, "msg": f"保存失败: {e}"}
 
+    @register.api(method="POST", path="/balance-interval", auth=True)
+    async def api_balance_interval(self, request: Request):
+        """保存余额轮询间隔（分钟，最小 1）"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        try:
+            interval = max(1, int(body.get("interval") or 1))
+        except (TypeError, ValueError):
+            return {"ok": False, "msg": "间隔必须是正整数（分钟）"}
+        try:
+            pm = self.ctx.plugin_mgr
+            if pm is None:
+                return {"ok": False, "msg": "plugin_mgr 不可用"}
+            cfg = pm.get_plugin_config("KiraAI_token_stats_plugin")
+            sec = dict(cfg.get("section_balance") or {})
+            sec["balance_interval"] = interval
+            cfg["section_balance"] = sec
+            await pm.update_plugin_config("KiraAI_token_stats_plugin", cfg)
+            return {"ok": True, "interval": interval}
+        except Exception as e:
+            logger.warning(f"[token_stats] 保存轮询间隔失败: {e}")
+            return {"ok": False, "msg": f"保存失败: {e}"}
+
     @register.api(method="GET", path="/pricing", auth=True)
     async def api_pricing(self):
-        return {"rules": self.rules, "peak_windows": [list(w) for w in _PEAK_WINDOWS]}
+        return {"rules": self.rules,
+                "peak_profiles": [{"name": p["name"], "windows": [list(w) for w in p["windows"]]} for p in _PEAK_PROFILES]}
 
     @register.api(method="POST", path="/pricing-config", auth=True)
     async def api_pricing_config(self, request: Request):
@@ -2660,8 +2768,9 @@ class TokenStatsPlugin(BasePlugin):
             name = str(r.get("name") or "").strip()
             if not name:
                 continue
-            item = {"name": name, "peak_enabled": bool(r.get("peak_enabled", True))}
-            for k in ("url_match", "model_match", "channel_match", "currency"):
+            item = {"name": name, "peak_enabled": bool(r.get("peak_enabled", True)),
+                    "enabled": r.get("enabled", True) is not False}
+            for k in ("url_match", "model_match", "channel_match", "currency", "peak_profile"):
                 v = r.get(k)
                 if v not in (None, ""):
                     item[k] = str(v).strip()
@@ -2722,6 +2831,49 @@ class TokenStatsPlugin(BasePlugin):
             logger.warning(f"[token_stats] 保存峰谷时段失败: {e}")
             return {"ok": False, "msg": f"保存失败: {e}"}
 
+    @register.api(method="POST", path="/pricing-profiles", auth=True)
+    async def api_pricing_profiles(self, request: Request):
+        """保存峰谷方案库：格式 [{"name":"默认工作日","windows":[["09:00","12:00"],["14:00","18:00"]]}]"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        profiles = body.get("profiles")
+        if not isinstance(profiles, list) or not profiles:
+            return {"ok": False, "msg": "profiles 必须是数组"}
+        cleaned = []
+        for p in profiles:
+            if not isinstance(p, dict) or not str(p.get("name") or "").strip():
+                continue
+            w = p.get("windows")
+            if not isinstance(w, list) or not w:
+                continue
+            cleaned_w = []
+            for item in w:
+                if not (isinstance(item, (list, tuple)) and len(item) == 2):
+                    continue
+                sh, sm = _parse_hhmm(item[0])
+                eh, em = _parse_hhmm(item[1])
+                if sh * 60 + sm < eh * 60 + em:
+                    cleaned_w.append([f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"])
+            if cleaned_w:
+                cleaned.append({"name": str(p["name"]).strip(), "windows": cleaned_w})
+        if not cleaned:
+            return {"ok": False, "msg": "方案格式错误：需为 [{'name':'方案名','windows':[['09:00','12:00'],...]}] 且结束晚于开始"}
+        try:
+            pm = self.ctx.plugin_mgr
+            if pm is None:
+                return {"ok": False, "msg": "plugin_mgr 不可用"}
+            cfg = pm.get_plugin_config("KiraAI_token_stats_plugin")
+            sec = dict(cfg.get("section_pricing") or {})
+            sec["peak_profiles"] = cleaned
+            cfg["section_pricing"] = sec
+            await pm.update_plugin_config("KiraAI_token_stats_plugin", cfg)
+            return {"ok": True, "count": len(cleaned)}
+        except Exception as e:
+            logger.warning(f"[token_stats] 保存峰谷方案库失败: {e}")
+            return {"ok": False, "msg": f"保存失败: {e}"}
+
     # ── WebUI 侧边栏页面 ──
 
     @register.page("/stats", auth=True, menu=PageMenu(label={"zh": "Token 用量"}, icon="DataLine"))
@@ -2733,9 +2885,9 @@ class TokenStatsPlugin(BasePlugin):
         if not self.enable_widget:
             return PluginPage.from_html(
                 f"<!DOCTYPE html><html lang=\"zh-CN\"><body style=\"background:#0f172a;color:#94a3b8;font-family:sans-serif;padding:24px;font-size:13px\">"
-                f"<p style=\"color:#e2e8f0;font-weight:600;margin-bottom:8px\">Token 挂件未启用</p>"
-                f"<p>开启方式：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 启用挂件。<br>"
-                f"开启后此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球），适合浏览器小窗钉角落。</p>"
+                f"<p style=\"color:#e2e8f0;font-weight:600;margin-bottom:8px\">Token 挂件已启用（默认开启）</p>"
+                f"<p>此页面为迷你悬浮卡片（实时 tokens/费用/余额，可拖动、可折叠成小球），适合浏览器小窗钉角落。<br>"
+                f"如需关闭：插件管理 → KiraAI_token_stats_plugin → 配置 → 「挂件」→ 关闭「启用挂件」。</p>"
                 f"</body></html>")
         # 后端「紧凑模式」配置注入为前端默认值；localStorage 有记忆时以用户为准
         html = _WIDGET_HTML.replace(
@@ -2752,7 +2904,16 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:#0f172a;--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--purple:#a78bfa;--pink:#f472b6}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--fg);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;padding:20px;font-size:14px}
+body{background:var(--bg);color:var(--fg);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;padding:20px;font-size:14px;background-size:cover;background-position:center;background-attachment:fixed}
+body.bg-on #app{background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-radius:16px;padding:20px;border:1px solid rgba(51,65,85,.5);box-shadow:0 8px 32px rgba(0,0,0,.35)}
+#skinBtn{position:fixed;right:14px;bottom:14px;width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:rgba(30,41,59,.7);color:var(--dim);cursor:pointer;font-size:16px;z-index:999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+#skinBtn:hover{color:var(--fg);border-color:var(--acc)}
+.sw{position:relative;display:inline-block;width:34px;height:18px;vertical-align:middle;cursor:pointer}
+.sw input{opacity:0;width:0;height:0}
+.sw i{position:absolute;inset:0;background:#334155;border-radius:999px;transition:.2s}
+.sw i:before{content:'';position:absolute;left:2px;top:2px;width:14px;height:14px;border-radius:50%;background:#94a3b8;transition:.2s}
+.sw input:checked + i{background:var(--acc)}
+.sw input:checked + i:before{transform:translateX(16px);background:#06283d}
 h1{font-size:20px;margin-bottom:4px;display:flex;align-items:center;gap:10px}
 h1 .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
 .sub{color:var(--dim);font-size:12px;margin-bottom:16px}
@@ -2814,6 +2975,8 @@ tr.cur td{background:rgba(52,211,153,.07)}
 </style>
 </head>
 <body>
+<button id="skinBtn" title="随机背景开关">🎨</button>
+<div id="app">
 <h1><span class="dot" id="dot"></span>Token 用量统计</h1>
 <div class="sub" id="sub">加载中…</div>
 <div class="tabs">
@@ -2880,10 +3043,14 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <span style="color:var(--dim);font-size:12px" id="priceInfo"></span>
     </div>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:8px 12px">
-      <span style="color:var(--dim);font-size:12px">峰谷时段（工作日）：</span>
-      <input id="peakWindows" style="width:260px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px" placeholder="09:00-12:00,14:00-18:00">
-      <button class="btn" id="peakWindowsSave">保存</button>
-      <span style="color:var(--dim);font-size:11px">格式 开始-结束，逗号分隔多段；保存后热重载，历史按新窗口重算</span>
+      <span style="color:var(--dim);font-size:12px">峰谷方案库：</span>
+      <select id="peakProfileSel" style="width:200px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px"></select>
+      <input id="peakProfileName" style="width:130px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px" placeholder="方案名">
+      <input id="peakWindows" style="width:240px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px" placeholder="09:00-12:00,14:00-18:00">
+      <button class="btn" id="peakWindowsSave">保存方案</button>
+      <button class="btn" id="peakProfileAdd">＋ 新建</button>
+      <button class="btn" id="peakProfileDel">删除</button>
+      <span style="color:var(--dim);font-size:11px">每条计价规则可选自己的峰谷方案；格式 开始-结束，逗号分隔多段</span>
     </div>
     <div id="priceBody"></div>
   </div>
@@ -2894,9 +3061,13 @@ tr.cur td{background:rgba(52,211,153,.07)}
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
       <button class="btn" id="balRefresh">立即探测</button>
       <button class="btn" id="balEdit">＋ 添加监测源</button>
+      <span style="color:var(--dim);font-size:12px">轮询间隔</span>
+      <input id="balInterval" type="number" min="1" style="width:64px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px;font-size:12px" value="1">
+      <span style="color:var(--dim);font-size:12px">分钟</span>
+      <button class="btn" id="balIntervalSave">保存</button>
       <span style="color:var(--dim);font-size:12px" id="balInfo"></span>
     </div>
-    <table><thead><tr><th>名称</th><th>类型</th><th>余额</th><th>更新时间</th><th>状态</th><th style="width:110px">操作</th></tr></thead><tbody id="balBody"></tbody></table>
+    <table><thead><tr><th>启用</th><th>名称</th><th>类型</th><th>余额</th><th>更新时间</th><th>状态</th><th style="width:110px">操作</th></tr></thead><tbody id="balBody"></tbody></table>
     <div class="note">点击「＋ 添加监测源」可视化配置，保存后自动热重载。类型说明：auto=按 URL 自动探测官方端点或 One-API 中转站；custom=自定义接口多端点尝试；newapi=New-API 站点；preset=预设扣减（钱包型）；daily=每日重置积分；rolling=每日累计滚存积分。估算型填「当前余额(对表)」即以上游实际余额校准，此后按价格规则自动扣减；可再选「关联模型」只统计该模型的用量来估算。</div>
   </div>
 </div>
@@ -3135,17 +3306,24 @@ async function loadRec(){
 }
 let priceRules = [];
 let priceEditIdx = -1;
+let peakProfiles = [];
+let peakProfileIdx = -1;
 async function loadPrice(){
   const d = await jget('/pricing');
   priceRules = d.rules||[];
-  $('#priceInfo').textContent = '共 ' + priceRules.length + ' 条规则';
-  const pw = d.peak_windows || [['09:00','12:00'],['14:00','18:00']];
-  $('#peakWindows').value = pw.map(x=>x[0]+'-'+x[1]).join(',');
-  $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>名称</th><th>币种</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
-    priceRules.map((r,i)=>'<tr><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
-    '<td>'+(r.peak_enabled!==false?'峰谷':'恒谷')+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
+  peakProfiles = d.peak_profiles || [{name:'默认工作日', windows:[['09:00','12:00'],['14:00','18:00']]}];
+  $('#priceInfo').textContent = '共 ' + priceRules.length + ' 条规则 · ' + peakProfiles.length + ' 套峰谷方案';
+  const sel = $('#peakProfileSel');
+  sel.innerHTML = peakProfiles.map((p,i)=>'<option value="'+i+'">'+esc(p.name)+'</option>').join('');
+  if(peakProfileIdx<0 || peakProfileIdx>=peakProfiles.length) peakProfileIdx = 0;
+  sel.value = peakProfileIdx;
+  $('#peakProfileName').value = peakProfiles[peakProfileIdx].name;
+  $('#peakWindows').value = peakProfiles[peakProfileIdx].windows.map(x=>x[0]+'-'+x[1]).join(',');
+  $('#priceBody').innerHTML = priceRules.length ? '<table><thead><tr><th>启用</th><th>名称</th><th>币种</th><th>URL 匹配</th><th>模型匹配</th><th>渠道匹配</th><th>峰谷方案</th><th>缓存命中(峰/谷)</th><th>未命中(峰/谷)</th><th>输出(峰/谷)</th><th style="width:110px">操作</th></tr></thead><tbody>'+
+    priceRules.map((r,i)=>'<tr'+(r.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(r.enabled!==false?'checked':'')+' onchange="priceToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(r.name||'')+'</td><td>'+(r.currency==='积分'?'积分':'¥元')+'</td><td>'+esc(r.url_match||'')+'</td><td>'+esc(r.model_match||'')+'</td><td>'+esc(r.channel_match||'')+'</td>'+
+    '<td>'+(r.peak_enabled===false?'恒谷':esc(r.peak_profile||'默认工作日'))+'</td><td>'+r.hit_peak+' / '+r.hit_off+'</td><td>'+r.miss_peak+' / '+r.miss_off+'</td><td>'+r.out_peak+' / '+r.out_off+'</td>'+
     '<td><button class="btn" onclick="priceEditOpen('+i+')">编辑</button> <button class="btn" onclick="priceDel('+i+')">删除</button></td></tr>').join('')+'</tbody></table>'+
-    '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；峰谷时段可在上方自定义（默认工作日 09:00-12:00、14:00-18:00 为峰，其余谷）。双币种分别累计，不与 ¥ 混算。改价/改峰谷后全历史费用即时重算。</div>'
+    '<div class="note">匹配加权 URL=4 分、模型=2 分、渠道名=1 分取最高；价格单位 元（或积分）/百万 tokens；每条规则可选自己的峰谷方案（上方方案库管理）。双币种分别累计，不与 ¥ 混算。改价/改方案后全历史费用即时重算。</div>'
     : '<div class="note">暂无价格规则，费用显示「—」。点「＋ 添加规则」配置第一条。</div>';
 }
 const PRICE_FIELDS = [
@@ -3172,8 +3350,10 @@ function priceEditOpen(i){
   $('#priceEditTitle').textContent = i>=0 ? '编辑价格规则' : '添加价格规则';
   let html = priceFieldHtml(['name','规则名称',r.name||'']);
   html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷价</label><select id="pf_peak_enabled" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
-    '<option value="1"'+(pe?' selected':'')+'>启用（工作日 9-12 / 14-18 为峰，其余谷）</option>'+
+    '<option value="1"'+(pe?' selected':'')+'>启用峰谷价</option>'+
     '<option value="0"'+(pe?'':' selected')+'>不启用（全天按谷价）</option></select></div>';
+  html += '<div style="margin-bottom:10px"><label style="display:block;font-size:12px;color:var(--dim);margin-bottom:4px">峰谷方案</label><select id="pf_peak_profile" style="width:100%;background:#0b1220;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:13px">'+
+    peakProfiles.map(p=>'<option value="'+esc(p.name)+'"'+(r.peak_profile===p.name?' selected':'')+'>'+esc(p.name)+'</option>').join('')+'</select></div>';
   html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">';
   PRICE_FIELDS.slice(1).forEach(f=>{ html += priceFieldHtml(f); });
   html += '</div>';
@@ -3187,6 +3367,8 @@ function priceEditOpen(i){
   $('#pf_cancel').onclick = ()=>{ $('#priceEditor').style.display='none'; };
   $('#pf_save').onclick = async ()=>{
     const item = {name:$('#pf_name').value.trim(), peak_enabled:$('#pf_peak_enabled').value==='1'};
+    const pp = $('#pf_peak_profile');
+    if(pp && pp.value) item.peak_profile = pp.value;
     if(!item.name){ alert('请填写规则名称'); return; }
     PRICE_FIELDS.slice(1).forEach(f=>{
       const el = $('#pf_'+f[0]);
@@ -3213,8 +3395,7 @@ async function priceDel(i){
 }
 $('#priceAdd').onclick = ()=>priceEditOpen(-1);
 $('#priceEditClose').onclick = ()=>{ $('#priceEditor').style.display='none'; };
-$('#peakWindowsSave').onclick = async ()=>{
-  const raw = $('#peakWindows').value.trim();
+function parseWindows(raw){
   const parts = raw.split(',').map(s=>s.trim()).filter(Boolean);
   const windows = [];
   let bad = false;
@@ -3225,25 +3406,78 @@ $('#peakWindowsSave').onclick = async ()=>{
     if(sh>23||sm>59||eh>23||em>59||sh*60+sm>=eh*60+em){ bad = true; return; }
     windows.push([String(sh).padStart(2,'0')+':'+String(sm).padStart(2,'0'), String(eh).padStart(2,'0')+':'+String(em).padStart(2,'0')]);
   });
-  if(bad || !windows.length){ alert('格式错误：请用 09:00-12:00,14:00-18:00 格式，且结束须晚于开始'); return; }
-  const r = await fetch(API+'/pricing-windows', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({peak_windows:windows})}).then(x=>x.json());
+  return bad ? null : windows;
+}
+async function saveProfiles(){
+  const r = await fetch(API+'/pricing-profiles', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({profiles:peakProfiles})}).then(x=>x.json());
   if(r.ok){ loadPrice(); loadOv(); }
   else alert('保存失败：'+(r.msg||'未知错误'));
+}
+$('#peakProfileSel').onchange = ()=>{
+  peakProfileIdx = parseInt($('#peakProfileSel').value,10);
+  $('#peakProfileName').value = peakProfiles[peakProfileIdx].name;
+  $('#peakWindows').value = peakProfiles[peakProfileIdx].windows.map(x=>x[0]+'-'+x[1]).join(',');
 };
+$('#peakWindowsSave').onclick = async ()=>{
+  const w = parseWindows($('#peakWindows').value);
+  if(!w){ alert('格式错误：请用 09:00-12:00,14:00-18:00 格式，且结束须晚于开始'); return; }
+  peakProfiles[peakProfileIdx].windows = w;
+  await saveProfiles();
+};
+$('#peakProfileAdd').onclick = ()=>{
+  const name = ($('#peakProfileName').value.trim() || ('方案'+(peakProfiles.length+1)));
+  if(peakProfiles.some(p=>p.name===name)){ alert('方案名已存在'); return; }
+  peakProfiles.push({name:name, windows:[['09:00','12:00'],['14:00','18:00']]});
+  peakProfileIdx = peakProfiles.length-1;
+  $('#peakProfileSel').innerHTML = peakProfiles.map((p,i)=>'<option value="'+i+'">'+esc(p.name)+'</option>').join('');
+  $('#peakProfileSel').value = peakProfileIdx;
+  $('#peakProfileName').value = name;
+  $('#peakWindows').value = '09:00-12:00,14:00-18:00';
+  saveProfiles();
+};
+$('#peakProfileDel').onclick = async ()=>{
+  if(peakProfiles.length<=1){ alert('至少保留一套方案'); return; }
+  const name = peakProfiles[peakProfileIdx].name;
+  if(priceRules.some(r=>r.peak_profile===name)){ alert('有计价规则正在使用「'+name+'」，请先改掉那些规则的方案再删'); return; }
+  if(!confirm('删除峰谷方案「'+name+'」？')) return;
+  peakProfiles.splice(peakProfileIdx,1);
+  peakProfileIdx = 0;
+  await saveProfiles();
+};
+async function priceToggle(i,on){
+  priceRules[i].enabled = on;
+  const r = await fetch(API+'/pricing-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rules:priceRules})}).then(x=>x.json());
+  if(r.ok){ loadPrice(); loadOv(); }
+  else alert('保存失败：'+(r.msg||'未知错误'));
+}
 let balSources = [];
 let balEditIdx = -1;
 async function loadBal(refresh){
   const d = await jget('/balance'+(refresh?'?refresh=1':''));
   balSources = d.sources||[];
-  $('#balInfo').textContent = '轮询间隔 ' + d.interval + ' 分钟';
+  $('#balInterval').value = d.interval;
+  $('#balInfo').textContent = balSources.length + ' 个源';
   $('#balBody').innerHTML = balSources.map((x,i)=>{
     const unit = x.currency==='积分' ? '积分' : (d.unit||'元');
-    return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td>'+esc(x.name)+(x.enabled===false?' <span class="note">(禁用)</span>':'')+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</td>'+
+    return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(x.enabled!==false?'checked':'')+' onchange="balToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+' '+esc(unit)):'失败')+'</td>'+
     '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
     '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+')">删除</button></td></tr>';
   }).join('') ||
-    '<tr><td colspan="6" class="note">未配置余额监测源，点「＋ 添加监测源」开始</td></tr>';
+    '<tr><td colspan="7" class="note">未配置余额监测源，点「＋ 添加监测源」开始</td></tr>';
 }
+async function balToggle(i,on){
+  balSources[i].enabled = on;
+  const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
+  if(r.ok){ loadBal(false); }
+  else alert('保存失败：'+(r.msg||'未知错误'));
+}
+$('#balIntervalSave').onclick = async ()=>{
+  const v = parseInt($('#balInterval').value,10);
+  if(!v || v<1){ alert('间隔须为 ≥1 的整数（分钟）'); return; }
+  const r = await fetch(API+'/balance-interval', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({interval:v})}).then(x=>x.json());
+  if(r.ok){ loadBal(false); }
+  else alert('保存失败：'+(r.msg||'未知错误'));
+};
 const BAL_TYPES = [
   ['auto','auto · 自动探测（官方端点/One-API 中转站）'],
   ['custom','custom · 自定义接口'],
@@ -3320,7 +3554,7 @@ function balEditOpen(i){
     if(balEditIdx>=0 && balSources[balEditIdx]) balSources[balEditIdx] = item;
     else balSources.push(item);
     const r = await fetch(API+'/balance-config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sources:balSources})}).then(x=>x.json());
-    if(r.ok){ $('#balEditor').style.display='none'; loadBal(false); }
+    if(r.ok){ $('#balEditor').style.display='none'; loadBal(true); }
     else alert('保存失败：'+(r.msg||'未知错误'));
   };
   $('#balEditor').style.display='flex';
@@ -3339,6 +3573,27 @@ $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent=
 
 loadOv();
 setInterval(loadOv, 1000);
+// 随机背景（默认开，右下角 🎨 点击关闭，localStorage 记忆）
+(function(){
+  const BG_KEY = 'tsSkinBg';
+  const bgOn = localStorage.getItem(BG_KEY) !== '0';
+  const applyBg = on => {
+    document.body.classList.toggle('bg-on', on);
+    if(on){
+      const img = new Image();
+      img.onload = ()=>{ document.body.style.backgroundImage = "url('" + img.src + "')"; };
+      img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
+    } else {
+      document.body.style.backgroundImage = '';
+    }
+  };
+  applyBg(bgOn);
+  $('#skinBtn').onclick = ()=>{
+    const now = localStorage.getItem(BG_KEY) !== '0';
+    localStorage.setItem(BG_KEY, now ? '0' : '1');
+    applyBg(!now);
+  };
+})();
 </script>
 </body>
 </html>
@@ -3354,7 +3609,9 @@ _WIDGET_HTML = r"""<!DOCTYPE html>
 :root{--bg:rgba(15,23,42,.92);--card:#1e293b;--line:#334155;--fg:#e2e8f0;--dim:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--pink:#f472b6;--purple:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
-body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;overflow:hidden;background-size:cover;background-position:center;background-attachment:fixed}
+#skinBtn{position:fixed;right:10px;bottom:10px;width:28px;height:28px;border-radius:50%;border:1px solid #334155;background:rgba(30,41,59,.7);color:#94a3b8;cursor:pointer;font-size:14px;z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+#skinBtn:hover{color:#e2e8f0;border-color:#38bdf8}
 #w{position:fixed;left:16px;top:16px;width:300px;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.45);backdrop-filter:blur(8px);user-select:none;z-index:9999}
 #w.dragging{opacity:.85;border-color:var(--acc)}
 .head{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:move;border-bottom:1px solid rgba(51,65,85,.5)}
@@ -3377,6 +3634,7 @@ body{background:transparent;font-family:"Segoe UI",system-ui,"Microsoft YaHei",s
 </style>
 </head>
 <body>
+<button id="skinBtn" title="随机背景开关">🎨</button>
 <div id="w">
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
@@ -3428,6 +3686,26 @@ async function refresh(){
 }
 refresh();
 setInterval(refresh, 5000);
+// 随机背景（默认开，右下角 🎨 点击关闭）
+(function(){
+  const BG_KEY = 'tsWidgetSkinBg';
+  const bgOn = localStorage.getItem(BG_KEY) !== '0';
+  const applyBg = on => {
+    if(on){
+      const img = new Image();
+      img.onload = ()=>{ document.body.style.backgroundImage = "url('" + img.src + "')"; };
+      img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
+    } else {
+      document.body.style.backgroundImage = '';
+    }
+  };
+  applyBg(bgOn);
+  $('#skinBtn').onclick = ()=>{
+    const now = localStorage.getItem(BG_KEY) !== '0';
+    localStorage.setItem(BG_KEY, now ? '0' : '1');
+    applyBg(!now);
+  };
+})();
 // 拖动
 let drag=false, sx=0, sy=0, ox=0, oy=0;
 $('#hd').addEventListener('mousedown',e=>{
