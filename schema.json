@@ -163,7 +163,7 @@
       "enable_balance": {
         "type": "switch",
         "name": "启用余额监测",
-        "default": false,
+        "default": true,
         "hint": "开启后按间隔轮询余额源，工具/命令/页面可查余额"
       },
       "balance_ssl_verify": {

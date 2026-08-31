@@ -493,7 +493,7 @@ class TokenStatsPlugin(BasePlugin):
 
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
-        self.enable_balance = bool(bal.get("enable_balance", False))
+        self.enable_balance = bool(bal.get("enable_balance", True))
         interval = bal.get("balance_interval", 1)
         self.balance_interval = max(1, int(interval) if interval is not None else 1)
         sources = bal.get("balance_sources", [])
@@ -2404,6 +2404,9 @@ class TokenStatsPlugin(BasePlugin):
         except Exception:
             n = 15
         recs = self._read_records()
+        sid_filter = request.query_params.get("sid") or ""
+        if sid_filter:
+            recs = [r for r in recs if r.get("sid", "") == sid_filter]
         out = []
         for r in reversed(recs[-n:]):
             try:
@@ -2496,6 +2499,90 @@ class TokenStatsPlugin(BasePlugin):
             "byChannel": dim(by_channel),
             "byModel": dim(by_model),
             "bySid": dim(by_sid),
+        }
+
+    @register.api(method="GET", path="/sessions", auth=True)
+    async def api_sessions(self, request: Request):
+        """/sessions?range=today|d7|d30|total|custom&from=&to=
+        会话级统计：细到每个 sid（如 qq:dm:12345 / qq:gm:12345），
+        并按私聊(dm)/群聊(gm)/其他 整体归类汇总"""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        range_key = (request.query_params.get("range") or "today").lower()
+        if range_key == "total":
+            frm, to = "0000-01-01", "9999-12-31"
+        elif range_key == "d7":
+            frm, to = (now - timedelta(days=6)).strftime("%Y-%m-%d"), today
+        elif range_key == "d30":
+            frm, to = (now - timedelta(days=29)).strftime("%Y-%m-%d"), today
+        else:
+            frm, to = today, today
+        frm = request.query_params.get("from") or frm
+        to = request.query_params.get("to") or to
+
+        sessions = {}
+        for r in self._read_records():
+            try:
+                t = _parse_ts(r["t"])
+            except Exception:
+                continue
+            day = t.strftime("%Y-%m-%d")
+            if day < frm or day > to:
+                continue
+            sid = r.get("sid", "") or "未知"
+            a = sessions.setdefault(sid, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "last_at": ""})
+            i, o, c, v = r.get("i", 0), r.get("o", 0), r.get("c", 0), r.get("v", 0)
+            a["r"] += 1; a["i"] += i; a["o"] += o; a["c"] += c; a["v"] += v
+            _ts = t.strftime("%Y-%m-%d %H:%M:%S")
+            if _ts > a["last_at"]:
+                a["last_at"] = _ts
+            rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
+            amt, cur = _rule_cost_ex(rule, i, o, c, t) if rule else (None, "CNY")
+            if amt is not None:
+                ukey = f"{cur}|{_rule_unit(rule) if rule else ''}"
+                a["units"][ukey] = a["units"].get(ukey, 0.0) + amt
+                a["matched"] = True
+
+        def _sess_type(sid: str) -> str:
+            if ":dm:" in sid:
+                return "dm"
+            if ":gm:" in sid:
+                return "gm"
+            return "other"
+
+        groups = {
+            "dm": {"label": "私聊", "r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "sessions": 0},
+            "gm": {"label": "群聊", "r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "sessions": 0},
+            "other": {"label": "其他", "r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "sessions": 0},
+        }
+        arr = []
+        for sid, a in sessions.items():
+            st = _sess_type(sid)
+            g = groups[st]
+            g["sessions"] += 1
+            for k in ("r", "i", "o", "c", "v"):
+                g[k] += a[k]
+            for uk, uv in a["units"].items():
+                g["units"][uk] = g["units"].get(uk, 0.0) + uv
+            if a["matched"]:
+                g["matched"] = True
+            arr.append({"sid": sid, "type": st, **a})
+        arr.sort(key=lambda x: x["v"], reverse=True)
+
+        def fmt_cost(a):
+            bits = []
+            if a.get("matched"):
+                for ukey, uamt in (a.get("units") or {}).items():
+                    _, _, uu = ukey.partition("|")
+                    bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
+            return " + ".join(bits) if bits else None
+
+        return {
+            "from": frm, "to": to,
+            "groups": {k: {**v, "cost": fmt_cost(v)} for k, v in groups.items()},
+            "sessions": [{"sid": x["sid"], "type": x["type"], "r": x["r"], "i": x["i"], "o": x["o"],
+                           "c": x["c"], "v": x["v"], "cost": fmt_cost(x), "last_at": x["last_at"]}
+                          for x in arr[:50]],
         }
 
     @register.api(method="GET", path="/trend", auth=True)
@@ -3024,6 +3111,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
   <div class="tab on" data-p="ov">概览</div>
   <div class="tab" data-p="trend">时间趋势</div>
   <div class="tab" data-p="dim">维度分析</div>
+  <div class="tab" data-p="sess">会话统计</div>
   <div class="tab" data-p="rec">最近记录</div>
   <div class="tab" data-p="price">价格规则</div>
   <div class="tab" data-p="bal">余额监测</div>
@@ -3064,6 +3152,20 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <span style="color:var(--dim);font-size:12px" id="dimRange"></span>
     </div>
     <table><thead><tr><th>维度</th><th>值</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th>费用</th></tr></thead><tbody id="dimBody"></tbody></table>
+  </div>
+</div>
+
+<div class="panel" id="p-sess">
+  <div class="box" style="margin-bottom:12px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+      <button class="btn" data-sr="today">今天</button>
+      <button class="btn on" data-sr="d7">近7天</button>
+      <button class="btn" data-sr="d30">近30天</button>
+      <button class="btn" data-sr="total">累计</button>
+      <span style="color:var(--dim);font-size:12px" id="sessRange"></span>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px" id="sessGroups"></div>
+    <table><thead><tr><th>会话</th><th>类型</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th>费用</th><th>最近活动</th></tr></thead><tbody id="sessBody"></tbody></table>
   </div>
 </div>
 
@@ -3153,6 +3255,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   t.classList.add('on'); $('#p-'+t.dataset.p).classList.add('on');
   if(t.dataset.p==='trend') loadTrend(curTr);
   if(t.dataset.p==='dim') loadDim(curDim);
+  if(t.dataset.p==='sess') loadSess(curSessRange);
   if(t.dataset.p==='rec') loadRec();
   if(t.dataset.p==='price') loadPrice();
   if(t.dataset.p==='bal') loadBal(false);
@@ -3324,6 +3427,36 @@ async function loadDim(r){
   });
   push('来源', d.bySource); push('渠道', d.byChannel); push('模型', d.byModel); push('会话', d.bySid);
   $('#dimBody').innerHTML = rows.join('') || '<tr><td colspan="8" class="note">该范围暂无数据</td></tr>';
+}
+let curSessRange='d7';
+document.querySelectorAll('[data-sr]').forEach(b=>b.onclick=()=>{curSessRange=b.dataset.sr;document.querySelectorAll('[data-sr]').forEach(x=>x.classList.remove('on'));b.classList.add('on');loadSess(curSessRange)});
+async function loadSess(r){
+  const d = await jget('/sessions?range='+r);
+  $('#sessRange').textContent = d.from + ' ~ ' + d.to + '（' + RL[r] + '）';
+  const g = d.groups||{};
+  const gOrder = [['dm','私聊'],['gm','群聊'],['other','其他']];
+  $('#sessGroups').innerHTML = gOrder.map(([k,label])=>{
+    const x = g[k]||{};
+    return '<div class="box" style="flex:1;min-width:150px;padding:10px 14px;margin:0"><div style="font-size:12px;color:var(--dim)">'+label+' · '+x.sessions+' 个会话</div><div style="font-size:18px;font-weight:700;margin-top:4px">'+fmt4(x.v)+' <span style="font-size:11px;color:var(--dim)">tokens</span></div><div style="font-size:11px;color:var(--dim);margin-top:2px">'+x.r+' 轮'+(x.cost?' · '+esc(x.cost):'')+'</div></div>';
+  }).join('');
+  const rows = (d.sessions||[]).map(x=>{
+    const t = x.type==='dm'?'私聊':(x.type==='gm'?'群聊':'其他');
+    return '<tr style="cursor:pointer" data-sid="'+esc(x.sid)+'" onclick="sessRecs(this.dataset.sid)"><td>'+esc(x.sid)+'</td><td>'+t+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td><td>'+esc(x.last_at||'')+'</td></tr>';
+  }).join('');
+  $('#sessBody').innerHTML = rows || '<tr><td colspan="9" class="note">该范围暂无会话数据</td></tr>';
+}
+function sessRecs(sid){
+  showTab('rec');
+  recSlotFilter = null;
+  $('#recCount').textContent = '会话 '+sid;
+  loadRecBySid(sid);
+}
+async function loadRecBySid(sid){
+  const d = await jget('/records?n=100&sid='+encodeURIComponent(sid));
+  $('#recBody').innerHTML = (d.recs||[]).map(x=>
+    '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+esc(x.s)+'</td><td>'+esc(x.ch)+'</td>'+
+    '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
+    '<tr><td colspan="9" class="note">该会话暂无记录</td></tr>';
 }
 async function loadRec(){
   const d = await jget('/records?n='+(recSlotFilter?100:15));
@@ -3635,11 +3768,28 @@ setInterval(loadOv, 1000);
       document.body.style.backgroundImage = '';
     }
   };
+  const toast = msg => {
+    let t = document.getElementById('skinToast');
+    if(!t){
+      t = document.createElement('div');
+      t.id = 'skinToast';
+      t.style.cssText = 'position:fixed;left:50%;bottom:60px;transform:translateX(-50%);background:rgba(15,23,42,.92);border:1px solid var(--line);color:var(--fg);padding:8px 16px;border-radius:20px;font-size:13px;z-index:999;transition:opacity .3s;pointer-events:none';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.opacity = '1';
+    clearTimeout(t._tm);
+    t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 1600);
+  };
+  const syncIcon = on => { $('#skinBtn').textContent = on ? '👕' : '🚫'; $('#skinBtn').title = on ? '随机背景：开（点击关闭）' : '随机背景：关（点击开启）'; };
   applyBg(bgOn);
+  syncIcon(bgOn);
   $('#skinBtn').onclick = ()=>{
     const now = localStorage.getItem(BG_KEY) !== '0';
     localStorage.setItem(BG_KEY, now ? '0' : '1');
     applyBg(!now);
+    syncIcon(!now);
+    toast('随机背景：' + (!now ? '开' : '关'));
   };
 })();
 </script>
@@ -3749,11 +3899,28 @@ setInterval(refresh, 5000);
       document.body.style.backgroundImage = '';
     }
   };
+  const toast = msg => {
+    let t = document.getElementById('skinToast');
+    if(!t){
+      t = document.createElement('div');
+      t.id = 'skinToast';
+      t.style.cssText = 'position:fixed;left:50%;bottom:50px;transform:translateX(-50%);background:rgba(15,23,42,.95);border:1px solid #334155;color:#e2e8f0;padding:6px 14px;border-radius:16px;font-size:12px;z-index:9999;transition:opacity .3s;pointer-events:none';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.opacity = '1';
+    clearTimeout(t._tm);
+    t._tm = setTimeout(()=>{ t.style.opacity = '0'; }, 1600);
+  };
+  const syncIcon = on => { $('#skinBtn').textContent = on ? '👕' : '🚫'; $('#skinBtn').title = on ? '随机背景：开（点击关闭）' : '随机背景：关（点击开启）'; };
   applyBg(bgOn);
+  syncIcon(bgOn);
   $('#skinBtn').onclick = ()=>{
     const now = localStorage.getItem(BG_KEY) !== '0';
     localStorage.setItem(BG_KEY, now ? '0' : '1');
     applyBg(!now);
+    syncIcon(!now);
+    toast('随机背景：' + (!now ? '开' : '关'));
   };
 })();
 // 拖动
@@ -3781,12 +3948,13 @@ $('#fold').onclick=()=>{
   if(b.style.display==='none'){ b.style.display=''; f.textContent='—'; }
   else { b.style.display='none'; f.textContent='+'; }
 };
-// 独立小窗
+// 独立小窗：blob URL 打开可拖动迷你面板（绕过 window.open 空窗拦截）
 $('#pop').onclick=()=>{
-  const w=window.open('', '_blank', 'width=340,height=300');
+  const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.95);border:1px solid #334155;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#e2e8f0;user-select:none;z-index:9999}.head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #334155;cursor:move}.dot{width:8px;height:8px;border-radius:50%;background:#34d399}.t{flex:1;font-size:12px;font-weight:600}.hbtn{border:1px solid #334155;background:transparent;color:#94a3b8;border-radius:6px;cursor:pointer;font-size:11px;padding:2px 6px}.hbtn:hover{color:#e2e8f0;border-color:#38bdf8}.row{display:flex;justify-content:space-between;padding:5px 12px;font-size:12px}.row .k{color:#94a3b8}.row .v{font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:#334155;margin:6px 0}.foot{padding:8px 12px;font-size:10px;color:#94a3b8;border-top:1px solid #334155}</style></head><body><div id="w"><div class="head" id="hd"><span class="dot" id="dot"></span><span class="t" id="title">Token 挂件</span><button class="hbtn" id="fold">—</button></div><div id="body"><div class="row"><span class="k">本次会话</span><span class="v" id="v_sess">—</span></div><div class="row"><span class="k">今日</span><span class="v" id="v_today">—</span></div><div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div><div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div><div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div><div class="sep"></div><div class="row"><span class="k">余额</span><span class="v" id="v_bal">—</span></div></div><div class="foot" id="st">—</div></div><script>const API="'+API+'";const $=s=>document.querySelector(s);const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ""+v;if(v<9950)return (v/1000).toFixed(1).replace(".0","")+"K";if(v<995000)return Math.round(v/1000)+"K";if(v<9950000)return (v/1e6).toFixed(1).replace(".0","")+"M";if(v<995000000)return Math.round(v/1e6)+"M";return Math.round(v/1e9)+"B"};async function rf(){try{const d=await fetch(API+"/stats",{cache:"no-store"}).then(r=>r.json());$("#dot").style.background=d.busy?"#60a5fa":"#34d399";$("#title").textContent="Token · "+(d.model||"—");$("#v_sess").textContent=fmt4(d.total);$("#v_today").textContent=fmt4((d.ranges||{}).today?d.ranges.today.v:0);$("#v_d7").textContent=fmt4((d.ranges||{}).d7?d.ranges.d7.v:0);const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return "—";return c.units.map(u=>u.unit?(u.amt+" "+u.unit):u.amt).join(" + ")};$("#v_cost").textContent=fc(co);$("#v_cost_total").textContent=fc(coT);const b=d.balance||{};$("#v_bal").textContent=b.current||"—";$("#st").textContent="会话 "+d.rounds+" 轮 · "+(d.src||"");}catch(e){$("#st").textContent="加载失败";}}rf();setInterval(rf,5000);let drag=false,sx=0,sy=0,ox=0,oy=0;const hd=$("#hd");hd.addEventListener("mousedown",e=>{if(e.target.id==="fold")return;drag=true;sx=e.clientX;sy=e.clientY;const r=$("#w").getBoundingClientRect();ox=r.left;oy=r.top;hd.style.cursor="grabbing"});document.addEventListener("mousemove",e=>{if(!drag)return;$("#w").style.left=Math.max(0,ox+e.clientX-sx)+"px";$("#w").style.top=Math.max(0,oy+e.clientY-sy)+"px"});document.addEventListener("mouseup",()=>{drag=false;hd.style.cursor="move"});$("#fold").onclick=()=>{const b=$("#body"),f=$("#fold");if(b.style.display==="none"){b.style.display="";f.textContent="—"}else{b.style.display="none";f.textContent="+"}};<\/script></body></html>';
+  const url = URL.createObjectURL(new Blob([html], {type:'text/html'}));
+  const w = window.open(url, '_blank', 'width=340,height=320');
   if(!w){ alert('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
-  w.document.write('<html><head><title>Token 挂件</title><style>body{margin:0;background:transparent;font-family:system-ui,sans-serif;overflow:hidden}#w{position:fixed;left:8px;top:8px;width:300px;background:rgba(15,23,42,.95);border:1px solid #334155;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.5);color:#e2e8f0;user-select:none;z-index:9999}.row{display:flex;justify-content:space-between;padding:5px 12px;font-size:12px}.row .k{color:#94a3b8}.row .v{font-weight:600}.v.cost{color:#34d399}.sep{height:1px;background:#334155;margin:6px 0}.foot{padding:8px 12px;font-size:10px;color:#94a3b8;border-top:1px solid #334155}</style></head><body><div id="w"></div><script>const API='"+API+"';const fmt4=v=>{v=Math.max(0,Math.round(v||0));if(v<1000)return ''+v;if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K';if(v<995000)return Math.round(v/1000)+'K';if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M';if(v<995000000)return Math.round(v/1e6)+'M';return Math.round(v/1e9)+'B'};async function rf(){try{const d=await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());const co=(d.costs||{}).today||{},coT=(d.costs||{}).total||{};const b=d.balance||{};const fc=c=>{if(!c.matched||!c.units||!c.units.length)return '—';return c.units.map(u=>u.unit?(u.amt+' '+u.unit):u.amt).join(' + ')};document.getElementById('w').innerHTML='<div class=row><span class=k>本次会话</span><span class=v>'+fmt4(d.total)+'</span></div><div class=row><span class=k>今日</span><span class=v>'+fmt4((d.ranges||{}).today?d.ranges.today.v:0)+'</span></div><div class=row><span class=k>近7天</span><span class=v>'+fmt4((d.ranges||{}).d7?d.ranges.d7.v:0)+'</span></div><div class=row><span class=k>费用(今日)</span><span class="v cost">'+fc(co)+'</span></div><div class=row><span class=k>费用(累计)</span><span class="v cost">'+fc(coT)+'</span></div>'+(b.current?'<div class=sep></div><div class=row><span class=k>余额</span><span class=v>'+b.current+'</span></div>':'')+'<div class=foot>会话 '+d.rounds+' 轮 · '+(d.src||'')+'</div>';}catch(e){document.getElementById('w').innerHTML='<div class=foot>加载失败</div>';}}rf();setInterval(rf,5000);<\/script></body></html>');
-  w.document.close();
+  setTimeout(()=>URL.revokeObjectURL(url), 60000);
 };
 $('#go').onclick=()=>{ window.open('/page/plugin/KiraAI_token_stats_plugin/stats','_blank'); };
 </script>
