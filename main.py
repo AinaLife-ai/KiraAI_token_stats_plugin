@@ -539,6 +539,13 @@ class TokenStatsPlugin(BasePlugin):
         sources = bal.get("balance_sources", [])
         # 复制一份再 append，避免直接引用 cfg 原始 list（热重载时重复追加）
         self.balance_sources = list(sources) if isinstance(sources, list) else []
+        # 派生源去重兜底：历史配置可能已被污染（派生源曾被整体写回 balance_sources），
+        # append 派生源前按 (type,url,name) 查重，已存在则跳过
+        def _bal_src_exists(name, url):
+            for ex in self.balance_sources:
+                if ex.get("name") == name and (not url or (ex.get("url") or "") == url):
+                    return True
+            return False
         # New-API 站点简易文本格式（对齐 api-balance 插件）：每行 名称;base_url;令牌;用户ID;换算比例(可选)
         simple_sec = cfg.get("section_balance_newapi_simple", {}) or {}
         simple_list = simple_sec.get("newapi_sites_simple", [])
@@ -560,6 +567,8 @@ class TokenStatsPlugin(BasePlugin):
                     conversion = 500000
                 if not base_url or not api_key or not api_user:
                     continue
+                if _bal_src_exists(name, base_url):
+                    continue
                 self.balance_sources.append({
                     "name": name,
                     "type": "newapi",
@@ -568,6 +577,7 @@ class TokenStatsPlugin(BasePlugin):
                     "api_user": api_user,
                     "quota_conversion": conversion,
                     "enabled": True,
+                    "_origin": "simple",
                 })
         # 固定平台快捷配置（对齐 api-balance 插件风格）：启用 + 填 key 即自动并入余额源
         for key, dname, durl in (
@@ -577,12 +587,17 @@ class TokenStatsPlugin(BasePlugin):
                 ("zhipu", "智谱", "https://open.bigmodel.cn/api/paas/v4")):
             sec = cfg.get(f"section_balance_{key}", {}) or {}
             if sec.get("enabled") and sec.get("api_key"):
+                qname = (sec.get("name") or dname).strip()
+                qurl = (sec.get("base_url") or durl).strip()
+                if _bal_src_exists(qname, qurl):
+                    continue
                 self.balance_sources.append({
-                    "name": (sec.get("name") or dname).strip(),
+                    "name": qname,
                     "type": "auto",
-                    "url": (sec.get("base_url") or durl).strip(),
+                    "url": qurl,
                     "api_key": sec.get("api_key"),
                     "enabled": True,
+                    "_origin": f"quick:{key}",
                 })
         self.balance_unit = (bal.get("balance_unit", "元") or "元").strip() or "元"
 
@@ -3018,6 +3033,9 @@ class TokenStatsPlugin(BasePlugin):
                 "at": st.get("at", ""),
                 "msg": st.get("msg", ""),
             }
+            # 派生源（简易文本/平台快捷配置派生）带 origin 标记：前端据此禁用编辑/删除/开关
+            if src.get("_origin"):
+                item["origin"] = src["_origin"]
             # 配置字段（可视化编辑器回填用，含禁用源）；api_key 掩码回传防明文泄露
             for k in ("url", "api_key", "api_user", "json_path", "quota_conversion",
                       "daily_quota", "anchor_balance", "refresh_time", "anchor_at", "model_ref"):
@@ -3039,10 +3057,13 @@ class TokenStatsPlugin(BasePlugin):
         new_sources = body.get("sources")
         if not isinstance(new_sources, list):
             return {"ok": False, "msg": "sources 必须是数组"}
-        # 清洗：只保留合法字段，剔除空项
+        # 清洗：只保留合法字段，剔除空项；派生源（简易文本/平台快捷配置）不落盘到
+        # balance_sources——它们始终只由各自原始配置项派生，避免整体写回后热重载重复增殖
         cleaned = []
         for s in new_sources:
             if not isinstance(s, dict):
+                continue
+            if s.get("_origin") or s.get("origin"):
                 continue
             name = str(s.get("name") or "").strip()
             if not name:
@@ -3295,6 +3316,8 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 .panel.on{animation:fadeIn .25s ease}
 .skel{height:92px;border-radius:12px;background:linear-gradient(90deg,var(--card) 25%,#263449 50%,var(--card) 75%);background-size:400px 100%;animation:shimmer 1.2s linear infinite;border:1px solid var(--line)}
 .card{transition:transform .18s ease,box-shadow .18s ease}
+.card::after{content:'';position:absolute;inset:0;background:linear-gradient(105deg,transparent 40%,rgba(255,255,255,.06) 50%,transparent 60%);transform:translateX(-130%);pointer-events:none;z-index:1}
+.card:hover::after{transform:translateX(130%);transition:transform .8s ease}
 .card:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.3)}
 .card[data-k="session"],.card[data-k="today"]{grid-column:span 2}
 @media(max-width:700px){.card[data-k="session"],.card[data-k="today"]{grid-column:span 1}}
@@ -3593,9 +3616,10 @@ async function _loadOvInner(){
   $('#dot').style.boxShadow = '';
   $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
   $('#sub').textContent = '模型 ' + (d.model||'—') + ' · 渠道 ' + (d.channel||'—') + ' · 日志 ' + (d.logFile||'');
-  const el = Math.floor(d.elapsed/60), em = d.elapsed%60;
+  // 会话已进行时长：以服务端值校准基准，本地 1s ticker 递增（见 fmtElapsed/setInterval 底部）
+  _elBase = {sec: d.elapsed||0, at: Date.now()};
   $('#snap').innerHTML = '<span><span class="dot"></span>' + esc(d.src||'—') + '</span>' +
-    '<span class="st">会话 <b>'+d.rounds+'</b> 轮 · <b>'+fmt4(d.total)+'</b> Token · 已进行 '+(el>0?el+' 分 ':'')+em+' 秒</span>' +
+    '<span class="st">会话 <b>'+d.rounds+'</b> 轮 · <b>'+fmt4(d.total)+'</b> Token · 已进行 <span id="sessElapsed">'+fmtElapsed(_elBase.sec)+'</span></span>' +
     '<span class="st">最近一轮：输入 <b>'+fmt(d.lastInput)+'</b> · 输出 <b>'+fmt(d.lastOutput)+'</b>'+(d.lastCached?' · 缓存 <b>'+fmt(d.lastCached)+'</b>':'')+'</span>';
   const hist = await jget('/history');
   const dayVols = (hist.days||[]).map(x=>x.v);
@@ -3638,6 +3662,8 @@ async function _loadOvInner(){
 let _cardEls = {};
 function renderCards(cards){
   const box = $('#cards');
+  // 首次真正渲染时清理初始骨架屏占位（幂等）
+  box.querySelectorAll('.skel').forEach(e=>e.remove());
   const seen = {};
   cards.forEach(c=>{
     seen[c.k] = 1;
@@ -3994,6 +4020,13 @@ async function loadBal(refresh){
   $('#balInfo').textContent = balSources.length + ' 个源';
   $('#balBody').innerHTML = balSources.map((x,i)=>{
     const unit = x.unit!==undefined ? x.unit : (x.currency==='积分' ? '积分' : (d.unit||'元'));
+    if(x.origin){
+      // 派生源（简易文本/平台快捷配置派生）：配置项管理，不提供编辑/删除/开关，避免改完存不住
+      const oLabel = x.origin==='simple' ? '由「New-API 简易配置」文本行管理' : '由平台快捷配置（'+esc(x.origin.replace('quick:',''))+'）管理';
+      return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw" title="'+oLabel+'"><input type="checkbox" disabled '+(x.enabled!==false?'checked':'')+'><i></i></label></td><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+(unit?' '+esc(unit):'')):'失败')+'</td>'+
+      '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
+      '<td class="note" title="请在插件配置中修改对应配置项">由配置项管理</td></tr>';
+    }
     return '<tr'+(x.enabled===false?' style="opacity:.55"':'')+'><td><label class="sw"><input type="checkbox" '+(x.enabled!==false?'checked':'')+' onchange="balToggle('+i+',this.checked)"><i></i></label></td><td>'+esc(x.name)+'</td><td>'+esc(x.type)+(x.est?' <span class="note">(估算)</span>':'')+'</td><td class="'+(x.ok?'ok':'bad')+'">'+(x.ok?(x.balance+(unit?' '+esc(unit):'')):'失败')+'</td>'+
     '<td>'+esc(x.at||'—')+'</td><td class="note">'+esc(x.msg||'—')+'</td>'+
     '<td><button class="btn" onclick="balEditOpen('+i+')">编辑</button> <button class="btn" onclick="balDel('+i+',this)">删除</button></td></tr>';
@@ -4111,6 +4144,21 @@ $('#balEdit').onclick = ()=>balEditOpen(-1);
 $('#balEditClose').onclick = ()=>{ $('#balEditor').style.display='none'; };
 $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent='15'; loadRec(); };
 
+// 已进行时长本地 1s 计时：/stats 轮询到校准基准（_elBase），页面不可见时暂停省 CPU，
+// 恢复可见时立即重新拉取校准，避免漂移
+let _elBase = null;
+function fmtElapsed(sec){
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec/60), s = sec%60;
+  return (m>0?m+' 分 ':'')+s+' 秒';
+}
+setInterval(()=>{
+  if(document.hidden || !_elBase) return;
+  const e = $('#sessElapsed');
+  if(e) e.textContent = fmtElapsed(_elBase.sec + (Date.now()-_elBase.at)/1000);
+}, 1000);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadOv(); });
+
 loadOv();
 setInterval(loadOv, 4000);
 // 随机背景（默认开，右下角 👕 点击关闭，localStorage 记忆）
@@ -4201,6 +4249,7 @@ body.grabbing,body.grabbing *{cursor:grabbing!important}
 </head>
 <body>
 <button id="skinBtn" title="随机背景开关">👕</button>
+<button id="bgBtn" title="自定义背景：单击选择图片（1-10 张），双击清除">🖼</button>
 <div id="w">
   <div class="head" id="hd">
     <span class="dot" id="dot"></span>
@@ -4228,6 +4277,10 @@ body.grabbing,body.grabbing *{cursor:grabbing!important}
 const API = '/api/plugin/KiraAI_token_stats_plugin';
 const PAGE = '/page/plugin/KiraAI_token_stats_plugin';
 const $ = s=>document.querySelector(s);
+// #w 可能被移入 PiP 窗口的 document，保存直接元素引用，所有内部读写经 wEl/w$（跨 document 仍有效）
+const wEl = document.getElementById('w');
+const w$ = s=>wEl.querySelector(s);
+let pipWinRef = null; // 活动中的 PiP 窗口（无则 null）
 const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1000)+'K';
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
@@ -4238,9 +4291,9 @@ const POS_KEY = IS_POP ? 'tsWidgetPopPos' : 'tsWidgetPos';
 let compact = localStorage.getItem('tsWidgetCompact')==='1';
 let pos = null;
 try{ pos = JSON.parse(localStorage.getItem(POS_KEY)||'null'); }catch(e){}
-if(pos && !IS_POP){ $('#w').style.left=pos.x+'px'; $('#w').style.top=pos.y+'px'; }
-if(compact){ $('#w').style.width='180px'; }
-if(IS_POP){ $('#pop').style.display='none'; document.title='Token 挂件 · 小窗'; }
+if(pos && !IS_POP){ wEl.style.left=pos.x+'px'; wEl.style.top=pos.y+'px'; }
+if(compact){ wEl.style.width='180px'; }
+if(IS_POP){ w$('#pop').style.display='none'; document.title='Token 挂件 · 小窗'; }
 
 function toast(msg){
   let t = document.getElementById('skinToast');
@@ -4258,7 +4311,7 @@ function toast(msg){
 
 // 数值变化 150ms 闪动
 function setVal(id, txt){
-  const el = $(id);
+  const el = w$(id);
   if(el.textContent !== txt){
     el.textContent = txt;
     el.classList.add('flash');
@@ -4268,11 +4321,11 @@ function setVal(id, txt){
 async function refresh(){
   try{
     const d = await fetch(API+'/stats',{cache:'no-store'}).then(r=>r.json());
-    $('#dot').classList.remove('err');
-    $('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
-    $('#title').textContent = 'Token · ' + (d.model||'—');
+    w$('#dot').classList.remove('err');
+    w$('#dot').style.background = d.busy ? '#60a5fa' : '#34d399';
+    w$('#title').textContent = 'Token · ' + (d.model||'—');
     setVal('#v_sess', fmt4(d.total));
-    $('#ballv').textContent = fmt4(d.total);
+    w$('#ballv').textContent = fmt4(d.total);
     setVal('#v_today', fmt4((d.ranges||{}).today ? d.ranges.today.v : 0));
     setVal('#v_d7', fmt4((d.ranges||{}).d7 ? d.ranges.d7.v : 0));
     const co = (d.costs||{}).today||{}, coT = (d.costs||{}).total||{};
@@ -4280,31 +4333,53 @@ async function refresh(){
     setVal('#v_cost', fmtCost(co));
     setVal('#v_cost_total', fmtCost(coT));
     const b = d.balance||{};
-    $('#bal').innerHTML = b.current ? '<div class="row"><span class="k">余额</span><span class="v">'+b.current+'</span></div>' : '';
-    $('#st').textContent = '会话 '+d.rounds+' 轮 · '+(d.src||'');
+    w$('#bal').innerHTML = b.current ? '<div class="row"><span class="k">余额</span><span class="v">'+b.current+'</span></div>' : '';
+    w$('#st').textContent = '会话 '+d.rounds+' 轮 · '+(d.src||'');
   }catch(e){
-    $('#dot').classList.add('err');
-    $('#dot').style.background = '';
-    $('#st').textContent = '加载失败';
+    w$('#dot').classList.add('err');
+    w$('#dot').style.background = '';
+    w$('#st').textContent = '加载失败';
   }
 }
 refresh();
 setInterval(refresh, 5000);
-// 随机背景（默认开，右下角 👕 点击关闭；图片加载失败静默回退）
+// 随机背景（默认开，右下角 👕 点击关闭）+ 自定义背景池（🖼 单击选图、双击清除；localStorage 共享，PiP 同步）
+const BG_KEY = 'tsWidgetSkinBg', CBG_KEY = 'tsWidgetCustomBg';
+let bgTimer = null;
+const customPool = ()=>{ try{ return JSON.parse(localStorage.getItem(CBG_KEY)||'[]'); }catch(e){ return []; } };
+// 经 body::before 叠层绘制（400ms 淡入过渡），PiP 活动窗口同步
+function paintBg(url){
+  const val = url ? 'url("'+url+'")' : 'none';
+  document.body.style.setProperty('--userbg', val);
+  document.body.classList.toggle('hasbg', !!url);
+  if(pipWinRef){
+    const pb = pipWinRef.document.body;
+    pb.style.setProperty('--userbg', val);
+    pb.classList.toggle('hasbg', !!url);
+  }
+}
+function applyBg(on){
+  clearInterval(bgTimer); bgTimer = null;
+  if(!on){ paintBg(''); return; }
+  const pool = customPool();
+  if(pool.length){
+    // 自定义池：加载随机选一张 + 每 60s 随机轮换
+    paintBg(pool[Math.floor(Math.random()*pool.length)]);
+    bgTimer = setInterval(()=>{
+      const p = customPool();
+      if(p.length) paintBg(p[Math.floor(Math.random()*p.length)]);
+    }, 60000);
+  } else {
+    // 线上随机图；加载失败静默回退
+    const img = new Image();
+    img.onload = ()=>paintBg(img.src);
+    img.onerror = ()=>paintBg('');
+    img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
+  }
+}
 (function(){
-  const BG_KEY = 'tsWidgetSkinBg';
-  const bgOn = localStorage.getItem(BG_KEY) !== '0';
-  const applyBg = on => {
-    if(on){
-      const img = new Image();
-      img.onload = ()=>{ document.body.style.backgroundImage = "url('" + img.src + "')"; };
-      img.onerror = ()=>{ document.body.style.backgroundImage = ''; };
-      img.src = 'https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=' + Date.now();
-    } else {
-      document.body.style.backgroundImage = '';
-    }
-  };
   const syncIcon = on => { $('#skinBtn').textContent = on ? '👕' : '🚫'; $('#skinBtn').title = on ? '随机背景：开（点击关闭）' : '随机背景：关（点击开启）'; };
+  const bgOn = localStorage.getItem(BG_KEY) !== '0';
   applyBg(bgOn);
   syncIcon(bgOn);
   $('#skinBtn').onclick = ()=>{
@@ -4315,18 +4390,83 @@ setInterval(refresh, 5000);
     toast('随机背景：' + (!now ? '开' : '关'));
   };
 })();
+// 自定义背景：选 1-10 张图，canvas 压缩（长边≤1280 JPEG q0.8，超限降档 960/q0.7 再逐张减少）存 localStorage
+function compressImg(file, maxSide, q){
+  return new Promise((res, rej)=>{
+    const r = new FileReader();
+    r.onerror = rej;
+    r.onload = ()=>{
+      const img = new Image();
+      img.onerror = rej;
+      img.onload = ()=>{
+        let w = img.naturalWidth, h = img.naturalHeight;
+        const sc = Math.min(1, maxSide/Math.max(w,h));
+        w = Math.max(1, Math.round(w*sc)); h = Math.max(1, Math.round(h*sc));
+        const cv = document.createElement('canvas');
+        cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        res(cv.toDataURL('image/jpeg', q));
+      };
+      img.src = r.result;
+    };
+    r.readAsDataURL(file);
+  });
+}
+(function(){
+  const fileIn = document.createElement('input');
+  fileIn.type = 'file'; fileIn.accept = 'image/*'; fileIn.multiple = true; fileIn.style.display = 'none';
+  document.body.appendChild(fileIn);
+  const bgOn = ()=>localStorage.getItem(BG_KEY) !== '0';
+  const trySave = arr => { try{ localStorage.setItem(CBG_KEY, JSON.stringify(arr)); return true; }catch(e){ return false; } };
+  fileIn.onchange = async ()=>{
+    const files = Array.from(fileIn.files||[]);
+    fileIn.value = '';
+    if(!files.length) return;
+    if(files.length > 10) toast('最多 10 张，仅取前 10 张');
+    const list = files.slice(0, 10);
+    let saved = 0;
+    outer:
+    for(const [ms, q] of [[1280, 0.8], [960, 0.7]]){
+      const urls = [];
+      for(const f of list){ try{ urls.push(await compressImg(f, ms, q)); }catch(e){} }
+      while(urls.length){
+        if(trySave(urls)){ saved = urls.length; break outer; }
+        urls.pop();
+      }
+    }
+    if(saved){
+      applyBg(bgOn());
+      toast('自定义背景已保存（'+saved+' 张）' + (saved < list.length ? '，图片过大仅保存前 '+saved+' 张' : ''));
+    }else{
+      toast('图片过大，无法保存自定义背景');
+    }
+  };
+  let clickTm = null;
+  $('#bgBtn').onclick = ()=>{ clearTimeout(clickTm); clickTm = setTimeout(()=>fileIn.click(), 260); };
+  $('#bgBtn').ondblclick = ()=>{
+    clearTimeout(clickTm);
+    localStorage.removeItem(CBG_KEY);
+    applyBg(bgOn());
+    toast('已清除自定义背景，恢复线上随机图');
+  };
+})();
 // 拖动（标题栏；球模式下整个球可拖）：弹窗模式优先 window.moveBy 移动真实窗口，失败退化页内拖拽
-let drag=false, sx=0, sy=0, ox=0, oy=0, popMove=true;
-$('#w').addEventListener('mousedown',e=>{
+// move/up 监听在 mousedown 时动态挂到 wEl.ownerDocument —— #w 移入 PiP 窗口后仍能拖动
+let drag=false, sx=0, sy=0, ox=0, oy=0, popMove=true, dragDist=0, dragDoc=null;
+wEl.addEventListener('mousedown',e=>{
   if(e.target.classList.contains('hbtn') || e.target.classList.contains('go')) return;
-  if(!$('#w').classList.contains('ball') && !e.target.closest('#hd')) return;
-  drag=true; sx=e.screenX; sy=e.screenY;
-  const r=$('#w').getBoundingClientRect(); ox=r.left; oy=r.top;
-  $('#w').classList.add('dragging');
-  document.body.classList.add('grabbing');
+  if(!wEl.classList.contains('ball') && !e.target.closest('#hd')) return;
+  drag=true; dragDist=0; sx=e.screenX; sy=e.screenY;
+  const r=wEl.getBoundingClientRect(); ox=r.left; oy=r.top;
+  wEl.classList.add('dragging');
+  (wEl.ownerDocument.body||document.body).classList.add('grabbing');
+  dragDoc = wEl.ownerDocument;
+  dragDoc.addEventListener('mousemove', onDragMove);
+  dragDoc.addEventListener('mouseup', onDragUp);
 });
-document.addEventListener('mousemove',e=>{
+function onDragMove(e){
   if(!drag) return;
+  dragDist += Math.abs(e.screenX-sx)+Math.abs(e.screenY-sy);
   if(IS_POP && popMove){
     try{
       window.moveBy(e.screenX-sx, e.screenY-sy);
@@ -4334,32 +4474,49 @@ document.addEventListener('mousemove',e=>{
       return;
     }catch(err){ popMove=false; sx=e.screenX; sy=e.screenY; }
   }
-  $('#w').style.left=Math.max(0,ox+(e.screenX-sx))+'px';
-  $('#w').style.top=Math.max(0,oy+(e.screenY-sy))+'px';
-});
-document.addEventListener('mouseup',()=>{
+  wEl.style.left=Math.max(0,ox+(e.screenX-sx))+'px';
+  wEl.style.top=Math.max(0,oy+(e.screenY-sy))+'px';
+}
+function onDragUp(){
   if(!drag) return;
-  drag=false; $('#w').classList.remove('dragging');
-  document.body.classList.remove('grabbing');
+  drag=false;
+  if(dragDoc){ dragDoc.removeEventListener('mousemove', onDragMove); dragDoc.removeEventListener('mouseup', onDragUp); dragDoc=null; }
+  wEl.classList.remove('dragging');
+  (wEl.ownerDocument.body||document.body).classList.remove('grabbing');
+  // 球模式下位移 <5px 判定为单击 → 展开
+  if(wEl.classList.contains('ball') && dragDist<5){ setFold(false); return; }
   if(IS_POP && popMove){
     try{ localStorage.setItem(POS_KEY, JSON.stringify({x:window.screenX,y:window.screenY})); }catch(e){}
   }else{
-    const r=$('#w').getBoundingClientRect();
+    const r=wEl.getBoundingClientRect();
     localStorage.setItem(POS_KEY, JSON.stringify({x:r.left,y:r.top}));
   }
-});
-// 折叠（球模式：收成 56px 圆球显示总量，点击展开）；弹窗模式同步 resizeTo 真实窗口
-$('#fold').onclick=()=>{
-  const w=$('#w');
-  const toBall = !w.classList.contains('ball');
-  w.classList.toggle('ball');
-  $('#fold').textContent = toBall ? '+' : '—';
+}
+// 折叠（球模式：收成 56px 圆球显示总量，球体单击展开）；弹窗模式同步 resizeTo 真实窗口并检测是否被钳制
+function setFold(toBall){
+  wEl.classList.toggle('ball', toBall);
+  wEl.classList.toggle('popball', toBall && IS_POP);
+  w$('#fold').textContent = toBall ? '+' : '—';
   if(IS_POP){
-    try{ toBall ? window.resizeTo(80,80) : window.resizeTo(340,360); }catch(e){}
+    try{
+      if(toBall){
+        window.resizeTo(140,150);
+        // 浏览器对 popup 外框有最小尺寸钳制，未生效则退回卡片态
+        if(window.outerWidth > 220){
+          toast('浏览器限制了小窗最小尺寸，无法折叠成球');
+          wEl.classList.remove('ball');
+          wEl.classList.remove('popball');
+          w$('#fold').textContent = '—';
+        }
+      }else{
+        window.resizeTo(340,360);
+      }
+    }catch(e){}
   }
-};
+}
+w$('#fold').onclick=()=>setFold(!wEl.classList.contains('ball'));
 // 独立小窗：同源真实 URL + 命名窗口单例 + 记忆位置；被拦截时页内 toast 提示
-$('#pop').onclick=()=>{
+function openPop(){
   let left = Math.max(0,(screen.availWidth||screen.width)-380), top = 80;
   try{
     const p = JSON.parse(localStorage.getItem('tsWidgetPopPos')||'null');
@@ -4369,33 +4526,47 @@ $('#pop').onclick=()=>{
   const w = window.open(url, 'tsWidgetPop', 'popup=yes,width=340,height=360,left='+left+',top='+top);
   if(!w){ toast('浏览器拦截了弹窗，请允许本站弹窗后重试'); return; }
   try{ w.focus(); }catch(e){}
-};
-// PiP 置顶浮窗（彩蛋层）：仅弹窗模式且浏览器支持 documentPictureInPicture 时显示；失败静默
-if(IS_POP && 'documentPictureInPicture' in window){
-  $('#pip').style.display = '';
-  $('#pip').onclick = async ()=>{
+}
+w$('#pop').onclick=openPop;
+// PiP 置顶浮窗：复制样式 + 移动 #w + pagehide 归还（侧边栏/弹窗两条路径共用）
+async function openPip(){
+  const pipWin = await documentPictureInPicture.requestWindow({width:340, height:360});
+  // 复制样式
+  let css = '';
+  for(const sh of document.styleSheets){
+    try{ for(const r of sh.cssRules) css += r.cssText; }catch(e){}
+  }
+  const st = pipWin.document.createElement('style');
+  st.textContent = css;
+  pipWin.document.head.appendChild(st);
+  pipWin.document.body.style.cssText = document.body.style.cssText;
+  pipWin.document.body.className = document.body.className;
+  pipWin.document.body.appendChild(wEl);
+  pipWinRef = pipWin;
+  const stEl = w$('#st'); if(stEl) stEl.textContent = '已置顶（OS 级浮窗）';
+  pipWin.addEventListener('pagehide', ()=>{
+    pipWinRef = null;
+    document.body.appendChild(wEl);
+  }, {once:true});
+}
+// 📌：浏览器支持即显示。侧边栏模式直接在当前 iframe 调 PiP（成功即一步到位，浮窗归属主标签页）；
+// 被 SecurityError/NotAllowedError 拒绝时回退：toast 提示并自动弹出独立小窗；弹窗模式保持手动点
+if('documentPictureInPicture' in window){
+  w$('#pip').style.display = '';
+  w$('#pip').onclick = async ()=>{
     try{
-      const pipWin = await documentPictureInPicture.requestWindow({width:340, height:360});
-      // 复制样式
-      let css = '';
-      for(const sh of document.styleSheets){
-        try{ for(const r of sh.cssRules) css += r.cssText; }catch(e){}
+      await openPip();
+    }catch(e){
+      if(!IS_POP){
+        toast('无法直接置顶：需先弹出独立小窗，已为你打开，请在小窗中点 📌');
+        openPop();
       }
-      const st = pipWin.document.createElement('style');
-      st.textContent = css;
-      pipWin.document.head.appendChild(st);
-      pipWin.document.body.style.cssText = document.body.style.cssText;
-      const wEl = $('#w');
-      pipWin.document.body.appendChild(wEl);
-      const stEl = $('#st'); if(stEl) stEl.textContent = '已置顶（OS 级浮窗）';
-      pipWin.addEventListener('pagehide', ()=>{
-        document.body.appendChild(wEl);
-      }, {once:true});
-    }catch(e){ /* 用户取消或不支持，静默 */ }
+      /* 弹窗模式下失败（含用户取消）静默 */
+    }
   };
 }
 // 打开看板：同源真实地址新开标签；失败时 toast + 可复制链接
-$('#go').onclick=()=>{
+w$('#go').onclick=()=>{
   const u = PAGE + '/stats';
   const w = window.open(u, '_blank');
   if(!w){
