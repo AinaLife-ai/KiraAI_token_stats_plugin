@@ -171,7 +171,8 @@ def _fmt_num(v):
 
 
 def _fmt4(v):
-    """超长自动缩写为 K/M/B（挂件风格）"""
+    """超长自动缩写：K(千)/M(百万)/亿/B(十亿)，沿用 995 平滑进位风格。
+    与 dashboard/widget 内嵌 JS fmt4 规则完全一致（取整用 int(x+0.5) 对齐 JS Math.round）"""
     try:
         v = max(0, int(v or 0))
     except (TypeError, ValueError):
@@ -181,14 +182,18 @@ def _fmt4(v):
     if v < 9950:
         return f"{v/1000:.1f}".replace(".0", "") + "K"
     if v < 995000:
-        return str(round(v / 1000)) + "K"
+        return str(int(v / 1000 + 0.5)) + "K"
     if v < 9950000:
         return f"{v/1000000:.1f}".replace(".0", "") + "M"
+    if v < 99500000:
+        return str(int(v / 1000000 + 0.5)) + "M"
     if v < 995000000:
-        return str(round(v / 1000000)) + "M"
+        return f"{v/100000000:.1f}".replace(".0", "") + "亿"
     if v < 9950000000:
+        return str(int(v / 100000000 + 0.5)) + "亿"
+    if v < 99500000000:
         return f"{v/1000000000:.1f}".replace(".0", "") + "B"
-    return str(round(v / 1000000000)) + "B"
+    return str(int(v / 1000000000 + 0.5)) + "B"
 
 
 def _parse_hhmm(s, default_h=0, default_m=0):
@@ -3540,10 +3545,12 @@ tr.cur td{background:rgba(52,211,153,.07)}
 const API = '/api/plugin/KiraAI_token_stats_plugin';
 const $ = s => document.querySelector(s);
 const fmt = n => Number(n||0).toLocaleString('zh-CN');
+// 数字缩写：K(千)/M(百万)/亿(1e8)/B(十亿)，995 平滑进位（三处 fmt4 与 Python _fmt4 规则一致）
 const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
-  if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1000)+'K';
-  if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
-  return Math.round(v/1e9)+'B'; };
+  if(v<9950)return (v/1e3).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1e3)+'K';
+  if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<99500000)return Math.round(v/1e6)+'M';
+  if(v<995000000)return (v/1e8).toFixed(1).replace('.0','')+'亿'; if(v<9950000000)return Math.round(v/1e8)+'亿';
+  if(v<99500000000)return (v/1e9).toFixed(1).replace('.0','')+'B'; return Math.round(v/1e9)+'B'; };
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const localDate = () => { const d=new Date();
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
@@ -4155,8 +4162,8 @@ $('#recRefresh').onclick = ()=>{ recSlotFilter=null; $('#recCount').textContent=
 let _elBase = null;
 function fmtElapsed(sec){
   sec = Math.max(0, Math.floor(sec));
-  const m = Math.floor(sec/60), s = sec%60;
-  return (m>0?m+' 分 ':'')+s+' 秒';
+  const d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  return (d>0?d+'天':'')+(d>0||h>0?h+'时':'')+(d>0||h>0||m>0?m+'分':'')+s+'秒';
 }
 setInterval(()=>{
   if(document.hidden || !_elBase) return;
@@ -4361,10 +4368,12 @@ const $ = s=>document.querySelector(s);
 const wEl = document.getElementById('w');
 const w$ = s=>wEl.querySelector(s);
 let pipWinRef = null; // 活动中的 PiP 窗口（无则 null）
+// 数字缩写：K(千)/M(百万)/亿(1e8)/B(十亿)，995 平滑进位（三处 fmt4 与 Python _fmt4 规则一致）
 const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
-  if(v<9950)return (v/1000).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1000)+'K';
-  if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<995000000)return Math.round(v/1e6)+'M';
-  return Math.round(v/1e9)+'B'; };
+  if(v<9950)return (v/1e3).toFixed(1).replace('.0','')+'K'; if(v<995000)return Math.round(v/1e3)+'K';
+  if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<99500000)return Math.round(v/1e6)+'M';
+  if(v<995000000)return (v/1e8).toFixed(1).replace('.0','')+'亿'; if(v<9950000000)return Math.round(v/1e8)+'亿';
+  if(v<99500000000)return (v/1e9).toFixed(1).replace('.0','')+'B'; return Math.round(v/1e9)+'B'; };
 // 双模式：URL ?pop=1 → 独立弹窗模式（window.moveBy/resizeTo 控制真实窗口）
 const IS_POP = new URLSearchParams(location.search).get('pop')==='1';
 const POS_KEY = IS_POP ? 'tsWidgetPopPos' : 'tsWidgetPos';
