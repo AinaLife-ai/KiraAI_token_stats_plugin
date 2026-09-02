@@ -4018,6 +4018,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             if rtype not in ("balance", "token", "cost"):
                 continue
             item = {"id": rid, "enabled": bool(r.get("enabled", True)), "type": rtype,
+                    "name": str(r.get("name") or "").strip(),
                     "target": str(r.get("target") or "").strip(),
                     "session": str(r.get("session") or "").strip(),
                     "op": (str(r.get("op") or "le").strip().lower() or "le"),
@@ -4528,6 +4529,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
       <button class="btn" id="alertAddRule">＋ 添加规则</button>
       <button class="btn" id="alertAddDel">＋ 添加投递会话</button>
+      <button class="btn" id="alertSaveBtn" style="background:var(--acc);border-color:var(--acc);color:#06283d;font-weight:600">保存配置</button>
       <span style="color:var(--dim);font-size:12px" id="alertInfo"></span>
       <span style="flex:1"></span>
       <span style="color:var(--dim);font-size:12px">监测余额 / 当日 tokens / 当日费用，达阈值自动提醒。同一站点可设多段阈值（如余额 10 元/5 元/1 元），各自独立触发互不影响。</span>
@@ -5447,6 +5449,15 @@ function alertEditDel(id){
     </div>`;
   $('#alertDelEditor').style.display='flex';
 }
+async function saveAlertConfig(){
+  try{
+    const r = await fetch(API+'/alert-config', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({deliveries: ALERT.deliveries, rules: ALERT.rules})});
+    const d = await r.json();
+    if(d.ok){ toast('配置已保存 ✓'); return true; }
+    toast('保存失败: '+(d.msg||'未知错误')); return false;
+  }catch(e){ toast('保存失败: '+e); return false; }
+}
 function alertSaveDel(){
   const name = $('#ad_name').value.trim(), sid = $('#ad_sid').value.trim();
   if(!name||!sid){ toast('名称和 sid 必填'); return; }
@@ -5457,13 +5468,13 @@ function alertSaveDel(){
     ALERT.deliveries.push({id:alertUid('d'), name, sid, enabled:$('#ad_enabled').checked});
   }
   $('#alertDelEditor').style.display='none';
-  renderAlert(); toast('会话已保存（记得点「保存配置」）');
+  renderAlert(); saveAlertConfig();
 }
 function alertDelDel(id){
   if(!confirm('删除投递会话？引用它的规则将无法投递。')) return;
   ALERT.deliveries = ALERT.deliveries.filter(d=>d.id!==id);
   ALERT.rules.forEach(r=>{r.deliveries=(r.deliveries||[]).filter(x=>x!==id)});
-  renderAlert(); toast('已删除会话');
+  renderAlert(); saveAlertConfig();
 }
 
 // ── 规则 ──
@@ -5499,9 +5510,16 @@ function alertEditRule(id){
       <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600" id="ar_target_lab">${type==='balance'?'目标（余额源名，留空=任一源）':'目标（来源标签，留空=全部）'}</label>
         <input id="ar_target" type="text" list="arTargetList" value="${r?aesc(r.target||''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="${type==='balance'?'如：DeepSeek':'如：gm / dm'}">
         <datalist id="arTargetList">${targetOpts.map(o=>`<option value="${o}">`).join('')}</datalist>
-        <div style="color:var(--dim);font-size:11px;margin-top:4px">${type==='balance'?'填余额源名称（包含匹配，如 DeepSeek 可匹配「DeepSeek 官方」）；留空=任一源达阈值即触发':'填来源标签（gm=群聊 / dm=私聊 / 自定义关键词规则标签）；留空=全部来源'}</div></div>
+        <div id="ar_target_hint" style="color:var(--dim);font-size:11px;margin-top:4px">${type==='balance'?'填余额源名称（包含匹配，如 DeepSeek 可匹配「DeepSeek 官方」）；留空=任一源达阈值即触发':'填来源标签（gm=群聊 / dm=私聊 / 自定义关键词规则标签）；留空=全部来源'}</div></div>
       <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">阈值 *</label>
-        <input id="ar_threshold" type="number" step="any" value="${r?r.threshold:''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如：10"></div>
+        <input id="ar_threshold" type="text" inputmode="decimal" value="${r?r.threshold:''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如：10 或 1M">
+        <div id="ar_thr_btns" style="display:${type==='token'?'flex':'none'};gap:6px;margin-top:6px">
+          <button type="button" class="btn sm" onclick="thrMul(1000)">K</button>
+          <button type="button" class="btn sm" onclick="thrMul(1000000)">M</button>
+          <button type="button" class="btn sm" onclick="thrMul(100000000)">亿</button>
+          <button type="button" class="btn sm" onclick="thrMul(1000000000)">B</button>
+        </div>
+        <div id="ar_thr_conv" style="color:var(--acc);font-size:11px;margin-top:4px;display:${type==='token'?'':'none'}"></div></div>
     </div>
     <div id="ar_session_row" style="display:${type==='balance'?'none':''};grid-template-columns:1fr 1fr;gap:0 12px">
       <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">限定会话 sid（留空=全部）</label>
@@ -5551,13 +5569,28 @@ function alertEditRule(id){
       <button class="btn" onclick="$('#alertEditor').style.display='none'">取消</button>
       <button class="btn" style="background:var(--acc);border-color:var(--acc);color:#06283d;font-weight:600" onclick="alertSaveRule()">保存规则</button>
     </div>`;
+  // 初始化比较方式：balance 才允许 le（编辑已有 token/cost 规则时禁用）
+  const leOpt0 = $('#ar_op').querySelector('option[value="le"]');
+  if(leOpt0) leOpt0.disabled = type!=='balance';
+  if(type!=='balance' && $('#ar_op').value==='le') $('#ar_op').value='ge';
   $('#alertEditor').style.display='flex';
   alertPreview();
   $('#ar_type').onchange = ()=>{
     const t = $('#ar_type').value;
     $('#ar_target_lab').textContent = t==='balance' ? '目标（余额源名，留空=任一源）' : '目标（来源标签，留空=全部）';
+    $('#ar_target_hint').textContent = t==='balance' ? '填余额源名称（包含匹配，如 DeepSeek 可匹配「DeepSeek 官方」）；留空=任一源达阈值即触发' : '填来源标签（gm=群聊 / dm=私聊 / 自定义关键词规则标签）；留空=全部来源';
+    $('#ar_target').placeholder = t==='balance' ? '如：DeepSeek' : '如：gm / dm';
     $('#ar_session_row').style.display = t==='balance' ? 'none' : 'grid';
     $('#ar_currency_row').style.display = t==='cost' ? '' : 'none';
+    // 比较方式：balance 才允许「低于等于」；token/cost 只允许「达到」
+    const opSel = $('#ar_op');
+    const leOpt = opSel.querySelector('option[value="le"]');
+    if(leOpt) leOpt.disabled = t!=='balance';
+    if(t!=='balance' && opSel.value==='le') opSel.value='ge';
+    // token 模式显示 K/M/亿/B 按钮与实时换算
+    const isToken = t==='token';
+    $('#ar_thr_btns').style.display = isToken ? 'flex' : 'none';
+    $('#ar_thr_conv').style.display = isToken ? '' : 'none';
     const opts = t==='balance' ? ['DeepSeek','硅基流动','NewAPI 中转','Kimi'] : ['gm','dm','system','全部'];
     $('#arTargetList').innerHTML = opts.map(o=>`<option value="${o}">`).join('');
     alertPreview();
@@ -5567,20 +5600,59 @@ function alertEditRule(id){
   });
   document.querySelectorAll('input[name=ar_mode]').forEach(x=>x.addEventListener('change', alertPreview));
 }
+function parseThreshold(v){
+  if(v==null||String(v).trim()==='') return NaN;
+  const s = String(v).trim().toLowerCase();
+  const m = s.match(/^([0-9]*\.?[0-9]+)\s*(k|m|亿|b)?$/);
+  if(!m) return NaN;
+  let n = parseFloat(m[1]);
+  const suf = m[2]||'';
+  if(suf==='k') n*=1000;
+  else if(suf==='m') n*=1000000;
+  else if(suf==='亿') n*=100000000;
+  else if(suf==='b') n*=1000000000;
+  return n;
+}
+function thrMul(mul){
+  // 预填写：点按钮直接填该单位的值（如点 M 填 1000000）；已有值时乘以该单位
+  const cur = parseThreshold($('#ar_threshold').value);
+  const base = isNaN(cur) ? 0 : cur;
+  $('#ar_threshold').value = base ? base*mul : mul;
+  alertPreview();
+}
+function thrConv(v){
+  if(!(v>0)) return '';
+  const units = [['B',1e9],['亿',1e8],['M',1e6],['K',1e3]];
+  for(const [u,div] of units){
+    if(v/div >= 1) return '= '+(v/div).toFixed(v/div>=100?0:2).replace(/\.?0+$/,'')+u;
+  }
+  if(v >= 100) return '= '+(v/1000).toFixed(2).replace(/\.?0+$/,'')+'K';
+  return '';
+}
 function alertPreview(){
-  const type = $('#ar_type').value, th = $('#ar_threshold').value;
+  const type = $('#ar_type').value;
+  const thRaw = $('#ar_threshold').value;
+  const th = parseThreshold(thRaw);
+  const thDisp = isNaN(th) ? (thRaw||'?') : th;
   const target = $('#ar_target').value.trim()||'全部';
   const unit = type==='balance'?'元':(type==='token'?'tokens':'元');
   const msg = $('#ar_message').value.trim() || `⚠️ ${ALERT_TYPE[type]}预警：${target} 已达 {value} {unit}`;
-  const pv = msg.replace(/\{name\}/g,target).replace(/\{value\}/g,th||'?').replace(/\{unit\}/g,unit)
-    .replace(/\{threshold\}/g,th||'?').replace(/\{type\}/g,ALERT_TYPE[type]).replace(/\{target\}/g,target);
+  const pv = msg.replace(/\{name\}/g,target).replace(/\{value\}/g,thDisp).replace(/\{unit\}/g,unit)
+    .replace(/\{threshold\}/g,thDisp).replace(/\{type\}/g,ALERT_TYPE[type]).replace(/\{target\}/g,target);
   $('#ar_preview').textContent = pv;
+  const conv = $('#ar_thr_conv');
+  if(conv){
+    const c = thrConv(th);
+    conv.textContent = c ? ('换算：'+c) : '';
+  }
 }
 function alertSaveRule(){
   const name = $('#ar_name').value.trim();
-  const threshold = parseFloat($('#ar_threshold').value);
+  const thRaw = $('#ar_threshold').value;
+  if(String(thRaw).trim().startsWith('-')){ toast('阈值不能为负数'); return; }
+  const threshold = parseThreshold(thRaw);
   if(!name){ toast('规则名称必填'); return; }
-  if(isNaN(threshold)){ toast('阈值必填且为数字'); return; }
+  if(isNaN(threshold)){ toast('阈值必填且为数字（支持 K/M/亿/B 后缀，如 1M）'); return; }
   const deliveries = [...document.querySelectorAll('#alertEditForm input[type=checkbox][value]')].filter(x=>x.checked).map(x=>x.value);
   const data = {
     name, type:$('#ar_type').value, op:$('#ar_op').value,
@@ -5598,13 +5670,13 @@ function alertSaveRule(){
   if(alertEditId){ Object.assign(ALERT.rules.find(x=>x.id===alertEditId), data); }
   else { ALERT.rules.push({id:alertUid('r'), enabled:true, ...data}); }
   $('#alertEditor').style.display='none';
-  renderAlert(); toast('规则已保存（记得点「保存配置」）');
+  renderAlert(); saveAlertConfig();
 }
 function alertDelRule(id){
   if(!confirm('删除该规则？')) return;
   ALERT.rules = ALERT.rules.filter(r=>r.id!==id);
   delete ALERT.fired[id];
-  renderAlert(); toast('已删除规则');
+  renderAlert(); saveAlertConfig();
 }
 function alertTest(id){
   const r = ALERT.rules.find(x=>x.id===id);
@@ -5612,10 +5684,15 @@ function alertTest(id){
   const dnames = (r.deliveries||[]).map(did=>{const d=ALERT.deliveries.find(x=>x.id===did);return d?d.name:did}).join('、');
   toast(`[测试] 已投递到：${dnames||'无'}（${r.mode==='llm'?'LLM 模式':'机械直发'}）`);
 }
-function alertReset(id){
+async function alertReset(id){
   delete ALERT.fired[id];
-  renderAlert(); toast('已复位该规则（可再次触发）');
+  renderAlert();
+  try{
+    await fetch(API+'/alert-reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+    toast('已复位该规则（可再次触发）');
+  }catch(e){ toast('复位失败: '+e); }
 }
+$('#alertSaveBtn').onclick = ()=>saveAlertConfig();
 $('#alertAddRule').onclick = ()=>alertEditRule(null);
 $('#alertAddDel').onclick = ()=>alertEditDel(null);
 $('#alertEditClose').onclick = ()=>$('#alertEditor').style.display='none';
