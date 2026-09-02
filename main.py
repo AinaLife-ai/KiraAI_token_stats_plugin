@@ -196,6 +196,64 @@ def _fmt4(v):
     return str(int(v / 1000000000 + 0.5)) + "B"
 
 
+def _fmt_dur(v):
+    """单轮 LLM 耗时（秒）格式化：与 dashboard/widget 内嵌 JS fmtDur 规则完全一致。
+    <10s → 4.56s；<60s → 23.4s；<60m → 1m23s；≥1h → 1h05m；无值/非法 → —"""
+    if v is None:
+        return "—"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if v != v or v < 0:  # NaN / 负值防御
+        return "—"
+    if v < 10:
+        return f"{v:.2f}s"
+    if v < 60:
+        return f"{v:.1f}s"
+    if v < 3600:
+        return f"{int(v // 60)}m{int(v % 60):02d}s"
+    return f"{int(v // 3600)}h{int(v % 3600 // 60):02d}m"
+
+
+def _rec_dur(rec: dict):
+    """从记录取耗时 d（秒，float）；无字段/非法 → None（兼容老记录）"""
+    d = rec.get("d")
+    if d is None:
+        return None
+    try:
+        d = float(d)
+    except (TypeError, ValueError):
+        return None
+    return d if d == d and d >= 0 else None
+
+
+def _dur_acc(b: dict, d):
+    """向聚合桶累计单轮耗时：维护 ds(和)/dc(数)/dmin/dmax；d=None 跳过"""
+    if d is None:
+        return
+    b["ds"] = b.get("ds", 0.0) + d
+    b["dc"] = b.get("dc", 0) + 1
+    if b.get("dmin") is None or d < b["dmin"]:
+        b["dmin"] = d
+    if b.get("dmax") is None or d > b["dmax"]:
+        b["dmax"] = d
+
+
+def _dur_stats(b: dict):
+    """聚合桶 → (avg, min, max)；无耗时数据（dc=0）→ (None, None, None)"""
+    cnt = (b or {}).get("dc", 0)
+    if not cnt:
+        return None, None, None
+    return b.get("ds", 0.0) / cnt, b.get("dmin"), b.get("dmax")
+
+
+def _dur_fields(b: dict) -> dict:
+    """聚合桶 → 下发字段 {da(avg秒), dmin, dmax}，无数据时全 None"""
+    a, mn, mx = _dur_stats(b)
+    return {"da": a, "dmin": mn, "dmax": mx}
+
+
 def _parse_hhmm(s, default_h=0, default_m=0):
     """解析 HH:mm → (时, 分)；失败返回默认"""
     try:
@@ -642,7 +700,7 @@ class TokenStatsPlugin(BasePlugin):
         self._sess = {
             "start": time.time(), "last": time.time(),
             "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
-            "aggs": {}, "sid": "",
+            "aggs": {}, "sid": "", "ds": 0.0, "dc": 0, "dmin": None, "dmax": None,
         }
         self._sess_map[""] = self._sess
         self._last_err_text = ""
@@ -795,6 +853,7 @@ class TokenStatsPlugin(BasePlugin):
         o = int(rec.get("o", 0) or 0)
         c = int(rec.get("c", 0) or 0)
         e = int(rec.get("e", 0) or 0)
+        d = _rec_dur(rec)
         # 分桶按该记录命中的规则所引用的峰谷方案（改方案后热重载 → 历史重分桶）
         _rule = _match_rule(self.rules, rec.get("ch", ""), rec.get("m", ""), rec.get("h", ""))
         peak = bool(_rule.get("peak_enabled", True)) and _is_peak_in(t, _windows_for_rule(_rule)) if _rule else _is_peak(t)
@@ -802,6 +861,7 @@ class TokenStatsPlugin(BasePlugin):
 
         ds = self._days.setdefault(day, {"r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}})
         ds["r"] += 1; ds["v"] += v; ds["i"] += i; ds["o"] += o; ds["c"] += c; ds["e"] += e
+        _dur_acc(ds, d)
         slots = ds["aggs"].setdefault(key, [None, None])
         agg = slots[1 if peak else 0]
         if agg is None:
@@ -813,6 +873,7 @@ class TokenStatsPlugin(BasePlugin):
         if hr is None:
             hr = hs[t.hour] = {"r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}}
         hr["r"] += 1; hr["v"] += v; hr["i"] += i; hr["o"] += o; hr["c"] += c; hr["e"] += e
+        _dur_acc(hr, d)
         hslots = hr["aggs"].setdefault(key, [None, None])
         hagg = hslots[1 if peak else 0]
         if hagg is None:
@@ -829,6 +890,7 @@ class TokenStatsPlugin(BasePlugin):
         if mb is None:
             mb = mrow[m5] = {"r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}}
         mb["r"] += 1; mb["v"] += v; mb["i"] += i; mb["o"] += o; mb["c"] += c; mb["e"] += e
+        _dur_acc(mb, d)
         mslots = mb["aggs"].setdefault(key, [None, None])
         magg = mslots[1 if peak else 0]
         if magg is None:
@@ -844,13 +906,15 @@ class TokenStatsPlugin(BasePlugin):
             s = {
                 "start": now, "last": now,
                 "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}, "sid": sid,
+                "ds": 0.0, "dc": 0, "dmin": None, "dmax": None,
             }
             self._sess_map[sid] = s
         else:
             # LRU：移到末尾（最近活跃）
             self._sess_map[sid] = self._sess_map.pop(sid)
             if now - s["last"] > self.session_idle_minutes * 60:
-                s.update({"start": now, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {}})
+                s.update({"start": now, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "aggs": {},
+                          "ds": 0.0, "dc": 0, "dmin": None, "dmax": None})
         while len(self._sess_map) > self._sess_map_max:
             self._sess_map.pop(next(iter(self._sess_map)))
         s["last"] = now
@@ -859,6 +923,7 @@ class TokenStatsPlugin(BasePlugin):
         s["r"] += 1
         s["v"] += rec["v"]; s["i"] += rec["i"]; s["o"] += rec["o"]; s["c"] += rec["c"]
         s["e"] += rec.get("e", 0)
+        _dur_acc(s, _rec_dur(rec))
         key = f"{rec.get('m', '')}\u001F{rec.get('ch', '')}\u001F{rec.get('h', '')}"
         slots = s["aggs"].setdefault(key, [None, None])
         try:
@@ -1099,6 +1164,10 @@ class TokenStatsPlugin(BasePlugin):
         }
         if errs > 0:
             rec["e"] = errs
+        # 单轮 LLM 耗时（秒，含工具中间步各算一条）；LLMResponse.time_consumed 可空，空则不写
+        dur = _rec_dur({"d": getattr(resp, "time_consumed", None)})
+        if dur is not None:
+            rec["d"] = dur
 
         self._last_round = {"i": inp, "o": out, "c": cached}
 
@@ -1146,13 +1215,20 @@ class TokenStatsPlugin(BasePlugin):
     # ── 聚合查询（双币种）──
 
     def _range_agg(self, from_date: str, to_date: str):
-        """按天键区间聚合 {v,i,o,c,r,e}（全遍历 + 区间判断，不依赖插入序）"""
+        """按天键区间聚合 {v,i,o,c,r,e} + 耗时（ds/dc/dmin/dmax）（全遍历 + 区间判断，不依赖插入序）"""
         v = i = o = c = r = e = 0
+        dur = {"ds": 0.0, "dc": 0, "dmin": None, "dmax": None}
         for key, ds in self._days.items():
             if from_date <= key <= to_date:
                 v += ds["v"]; i += ds["i"]; o += ds["o"]; c += ds["c"]
                 r += ds["r"]; e += ds["e"]
-        return {"v": v, "i": i, "o": o, "c": c, "r": r, "e": e}
+                if ds.get("dc"):
+                    dur["ds"] += ds.get("ds", 0.0); dur["dc"] += ds["dc"]
+                    if ds.get("dmin") is not None and (dur["dmin"] is None or ds["dmin"] < dur["dmin"]):
+                        dur["dmin"] = ds["dmin"]
+                    if ds.get("dmax") is not None and (dur["dmax"] is None or ds["dmax"] > dur["dmax"]):
+                        dur["dmax"] = ds["dmax"]
+        return {"v": v, "i": i, "o": o, "c": c, "r": r, "e": e, **dur}
 
     def _aggs_cost_units(self, aggs: dict):
         """聚合桶 → ({f"{cur}|{unit}": amt}, matched)。按 (币种, 显示单位) 分桶，永不混算"""
@@ -2032,6 +2108,13 @@ class TokenStatsPlugin(BasePlugin):
         def want(k):
             return not range_key or range_key.strip().lower() == k
 
+        def dur_suffix(b):
+            """耗时后缀：均/快/慢（单轮 LLM 响应），无数据不追加"""
+            a, mn, mx = _dur_stats(b)
+            if a is None:
+                return ""
+            return f" · 耗时 均{_fmt_dur(a)}·快{_fmt_dur(mn)}·慢{_fmt_dur(mx)}"
+
         if want("session"):
             s = self._sess
             units, matched = self._session_cost_units()
@@ -2039,6 +2122,7 @@ class TokenStatsPlugin(BasePlugin):
             cp = self._fmt_cost_units(units)
             if cp:
                 line += " · " + cp
+            line += dur_suffix(s)
             if s["e"] > 0:
                 line += f" · 出错 {s['e']}"
             sb.append(line)
@@ -2058,6 +2142,7 @@ class TokenStatsPlugin(BasePlugin):
             cp = self._fmt_cost_units(units)
             if cp:
                 line += " · " + cp
+            line += dur_suffix(agg)
             if agg["e"] > 0:
                 line += f" · 出错 {agg['e']}"
             sb.append(line)
@@ -2159,6 +2244,7 @@ class TokenStatsPlugin(BasePlugin):
             dim_label = {"model": "模型", "source": "来源", "day": "日期"}.get(d, "渠道")
             map_agg = {}
             t_r = t_i = t_o = t_c = t_v = 0
+            t_dur = {"ds": 0.0, "dc": 0, "dmin": None, "dmax": None}
             errs = 0
             cny_tot = pts_tot = 0.0
             any_matched = False
@@ -2181,8 +2267,12 @@ class TokenStatsPlugin(BasePlugin):
                 key = r.get("m", "") if d == "model" else (r.get("s", "") or "未知") if d == "source" else day if d == "day" else (r.get("ch", "") or "未知")
                 if not key:
                     key = "未知"
-                a = map_agg.setdefault(key, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False})
+                a = map_agg.setdefault(key, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False,
+                                             "ds": 0.0, "dc": 0, "dmin": None, "dmax": None})
                 a["r"] += 1; a["i"] += i; a["o"] += o; a["c"] += c; a["v"] += v
+                dval = _rec_dur(r)
+                _dur_acc(a, dval)
+                _dur_acc(t_dur, dval)
                 if amt is not None:
                     ukey = f"{cur}|{_rule_unit(rule) if rule else ''}"
                     a["units"][ukey] = a["units"].get(ukey, 0.0) + amt
@@ -2201,7 +2291,7 @@ class TokenStatsPlugin(BasePlugin):
             sb.append("")
             if not map_agg:
                 return _clamp_ai_output("".join(sb) + "（该条件下暂无记录）")
-            sb.append(f"{dim_label} | 轮次 | 输入 | 输出 | 缓存 | 合计 | 费用")
+            sb.append(f"{dim_label} | 轮次 | 输入 | 输出 | 缓存 | 合计 | 均耗时 | 费用")
             cap = max(1, min(top or 8, 20))
             for k, a in sorted(map_agg.items(), key=lambda x: x[1]["v"], reverse=True)[:cap]:
                 cost_txt = "—"
@@ -2211,7 +2301,7 @@ class TokenStatsPlugin(BasePlugin):
                         _, _, uu = ukey.partition("|")
                         bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
                     cost_txt = " + ".join(bits)
-                sb.append(f"{k} | {a['r']} | {_fmt_num(a['i'])} | {_fmt_num(a['o'])} | {_fmt_num(a['c'])} | {_fmt_num(a['v'])} | {cost_txt}")
+                sb.append(f"{k} | {a['r']} | {_fmt_num(a['i'])} | {_fmt_num(a['o'])} | {_fmt_num(a['c'])} | {_fmt_num(a['v'])} | {_fmt_dur(_dur_stats(a)[0])} | {cost_txt}")
             if len(map_agg) > cap:
                 sb.append(f"（共 {len(map_agg)} 行，仅显示前 {cap} 行，可调大 top 或增加过滤条件）")
             tot_bits = []
@@ -2220,7 +2310,7 @@ class TokenStatsPlugin(BasePlugin):
                     tot_bits.append(f"¥{cny_tot:.4f}")
                 if pts_tot:
                     tot_bits.append(f"积分 {pts_tot:,.4f}")
-            sb.append(f"合计 | {t_r} | {_fmt_num(t_i)} | {_fmt_num(t_o)} | {_fmt_num(t_c)} | {_fmt_num(t_v)} | {' + '.join(tot_bits) if tot_bits else '—'}")
+            sb.append(f"合计 | {t_r} | {_fmt_num(t_i)} | {_fmt_num(t_o)} | {_fmt_num(t_c)} | {_fmt_num(t_v)} | {_fmt_dur(_dur_stats(t_dur)[0])} | {' + '.join(tot_bits) if tot_bits else '—'}")
             if errs > 0:
                 sb.append(f"出错标记合计：{errs}")
             return _clamp_ai_output("\n".join(sb))
@@ -2243,7 +2333,7 @@ class TokenStatsPlugin(BasePlugin):
             if want:
                 sb.append(" · 筛选: " + "、".join(want))
             sb.append("")
-            sb.append("时间 | 模型 | 来源 | 渠道 | 输入 | 输出 | 缓存 | 合计 | 费用")
+            sb.append("时间 | 模型 | 来源 | 渠道 | 输入 | 输出 | 缓存 | 合计 | 费用（尾部按需附 出错/耗时）")
             cap = max(1, min(n or 10, 30))
             written = 0
             recs = self._read_records()
@@ -2272,6 +2362,9 @@ class TokenStatsPlugin(BasePlugin):
                 e = int(r.get("e", 0) or 0)
                 if e > 0:
                     row += f" | 出错{e}"
+                dval = _rec_dur(r)
+                if dval is not None:
+                    row += f" | 耗时{_fmt_dur(dval)}"
                 sb.append(row)
                 written += 1
             if written == 0:
@@ -2416,13 +2509,20 @@ class TokenStatsPlugin(BasePlugin):
         s = self._sess
         channel, model, _ = self._resolve_channel_model()
 
+        def _with_dur(base: dict, b: dict) -> dict:
+            """范围聚合 + 耗时（有数据才带 dur 字段，前端据此决定是否显示耗时行）"""
+            a, mn, mx = _dur_stats(b)
+            if a is not None:
+                base["dur"] = {"avg": a, "min": mn, "max": mx}
+            return base
+
         ranges = {
-            "session": {"v": s["v"], "i": s["i"], "o": s["o"], "c": s["c"], "r": s["r"], "e": s["e"]},
-            "today": self._range_agg(today, today),
-            "d7": self._range_agg(d7, today),
-            "d30": self._range_agg(d30, today),
-            "total": self._range_agg("0000-01-01", "9999-12-31"),
+            "session": _with_dur({"v": s["v"], "i": s["i"], "o": s["o"], "c": s["c"], "r": s["r"], "e": s["e"]}, s),
         }
+        for _k, _f, _t in (("today", today, today), ("d7", d7, today), ("d30", d30, today),
+                           ("total", "0000-01-01", "9999-12-31")):
+            _a = self._range_agg(_f, _t)
+            ranges[_k] = _with_dur(_a, _a)
         # 费用：按 (币种, 显示单位) 分桶，前端按需展示
         def _cost_pair(k):
             units, matched = k
@@ -2572,6 +2672,7 @@ class TokenStatsPlugin(BasePlugin):
                 "co": f"{amt:.4f}" if amt is not None else None,
                 "cur": cur,
                 "unit": _rule_unit(rule) if rule else "",
+                "d": _rec_dur(r),
             })
         # 并发解析会话昵称（唯一 sid 去重，缓存命中后零开销）
         uniq = sorted({x["sid"] for x in out if x["sid"]})
@@ -2609,12 +2710,15 @@ class TokenStatsPlugin(BasePlugin):
             if day < frm or day > to:
                 continue
             i, o, c, v = r.get("i", 0), r.get("o", 0), r.get("c", 0), r.get("v", 0)
+            dval = _rec_dur(r)
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
             amt, cur = _rule_cost_ex(rule, i, o, c, t) if rule else (None, "CNY")
 
             def add(d, k):
-                a = d.setdefault(k, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "last_at": ""})
+                a = d.setdefault(k, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "last_at": "",
+                                     "ds": 0.0, "dc": 0, "dmin": None, "dmax": None})
                 a["r"] += 1; a["i"] += i; a["o"] += o; a["c"] += c; a["v"] += v
+                _dur_acc(a, dval)
                 _ts = t.strftime("%Y-%m-%d %H:%M:%S")
                 if _ts > a["last_at"]:
                     a["last_at"] = _ts
@@ -2628,6 +2732,7 @@ class TokenStatsPlugin(BasePlugin):
             add(by_model, r.get("m", "") or "未知")
             add(by_sid, r.get("sid", "") or "未知")
             total["r"] += 1; total["i"] += i; total["o"] += o; total["c"] += c; total["v"] += v
+            _dur_acc(total, dval)
             if amt is not None:
                 ukey = f"{cur}|{_rule_unit(rule) if rule else ''}"
                 total["units"][ukey] = total["units"].get(ukey, 0.0) + amt
@@ -2641,13 +2746,19 @@ class TokenStatsPlugin(BasePlugin):
                     bits.append(f"{uu} {uamt:,.4f}" if uu else f"{uamt:,.4f}")
             return " + ".join(bits) if bits else None
 
+        def _dim_row(k, v):
+            row = {"k": k, **{kk: vv for kk, vv in v.items() if kk not in ("ds", "dc", "dmin", "dmax")},
+                   "cost": fmt_cost(v)}
+            row["dur_avg"], row["dur_min"], row["dur_max"] = _dur_stats(v)
+            return row
+
         def dim(d):
-            arr = [{"k": k, **v, "cost": fmt_cost(v)} for k, v in d.items()]
+            arr = [_dim_row(k, v) for k, v in d.items()]
             arr.sort(key=lambda x: x["v"], reverse=True)
             return arr[:20]
 
         async def dim_sid(d):
-            arr = [{"k": k, **v, "cost": fmt_cost(v)} for k, v in d.items()]
+            arr = [_dim_row(k, v) for k, v in d.items()]
             arr.sort(key=lambda x: x["v"], reverse=True)
             out = arr[:20]
             uniq = sorted({x["k"] for x in out if x["k"]})
@@ -2656,10 +2767,11 @@ class TokenStatsPlugin(BasePlugin):
                 x["name"] = nmap.get(x["k"], "")
             return out
 
+        _ta, _tmin, _tmax = _dur_stats(total)
         return {
             "from": frm, "to": to,
             "total": {"r": total["r"], "i": total["i"], "o": total["o"], "c": total["c"], "v": total["v"],
-                      "cost": fmt_cost(total)},
+                      "cost": fmt_cost(total), "dur_avg": _ta, "dur_min": _tmin, "dur_max": _tmax},
             "bySource": dim(by_source),
             "byChannel": dim(by_channel),
             "byModel": dim(by_model),
@@ -2759,9 +2871,11 @@ class TokenStatsPlugin(BasePlugin):
             if day < frm or day > to:
                 continue
             sid = r.get("sid", "") or "未知"
-            a = sessions.setdefault(sid, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "last_at": ""})
+            a = sessions.setdefault(sid, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "last_at": "",
+                                          "ds": 0.0, "dc": 0, "dmin": None, "dmax": None})
             i, o, c, v = r.get("i", 0), r.get("o", 0), r.get("c", 0), r.get("v", 0)
             a["r"] += 1; a["i"] += i; a["o"] += o; a["c"] += c; a["v"] += v
+            _dur_acc(a, _rec_dur(r))
             _ts = t.strftime("%Y-%m-%d %H:%M:%S")
             if _ts > a["last_at"]:
                 a["last_at"] = _ts
@@ -2809,10 +2923,12 @@ class TokenStatsPlugin(BasePlugin):
         names = await asyncio.gather(*(self._resolve_sid_name(x["sid"]) for x in arr[:50]))
         sess_out = []
         for x, name in zip(arr[:50], names):
+            _a, _mn, _mx = _dur_stats(x)
             sess_out.append({
                 "sid": x["sid"], "name": name,
                 "type": x["type"], "r": x["r"], "i": x["i"], "o": x["o"],
                 "c": x["c"], "v": x["v"], "cost": fmt_cost(x), "last_at": x["last_at"],
+                "dur_avg": _a, "dur_min": _mn, "dur_max": _mx,
             })
         return {
             "from": frm, "to": to,
@@ -2825,7 +2941,7 @@ class TokenStatsPlugin(BasePlugin):
         """/trend?range=today|d7|d30|total  → 按天时间趋势；
         &day=YYYY-MM-DD → 单天按小时桶（含模型费用分色数据）；
         &day=...&hour=N → 单小时按 5 分钟桶（含模型费用分色数据）。
-        每桶 {d, r, v, i, o, c, e, models:[{name,cny,pts}]}；顶层带 Top8 模型 topModels。"""
+        每桶 {d, r, v, i, o, c, e, da/dmin/dmax(单轮耗时秒，无数据为 None), models:[{name,cny,pts}]}；顶层带 Top8 模型 topModels。"""
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
         range_key = (request.query_params.get("range") or "d7").lower()
@@ -2842,6 +2958,7 @@ class TokenStatsPlugin(BasePlugin):
                     "d": f"{day} {h:02d}:00", "h": h,
                     "r": hr["r"], "v": hr["v"], "i": hr["i"], "o": hr["o"], "c": hr["c"], "e": hr["e"],
                     "models": self._bucket_fee_models(hr["aggs"]),
+                    **_dur_fields(hr),
                 })
             top = self._all_top_models(day, day)
             return {"from": day, "to": day, "day": day, "unit": "hour", "days": hours, "topModels": top}
@@ -2859,6 +2976,7 @@ class TokenStatsPlugin(BasePlugin):
                             "d": f"{day} {h:02d}:{m5 * 5:02d}", "h": h, "m": m5,
                             "r": mb["r"], "v": mb["v"], "i": mb["i"], "o": mb["o"], "c": mb["c"], "e": mb["e"],
                             "models": self._bucket_fee_models(mb["aggs"]),
+                            **_dur_fields(mb),
                         })
                 top = self._all_top_models()
                 return {"from": day, "to": day, "day": day, "hour": h, "unit": "min5",
@@ -2886,10 +3004,17 @@ class TokenStatsPlugin(BasePlugin):
             for dk in day_keys:
                 mk2 = dk[:7]
                 b = mbuckets.setdefault(mk2, {"d": mk2, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0,
-                                              "_aggs": {}, "_models": {}})
+                                              "_aggs": {}, "_models": {},
+                                              "ds": 0.0, "dc": 0, "dmin": None, "dmax": None})
                 src = self._days[dk]
                 for kk in ("r", "v", "i", "o", "c", "e"):
                     b[kk] += src[kk]
+                if src.get("dc"):
+                    b["ds"] += src.get("ds", 0.0); b["dc"] += src["dc"]
+                    if src.get("dmin") is not None and (b["dmin"] is None or src["dmin"] < b["dmin"]):
+                        b["dmin"] = src["dmin"]
+                    if src.get("dmax") is not None and (b["dmax"] is None or src["dmax"] > b["dmax"]):
+                        b["dmax"] = src["dmax"]
                 for m in self._bucket_fee_models(src["aggs"]):
                     bm = b["_models"].setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
                     bm["cny"] += m["cny"]; bm["pts"] += m["pts"]
@@ -2901,6 +3026,9 @@ class TokenStatsPlugin(BasePlugin):
                 b["models"] = sorted(b.pop("_models").values(),
                                      key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
                 b.pop("_aggs", None)
+                b.update(_dur_fields(b))
+                for kk in ("ds", "dc", "dmin", "dmax"):
+                    b.pop(kk, None)
                 days.append(b)
             unit = "month"
         else:
@@ -2916,19 +3044,22 @@ class TokenStatsPlugin(BasePlugin):
                     if src:
                         models_l = self._bucket_fee_models(src["aggs"])
                         days.append({"d": dk, "r": src["r"], "v": src["v"], "i": src["i"],
-                                     "o": src["o"], "c": src["c"], "e": src["e"], "models": models_l})
+                                     "o": src["o"], "c": src["c"], "e": src["e"], "models": models_l,
+                                     **_dur_fields(src)})
                         for m in models_l:
                             tm = top_models.setdefault(m["name"], {"name": m["name"], "cny": 0.0, "pts": 0.0})
                             tm["cny"] += m["cny"]; tm["pts"] += m["pts"]
                     else:
-                        days.append({"d": dk, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "models": []})
+                        days.append({"d": dk, "r": 0, "v": 0, "i": 0, "o": 0, "c": 0, "e": 0, "models": [],
+                                     "da": None, "dmin": None, "dmax": None})
                     cur_d += timedelta(days=1)
             except ValueError:
                 for dk in day_keys:
                     src = self._days[dk]
                     days.append({"d": dk, "r": src["r"], "v": src["v"], "i": src["i"],
                                  "o": src["o"], "c": src["c"], "e": src["e"],
-                                 "models": self._bucket_fee_models(src["aggs"])})
+                                 "models": self._bucket_fee_models(src["aggs"]),
+                                 **_dur_fields(src)})
             unit = "day"
         models = sorted(top_models.values(), key=lambda x: x["cny"] + x["pts"] / 500, reverse=True)[:8]
         return {"from": frm, "to": to, "unit": unit, "days": days, "topModels": models}
@@ -3400,6 +3531,8 @@ tr.cur td{background:rgba(52,211,153,.07)}
 .trend .stack{border-radius:2px 2px 0 0;width:100%;transition:filter .15s}
 .trend .col:hover .stack{filter:brightness(1.3)}
 .trend .hitsvg{position:absolute;left:0;top:6px;width:100%;height:calc(100% - 22px);pointer-events:none;overflow:visible}
+.trendWrap.hasDur{padding-right:36px}
+.trendWrap .durlbl{position:absolute;right:2px;transform:translateY(-50%);font-size:9px;line-height:1;color:var(--warn);opacity:.85;pointer-events:none;font-variant-numeric:tabular-nums}
 .trend .tlbl{text-align:center;font-size:10px;color:var(--dim);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .trend .tip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:11px;white-space:nowrap;opacity:0;transition:.15s;z-index:20;pointer-events:none;color:var(--fg)}
 .trend .tip.flip{left:auto;right:0;transform:none}
@@ -3457,7 +3590,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" data-r="total">累计</button>
       <span style="color:var(--dim);font-size:12px" id="dimRange"></span>
     </div>
-    <table><thead><tr><th>维度</th><th>值</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th>费用</th></tr></thead><tbody id="dimBody"></tbody></table>
+    <table><thead><tr><th>维度</th><th>值</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th title="单轮 LLM 响应耗时均值">均耗时</th><th title="最快单轮">最快</th><th title="最慢单轮">最慢</th><th>费用</th></tr></thead><tbody id="dimBody"></tbody></table>
   </div>
 </div>
 
@@ -3471,7 +3604,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <span style="color:var(--dim);font-size:12px" id="sessRange"></span>
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px" id="sessGroups"></div>
-    <table><thead><tr><th>会话</th><th>类型</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th>费用</th><th>最近活动</th></tr></thead><tbody id="sessBody"></tbody></table>
+    <table><thead><tr><th>会话</th><th>类型</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th title="单轮 LLM 响应耗时均值">均耗时</th><th title="最快单轮">最快</th><th title="最慢单轮">最慢</th><th>费用</th><th>最近活动</th></tr></thead><tbody id="sessBody"></tbody></table>
   </div>
 </div>
 
@@ -3552,6 +3685,12 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<995000000)return (v/1e8).toFixed(1).replace('.0','')+'亿'; if(v<9950000000)return Math.round(v/1e8)+'亿';
   if(v<99500000000)return (v/1e9).toFixed(1).replace('.0','')+'B'; return Math.round(v/1e9)+'B'; };
 const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// 单轮耗时（秒）格式化：<10s→4.56s；<60s→23.4s；<60m→1m23s；≥1h→1h05m；无值→—（与 Python _fmt_dur、挂件 fmtDur 一致）
+const fmtDur = v => { if(v==null||isNaN(+v)||+v<0) return '—'; v=+v;
+  if(v<10) return v.toFixed(2)+'s';
+  if(v<60) return v.toFixed(1)+'s';
+  if(v<3600) return Math.floor(v/60)+'m'+String(Math.floor(v%60)).padStart(2,'0')+'s';
+  return Math.floor(v/3600)+'h'+String(Math.floor(v%3600/60)).padStart(2,'0')+'m'; };
 const localDate = () => { const d=new Date();
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
 // 页内 toast（沙箱内 alert 不可用，一律用 toast）
@@ -3643,12 +3782,14 @@ async function _loadOvInner(){
     const errs = (d.errors||{})[k]||0;
     const costBits = [];
     if(co.matched && co.units){ co.units.forEach(u=>{ costBits.push(u.unit?('<span class="pts">'+u.amt+' '+esc(u.unit)+'</span>'):u.amt); }); }
+    // 单轮耗时行（仅该范围有耗时数据时显示）
+    const durLine = (rg.dur && rg.dur.avg!=null) ? '<div class="d">耗时 均'+fmtDur(rg.dur.avg)+'·快'+fmtDur(rg.dur.min)+'·慢'+fmtDur(rg.dur.max)+'</div>' : '';
     // 迷你走势（非本次会话）：近14天分布
     let sp = '';
     if(k!=='session') sp = '<div class="spark">'+sparkHtml(dayVols.slice(-14))+'</div>';
     cards.push({k:k, vnum:rg.v||0, html:'<div class="k">'+(k==='session'?sessLabel(d):RL[k])+'</div><div class="topline"><div class="v">'+fmt4(rg.v)+'</div>'+(sp||'')+'</div>'+
       '<div class="d">'+fmt(rg.r)+' 轮 · 输入 '+fmt(rg.i)+' · 输出 '+fmt(rg.o)+' · 缓存 '+fmt(rg.c)+' · 命中率 <span class="rate">'+rate+'</span></div>'+
-      '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div>'});
+      '<div class="d">费用 '+(costBits.length?costBits.join(' + '):'<span class="cost">—</span>')+(errs?' · 出错 <span class="bad">'+errs+'</span>':'')+'</div>'+durLine});
   }
   const er = d.errors||{};
   if (er.last) cards.push({k:'errLast', cls:'errbox', html:'<div class="k">最近出错</div><div class="d">'+esc(er.last)+'</div>'});
@@ -3753,8 +3894,9 @@ async function loadTrend(r){
   models.forEach(m=>{ if(m.cny||m.pts) legend.push('<span><i style="background:'+colorOf[m.name]+'"></i>'+esc(m.name)+'</span>'); });
   legend.push('<span><i style="background:#334155"></i>未计价</span>');
   legend.push('<span><i style="background:transparent;border-top:2px dashed var(--purple);border-radius:0;height:0;width:14px;vertical-align:2px"></i>缓存命中率</span>');
+  if(days.some(x=>x.da!=null)) legend.push('<span><i style="background:transparent;border-top:2px solid var(--warn);border-radius:0;height:0;width:14px;vertical-align:2px"></i>单轮耗时</span>');
   $('#trendLegend').innerHTML = legend.join('');
-  $('#trendNote').textContent = '柱高=总量，堆叠色=Top8 模型费用分色；紫色虚线=缓存命中率（右轴 0-100%）。'+(isMin?'当前为单小时按5分钟桶。':(isDay?'当前为单天按小时桶。':(isMonth?'当前为按月聚合，不可下钻。':'')))+(isMonth?'':'点柱：'+(isMin?'→ 查看该时段记录':(isDay?'→ 下钻该小时按5分钟':'→ 下钻该天按小时'))+'；「← 返回」逐级回退。');
+  $('#trendNote').textContent = '柱高=总量，堆叠色=Top8 模型费用分色；紫色虚线=缓存命中率（右轴 0-100%）；橙色实线=单轮平均耗时（右轴 秒）。'+(isMin?'当前为单小时按5分钟桶。':(isDay?'当前为单天按小时桶。':(isMonth?'当前为按月聚合，不可下钻。':'')))+(isMonth?'':'点柱：'+(isMin?'→ 查看该时段记录':(isDay?'→ 下钻该小时按5分钟':'→ 下钻该天按小时'))+'；「← 返回」逐级回退。');
   const N = days.length;
   const rows = days.map((x,xi)=>{
     const stack = [];
@@ -3772,7 +3914,7 @@ async function loadTrend(r){
     if(!stack.length) stack.push('<div class="stack" style="height:100%;background:#334155"></div>');
     const rate = x.i>0 ? (x.c/x.i*100) : 0;
     const costLine = bm.length ? bm.slice(0,3).map(m=>esc(m.name)+' ¥'+m.cny.toFixed(2)).join(' · ') : '';
-    const tip = '<div class="tip'+(xi>=N*0.7?' flip':'')+'">'+(x.d)+(x.h!=null&&isDay?' 时':'')+(x.m!=null?':'+String(x.m*5).padStart(2,'0'):'')+'<br>'+(x.r)+' 轮 · '+fmt4(x.v)+' Token<br>输入 '+fmt(x.i)+' · 输出 '+fmt(x.o)+' · 缓存 '+fmt(x.c)+'<br>命中率 <span class="rate">'+rate.toFixed(1)+'%</span>'+(x.e?' · 出错 '+x.e:'')+(costLine?'<br>'+costLine:'')+'</div>';
+    const tip = '<div class="tip'+(xi>=N*0.7?' flip':'')+'">'+(x.d)+(x.h!=null&&isDay?' 时':'')+(x.m!=null?':'+String(x.m*5).padStart(2,'0'):'')+'<br>'+(x.r)+' 轮 · '+fmt4(x.v)+' Token<br>输入 '+fmt(x.i)+' · 输出 '+fmt(x.o)+' · 缓存 '+fmt(x.c)+'<br>命中率 <span class="rate">'+rate.toFixed(1)+'%</span>'+(x.da!=null?' · 单轮耗时 <span style="color:var(--warn)">'+fmtDur(x.da)+'</span>':'')+(x.e?' · 出错 '+x.e:'')+(costLine?'<br>'+costLine:'')+'</div>';
     const hgt = x.v>0 ? Math.max(2, x.v/maxV*100) : 0;
     const lbl = isMonth ? x.d : (x.d.length>10?x.d.slice(x.d.length-5):x.d);
     return '<div class="col" data-d="'+esc(x.d)+'" data-h="'+(x.h!=null?x.h:'')+'" data-m="'+(x.m!=null?x.m:'')+'">'+tip+'<div class="stk" style="height:'+hgt+'%">'+
@@ -3785,7 +3927,28 @@ async function loadTrend(r){
     return ((xi+0.5)/N*100).toFixed(2)+','+(100-Math.min(100,rate)).toFixed(2);
   }).join(' ');
   const hitSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+hitPts+'" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 2" vector-effect="non-scaling-stroke" opacity=".85"/></svg>';
-  $('#trend').innerHTML = rows + hitSvg;
+  // 单轮平均耗时折线（橙色实线，右轴 秒，独立量纲；无耗时数据的桶断开不连线）
+  let durMax = 0;
+  days.forEach(x=>{ if(x.da!=null && x.da>durMax) durMax=x.da; });
+  let durSvg = '', durAxisHtml = '';
+  if(durMax>0){
+    let path = '', pen = false;
+    days.forEach((x,xi)=>{
+      if(x.da==null){ pen=false; return; }
+      path += (pen?'L':'M')+((xi+0.5)/N*100).toFixed(2)+' '+(100-Math.min(96,x.da/durMax*96)).toFixed(2);
+      pen = true;
+    });
+    durSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><path d="'+path+'" fill="none" stroke="var(--warn)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity=".9"/></svg>';
+    // 右轴刻度标签（柱子右侧小字）：0 / 半值 / 峰值；CSS 不支持 calc 乘法，换算为 px+% 组合
+    durAxisHtml = [0, 0.5, 1].map(f=>{
+      const top = 'calc('+(6-22*(1-f))+'px + '+((1-f)*100)+'%)';
+      return '<span class="durlbl" style="top:'+top+'">'+fmtDur(durMax*f)+'</span>';
+    }).join('');
+  }
+  $('#trendWrap').classList.toggle('hasDur', durMax>0);
+  $('#trend').innerHTML = rows + hitSvg + durSvg;
+  const oldAxis = $('#trendWrap').querySelectorAll('.durlbl'); oldAxis.forEach(e=>e.remove());
+  if(durAxisHtml) $('#trendWrap').insertAdjacentHTML('beforeend', durAxisHtml);
   document.querySelectorAll('#trend .col').forEach(c=>{
     if(isMonth) return; // 按月聚合不可下钻
     c.onclick=()=>{
@@ -3816,12 +3979,13 @@ async function loadDim(r){
   const d = await jget('/analytics?range='+r);
   $('#dimRange').textContent = d.from + ' ~ ' + d.to + '（' + RL[r] + '）';
   const rows = [];
+  const durTd = x => '<td>'+fmtDur(x.dur_avg)+'</td><td>'+fmtDur(x.dur_min)+'</td><td>'+fmtDur(x.dur_max)+'</td>';
   const push = (name, arr) => (arr||[]).forEach(x=>{
-    rows.push('<tr><td>'+esc(name)+'</td><td>'+esc(x.k)+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td></tr>');
+    rows.push('<tr><td>'+esc(name)+'</td><td>'+esc(x.k)+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td>'+durTd(x)+'<td>'+(x.cost||'—')+'</td></tr>');
   });
   push('来源', d.bySource); push('渠道', d.byChannel); push('模型', d.byModel);
-  (d.bySid||[]).forEach(x=>{ rows.push('<tr><td>会话</td><td>'+esc(x.name||x.k)+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td></tr>'); });
-  $('#dimBody').innerHTML = rows.join('') || '<tr><td colspan="8" class="note">该范围暂无数据</td></tr>';
+  (d.bySid||[]).forEach(x=>{ rows.push('<tr><td>会话</td><td>'+esc(x.name||x.k)+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td>'+durTd(x)+'<td>'+(x.cost||'—')+'</td></tr>'); });
+  $('#dimBody').innerHTML = rows.join('') || '<tr><td colspan="11" class="note">该范围暂无数据</td></tr>';
 }
 let curSessRange='d7';
 document.querySelectorAll('[data-sr]').forEach(b=>b.onclick=()=>{curSessRange=b.dataset.sr;document.querySelectorAll('[data-sr]').forEach(x=>x.classList.remove('on'));b.classList.add('on');loadSess(curSessRange)});
@@ -3836,9 +4000,9 @@ async function loadSess(r){
   }).join('');
   const rows = (d.sessions||[]).map(x=>{
     const t = x.type==='dm'?'私聊':(x.type==='gm'?'群聊':'其他');
-    return '<tr style="cursor:pointer" data-sid="'+esc(x.sid)+'" onclick="sessRecs(this.dataset.sid)"><td>'+esc(x.name||x.sid)+'</td><td>'+t+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.cost||'—')+'</td><td>'+esc(x.last_at||'')+'</td></tr>';
+    return '<tr style="cursor:pointer" data-sid="'+esc(x.sid)+'" onclick="sessRecs(this.dataset.sid)"><td>'+esc(x.name||x.sid)+'</td><td>'+t+'</td><td>'+x.r+'</td><td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+fmtDur(x.dur_avg)+'</td><td>'+fmtDur(x.dur_min)+'</td><td>'+fmtDur(x.dur_max)+'</td><td>'+(x.cost||'—')+'</td><td>'+esc(x.last_at||'')+'</td></tr>';
   }).join('');
-  $('#sessBody').innerHTML = rows || '<tr><td colspan="9" class="note">该范围暂无会话数据</td></tr>';
+  $('#sessBody').innerHTML = rows || '<tr><td colspan="12" class="note">该范围暂无会话数据</td></tr>';
 }
 function sessRecs(sid){
   showTab('rec');
@@ -3850,8 +4014,8 @@ async function loadRecBySid(sid){
   const d = await jget('/records?n=100&sid='+encodeURIComponent(sid));
   $('#recBody').innerHTML = (d.recs||[]).map(x=>
     '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+(x.sid?('<span class="note">['+(x.type==='dm'?'私聊':(x.type==='gm'?'群聊':'其他'))+']</span> '+esc(x.sid_name||x.sid)):esc(x.s))+'</td><td>'+esc(x.ch)+'</td>'+
-    '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
-    '<tr><td colspan="9" class="note">该会话暂无记录</td></tr>';
+    '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmtDur(x.d)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
+    '<tr><td colspan="10" class="note">该会话暂无记录</td></tr>';
 }
 async function loadRec(){
   const d = await jget('/records?n='+(recSlotFilter?100:15));
@@ -3869,8 +4033,8 @@ async function loadRec(){
   }
   $('#recBody').innerHTML = recs.map(x=>
     '<tr><td>'+esc(x.t)+'</td><td>'+esc(x.m)+'</td><td>'+(x.sid?('<span class="note">['+(x.type==='dm'?'私聊':(x.type==='gm'?'群聊':'其他'))+']</span> '+esc(x.sid_name||x.sid)):esc(x.s))+'</td><td>'+esc(x.ch)+'</td>'+
-    '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
-    '<tr><td colspan="9" class="note">'+(recSlotFilter?'该时段暂无记录':'暂无记录')+'</td></tr>';
+    '<td>'+fmt(x.i)+'</td><td>'+fmt(x.o)+'</td><td>'+fmt(x.c)+'</td><td>'+fmtDur(x.d)+'</td><td>'+fmt(x.v)+'</td><td>'+(x.co?(x.unit?x.co+' '+esc(x.unit):x.co):'—')+'</td></tr>').join('') ||
+    '<tr><td colspan="10" class="note">'+(recSlotFilter?'该时段暂无记录':'暂无记录')+'</td></tr>';
   recSlotFilter = null;
 }
 let priceRules = [];
@@ -4351,6 +4515,7 @@ body.grabbing,body.grabbing *{cursor:grabbing!important}
     <div class="row"><span class="k">近7天</span><span class="v" id="v_d7">—</span></div>
     <div class="row"><span class="k">费用(今日)</span><span class="v cost" id="v_cost">—</span></div>
     <div class="row"><span class="k">费用(累计)</span><span class="v cost" id="v_cost_total">—</span></div>
+    <div class="row" id="row_dur" style="display:none" title="单轮 LLM 响应耗时均值（本次会话）"><span class="k">轮均耗时</span><span class="v" id="v_dur">—</span></div>
     <div class="sep"></div>
     <div class="bal" id="bal"></div>
   </div>
@@ -4374,6 +4539,12 @@ const fmt4 = v => { v=Math.max(0,Math.round(v||0)); if(v<1000)return ''+v;
   if(v<9950000)return (v/1e6).toFixed(1).replace('.0','')+'M'; if(v<99500000)return Math.round(v/1e6)+'M';
   if(v<995000000)return (v/1e8).toFixed(1).replace('.0','')+'亿'; if(v<9950000000)return Math.round(v/1e8)+'亿';
   if(v<99500000000)return (v/1e9).toFixed(1).replace('.0','')+'B'; return Math.round(v/1e9)+'B'; };
+// 单轮耗时（秒）格式化：与看板 fmtDur / Python _fmt_dur 一致（<10s→4.56s；<60s→23.4s；<60m→1m23s；≥1h→1h05m）
+const fmtDur = v => { if(v==null||isNaN(+v)||+v<0) return '—'; v=+v;
+  if(v<10) return v.toFixed(2)+'s';
+  if(v<60) return v.toFixed(1)+'s';
+  if(v<3600) return Math.floor(v/60)+'m'+String(Math.floor(v%60)).padStart(2,'0')+'s';
+  return Math.floor(v/3600)+'h'+String(Math.floor(v%3600/60)).padStart(2,'0')+'m'; };
 // 双模式：URL ?pop=1 → 独立弹窗模式（window.moveBy/resizeTo 控制真实窗口）
 const IS_POP = new URLSearchParams(location.search).get('pop')==='1';
 const POS_KEY = IS_POP ? 'tsWidgetPopPos' : 'tsWidgetPos';
@@ -4421,6 +4592,9 @@ async function refresh(){
     const fmtCost = c => { if(!c.matched || !c.units || !c.units.length) return '—'; return c.units.map(u=>u.unit?(u.amt+' '+u.unit):u.amt).join(' + '); };
     setVal('#v_cost', fmtCost(co));
     setVal('#v_cost_total', fmtCost(coT));
+    const dur = (d.ranges||{}).session && d.ranges.session.dur;
+    w$('#row_dur').style.display = (dur && dur.avg!=null) ? '' : 'none';
+    if(dur && dur.avg!=null) setVal('#v_dur', fmtDur(dur.avg));
     const b = d.balance||{};
     w$('#bal').innerHTML = b.current ? '<div class="row"><span class="k">余额</span><span class="v">'+b.current+'</span></div>' : '';
     w$('#st').textContent = '会话 '+d.rounds+' 轮 · '+(d.src||'');
