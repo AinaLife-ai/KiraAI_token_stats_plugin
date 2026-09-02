@@ -2023,7 +2023,8 @@ class TokenStatsPlugin(BasePlugin):
         return True  # 旧格式：float 时间戳 = 已触发
 
     def _alert_mark_fired(self, r: dict):
-        """记录触发：count+1（连续提醒次数）、at（最近触发时间）、day（自然日，token/cost 跨天重置用）"""
+        """记录触发：count+1（连续提醒次数）、at（最近触发时间）、day（自然日，token/cost 跨天重置用）、
+        step（step 模式上次提醒到的档位 = floor(当前值/阈值)）"""
         rid = str(r.get("id"))
         st = self._alert_fired.get(rid)
         if isinstance(st, dict):
@@ -2032,6 +2033,30 @@ class TokenStatsPlugin(BasePlugin):
         else:
             self._alert_fired[rid] = {"count": 1, "at": time.time(),
                                       "day": datetime.now().strftime("%Y-%m-%d")}
+
+    def _alert_step_ok(self, r: dict, value: float, threshold: float) -> bool:
+        """step 模式（每新增 ≥N 提醒一次）：当前档位 = floor(value/threshold)，
+        档位比上次记录的大才触发（每跨过一个 N 的整数倍提醒一次，如每 10M 提醒）。
+        非 step 模式恒 True。"""
+        if (r.get("trigger") or "once").strip().lower() != "step":
+            return True
+        if threshold <= 0:
+            return False
+        cur_step = int(value // threshold)
+        st = self._alert_fired.get(str(r.get("id")))
+        last_step = st.get("step", 0) if isinstance(st, dict) else 0
+        return cur_step > last_step
+
+    def _alert_mark_step(self, r: dict, value: float, threshold: float):
+        """step 模式触发后记录当前档位"""
+        if (r.get("trigger") or "once").strip().lower() != "step":
+            return
+        if threshold <= 0:
+            return
+        rid = str(r.get("id"))
+        st = self._alert_fired.get(rid)
+        if isinstance(st, dict):
+            st["step"] = int(value // threshold)
 
     def _alert_clear_fired(self, r: dict):
         self._alert_fired.pop(str(r.get("id")), None)
@@ -2191,10 +2216,15 @@ class TokenStatsPlugin(BasePlugin):
             hit = value >= threshold if op == "ge" else value <= threshold
             if not hit:
                 return False
+            # step 模式（每新增 ≥N 提醒一次）：档位未前进则不触发
+            if not self._alert_step_ok(r, value, threshold):
+                return False
         if self._alert_rule_fired(r):
             # 已触发过：受「最大连续提醒次数」与「连续提醒间隔」约束
-            if not self._alert_max_ok(r):
-                return False
+            # step 模式天然每档一次，跳过 max_alerts 限制（仍受 alert_interval 防刷屏）
+            if (r.get("trigger") or "once").strip().lower() != "step":
+                if not self._alert_max_ok(r):
+                    return False
             if not self._alert_interval_ok(r):
                 return False
         sids = self._alert_delivery_sids(r)
@@ -2205,6 +2235,7 @@ class TokenStatsPlugin(BasePlugin):
         send_image = bool(r.get("llm_send_image", False)) if (r.get("mode") or "direct").strip().lower() == "llm" \
             else bool(r.get("send_image", False))
         self._alert_mark_fired(r)
+        self._alert_mark_step(r, value, threshold)
         asyncio.ensure_future(self._alert_send(r, sids, text, send_image))
         logger.info(f"[token_stats] 预警触发: {r.get('id')} type={rtype} value={value}{unit} threshold={threshold} mode={r.get('mode')}")
         return True
@@ -4019,6 +4050,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
                 continue
             item = {"id": rid, "enabled": bool(r.get("enabled", True)), "type": rtype,
                     "name": str(r.get("name") or "").strip(),
+                    "trigger": (str(r.get("trigger") or "once").strip().lower() or "once"),
                     "target": str(r.get("target") or "").strip(),
                     "session": str(r.get("session") or "").strip(),
                     "op": (str(r.get("op") or "le").strip().lower() or "le"),
@@ -5401,6 +5433,7 @@ function renderAlert(){
     const cur = r.currency?`（${aesc(r.currency)}）`:'（任一币种）';
     const win = (r.time_start||r.time_end||r.time_window)?` · 时段 <b>${aesc(r.time_start||'00:00')}${r.time_window?'+'+aesc(r.time_window)+'min':''}${r.time_end?'~'+aesc(r.time_end):''}</b>`:'';
     const cd = (r.max_alerts&&r.max_alerts>1)?` · 连续提醒 <b>${r.max_alerts}次/${r.alert_interval||300}s</b>`:'';
+    const trg = r.trigger==='step' ? ` · 每新增 <b>${r.threshold}</b> 提醒一次` : '';
     const img = (r.mode==='llm'?r.llm_send_image:r.send_image)?' · 📷 补发概况图':'';
     const fired = ALERT.fired[r.id]?`<span style="color:var(--ok);font-size:11px;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3);padding:2px 8px;border-radius:6px">已触发 ${aesc(ALERT.fired[r.id])}</span>`:'';
     const dnames = (r.deliveries||[]).map(id=>{const d=ALERT.deliveries.find(x=>x.id===id);return d?d.name:id}).join('、')||'<span style="color:var(--err)">未配置投递</span>';
@@ -5420,7 +5453,7 @@ function renderAlert(){
       <div style="color:var(--dim);font-size:12px;margin-top:6px;line-height:1.7">
         ${r.type==='balance'
           ? `监测 <b style="color:var(--fg)">余额</b>：${target} ${opTxt} <b style="color:var(--warn)">${r.threshold}</b>${win}${cd}${img}`
-          : `监测 <b style="color:var(--fg)">${t}</b>：${target}${sess} ${opTxt} <b style="color:var(--warn)">${r.threshold}</b>${cur}${win}${cd}${img}`}
+          : `监测 <b style="color:var(--fg)">${t}</b>：${target}${sess} ${opTxt} <b style="color:var(--warn)">${r.threshold}</b>${cur}${trg}${win}${cd}${img}`}
         <br>投递到：<b style="color:var(--fg)">${dnames}</b>
         ${r.message?`<br>话语：<span style="color:var(--dim)">${aesc(r.message)}</span>`:''}
       </div>
@@ -5505,6 +5538,12 @@ function alertEditRule(id){
           <option value="le" ${(r?r.op:'le')==='le'?'selected':''}>低于等于（≤）</option>
           <option value="ge" ${(r?r.op:'le')==='ge'?'selected':''}>达到（≥）</option>
         </select></div>
+      <div id="ar_trigger_row" style="margin-bottom:12px;display:${type==='balance'?'none':''}"><label style="font-size:12px;color:var(--dim);font-weight:600">触发模式</label>
+        <select id="ar_trigger" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px">
+          <option value="once" ${(r?r.trigger:'once')==='once'?'selected':''}>当天累计达阈值提醒一次</option>
+          <option value="step" ${(r?r.trigger:'once')==='step'?'selected':''}>每新增达阈值提醒一次（如每 10M）</option>
+        </select>
+        <div style="color:var(--dim);font-size:11px;margin-top:4px">「每新增」= 每跨过一个阈值整数倍提醒一次（如每 10M 提醒），受生效时段限制，跨天重置</div></div>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
       <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600" id="ar_target_lab">${type==='balance'?'目标（余额源名，留空=任一源）':'目标（来源标签，留空=全部）'}</label>
@@ -5582,6 +5621,7 @@ function alertEditRule(id){
     $('#ar_target').placeholder = t==='balance' ? '如：DeepSeek' : '如：gm / dm';
     $('#ar_session_row').style.display = t==='balance' ? 'none' : 'grid';
     $('#ar_currency_row').style.display = t==='cost' ? '' : 'none';
+    $('#ar_trigger_row').style.display = t==='balance' ? 'none' : '';
     // 比较方式：balance 才允许「低于等于」；token/cost 只允许「达到」
     const opSel = $('#ar_op');
     const leOpt = opSel.querySelector('option[value="le"]');
@@ -5656,6 +5696,7 @@ function alertSaveRule(){
   const deliveries = [...document.querySelectorAll('#alertEditForm input[type=checkbox][value]')].filter(x=>x.checked).map(x=>x.value);
   const data = {
     name, type:$('#ar_type').value, op:$('#ar_op').value,
+    trigger:$('#ar_trigger').value,
     target:$('#ar_target').value.trim(), session:$('#ar_session').value.trim(),
     threshold, currency:$('#ar_currency').value.trim(),
     mode:document.querySelector('input[name=ar_mode]:checked').value,
