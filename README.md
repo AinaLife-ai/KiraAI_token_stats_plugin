@@ -367,7 +367,7 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 
 ### v1.3.9（2026-09-02）
 
-- **内容面板居中加大**：body 宽度 1160px → **1200px** 并 `margin:0 auto` 水平居中；背景图改 `position:fixed` 全屏铺满（之前 absolute 只覆盖 body 区域，页面比 body 宽时右侧留白、内容贴左）
+- **内容面板居中**：body 改 flex 布局（`align-items:center;justify-content:center`），面板水平+垂直双居中；body 100% 宽 + 背景图 `position:absolute` 全屏铺满（`object-fit:cover` 缩放居中），任何宽高下背景完整无空隙
 - **毛玻璃透明效果**：`.wrap` 加 `background:rgba(15,23,42,.72)` + `backdrop-filter:blur(14px)`（对齐 WebUI 看板 `body.bg-on #app` 风格），背景图透过面板柔和模糊，文字清晰可读
 - **渲染图自动清理**：`output/` 目录只保留最近 20 张渲染图（按文件名时间戳排序，最旧先删），不再无限累积
 - **README 精简**：顶部版本简介块删除，只保留标题 + 介绍 + 移植说明；更新日志保留在尾部折叠区
