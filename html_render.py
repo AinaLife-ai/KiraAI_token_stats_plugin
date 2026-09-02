@@ -22,7 +22,7 @@ _BROWSER_CANDIDATES = (
     ("chromium", "Chromium"),
 )
 
-SCREENSHOT_WIDTH = 1400
+SCREENSHOT_WIDTH = 1200
 
 
 async def _install_chromium() -> bool:

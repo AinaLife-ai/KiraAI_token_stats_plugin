@@ -2340,7 +2340,7 @@ class TokenStatsPlugin(BasePlugin):
 
         return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><style>
 h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
-body{{margin:0 auto;width:1400px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
+body{{margin:0 auto;width:1200px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
 font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:14px;padding:20px;}}
 .bg{{position:fixed;top:0;left:0;right:0;bottom:0;z-index:-1;}}
 .wrap{{position:relative;z-index:1;background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
@@ -2420,6 +2420,13 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             await render_html(html, str(png), self._browser, wait_js=wait_js)
             # 直发图片
             await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
+            # 清理旧渲染图：只保留最近 20 张（按文件名时间戳排序，最旧先删）
+            try:
+                old = sorted(out_dir.glob("summary_*.png"), key=lambda p: p.name)
+                for p in old[:-20]:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
             # 文本摘要（bot 自行组织语言转述）
             text = self._build_summary_text(range_key)
             return f"已发送渲染概览图到会话。数据摘要：\n{text}"
