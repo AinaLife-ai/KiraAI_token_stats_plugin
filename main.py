@@ -100,10 +100,14 @@ LOG_ERR_LABELS = {"xml": "XML解析", "model": "模型调用", "tool": "工具�
 # tool 返回 error / 权限 denied / 超时 / 调用失败等——LLM 白烧 token 的典型
 # 注意：error 字段值须为非零数字（含负数/小数）/非空字符串/true 才算失败
 # （{"error": 0} 是很多 API 的成功约定）；不匹配裸 403（"第403条"会误报）
+# 只匹配"动词+失败/超时"的明确失败模式，不匹配裸"超时/失败"（bot 正常回答里
+# 提到"如果响应超时/可能失败"等说明文字会误判）；且只检查文本开头 200 字符
+# （真实工具失败几乎总是以错误信息开头，长文本中间提到失败词是正常说明）
 TOOL_ERR_RE = re.compile(
     r"\{['\"]?error['\"]?\s*:\s*(?:-?(?:[1-9]\d*(?:\.\d+)?|0\.\d*[1-9]\d*)|['\"](?![+-]?0+(?:\.0+)?['\"])[^'\"]+['\"]|true|True)\s*[,}]|"
     r"Error\s*:|Permission denied|Access denied|权限不足|无权限|拒绝访问|"
-    r"Forbidden|HTTP\s*403|status\s*[=:]\s*403|not allowed|timed out|超时|"
+    r"Forbidden|HTTP\s*403|status\s*[=:]\s*403|not allowed|timed out|"
+    r"请求超时|连接超时|调用超时|读取超时|响应超时|"
     r"Failed to call tool|not implemented|"
     r"调用失败|执行失败|查询失败|获取失败|生成失败|发送失败|上传失败|下载失败|删除失败|保存失败|"
     r"失败[：:，。]|失败$",
@@ -1211,7 +1215,9 @@ class TokenStatsPlugin(BasePlugin):
         # （如"工具结果失败：N 次"、"最近出错：…"）但并非工具执行失败，避免自报污染统计
         if _SELF_TOOL_RE.match(text):
             return
-        if not TOOL_ERR_RE.search(text):
+        # 只检查文本开头 200 字符：真实工具失败几乎总是以错误信息开头；
+        # bot 正常回答长文本中间提到"超时/失败"（如"如果响应超时可能失败"）是说明文字，不误判
+        if not TOOL_ERR_RE.search(text[:200]):
             return
         day = datetime.now().strftime("%Y-%m-%d")
         self._tool_err_hist[day] = self._tool_err_hist.get(day, 0) + 1
