@@ -379,6 +379,12 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 <details>
 <summary>点击展开</summary>
 
+### v1.4.3（2026-09-03）
+
+- **修复预警 tab 加载失败（500）**：v1.4.2 把 `_alert_fired` 从 float 时间戳改为 dict `{count,at,day}`，但 `api_alert` 仍用 `datetime.fromtimestamp(v)` 期望 float → TypeError → 500 → 前端 JSON.parse 报错、规则编辑不了。修复：兼容 dict/float 两种格式，异常值兜底空串
+- **step 模式默认话语**：体现「每新增 N 提醒一次」（如"📈 tokens预警：全部 每新增 10000000 提醒一次，当前已达 12,000,000 tokens"）；新增 `{step}` 占位符
+- **投递会话停用**：规则编辑弹窗里该会话勾选框置灰不可勾选（标注"已停用"），规则卡片投递到显示删除线；后端 `_alert_delivery_sids` 本就跳过停用会话
+
 ### v1.4.2（2026-09-03）
 
 - **token/cost 新增「每新增 ≥」触发模式**（trigger=step）：每跨过一个阈值整数倍提醒一次（如每 10M tokens 提醒），受生效时段限制，跨天重置；与「当天累计达阈值提醒一次」（trigger=once，默认）并存
