@@ -114,7 +114,9 @@ class BrowserManager:
 
 async def render_html(html: str, output_path: str, browser: BrowserManager, wait_js: str = None) -> str:
     """渲染 HTML → PNG 整页截图，返回输出路径。失败抛异常（由调用方降级文本）。
-    wait_js：可选 JS 表达式，非空时等待其返回真值（如背景图加载完成），超时 8s 忽略。"""
+    wait_js：可选 JS 表达式，非空时等待其返回真值（如背景图加载完成），超时 8s 忽略。
+    截图策略：先按内容实际高度动态设置视口再截图（flex/min-height 布局下 full_page
+    的 scrollHeight 计算不可靠会截断），内容超高时自动撑高视口。"""
     if browser is not None:
         await browser.ready.wait()
         if not browser.ok:
@@ -136,10 +138,18 @@ async def render_html(html: str, output_path: str, browser: BrowserManager, wait
                 except Exception:
                     pass  # 超时忽略，继续截图
             await page.wait_for_timeout(800)
+            # 按内容实际高度动态设置视口（flex 布局下 full_page scrollHeight 不可靠）
             try:
-                await page.screenshot(path=output_path, full_page=True)
-            except Exception:
+                h = await page.evaluate("Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
+                h = max(800, int(h) + 2)
+                await page.set_viewport_size({"width": SCREENSHOT_WIDTH, "height": h})
+                await page.wait_for_timeout(200)
                 await page.screenshot(path=output_path, full_page=False)
+            except Exception:
+                try:
+                    await page.screenshot(path=output_path, full_page=True)
+                except Exception:
+                    await page.screenshot(path=output_path, full_page=False)
         finally:
             await b.close()
     return output_path

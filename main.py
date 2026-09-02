@@ -111,7 +111,7 @@ TOOL_ERR_RE = re.compile(
 
 # 本插件自身工具的正常输出前缀：摘要/聚合/明细文本里含"失败/出错"字样
 # （如"工具结果失败：N 次"、"最近出错：…"）但并非工具执行失败，排除自报避免统计污染
-_SELF_TOOL_RE = re.compile(r"^(?:【Token 用量统计】|【用量·|【最近轮次】)")
+_SELF_TOOL_RE = re.compile(r"^(?:【Token 用量统计】|【用量·|【最近轮次】|已发送渲染概览图到会话)")
 
 # LLM 响应内自报片段剥离：bot 转述本插件统计结果时带「出错：」字样
 # （如"最近出错：Merge facts error"、"出错标记合计：3"、"工具结果失败：2 次"、
@@ -2354,7 +2354,7 @@ h1 .dot{{width:9px;height:9px;border-radius:50%;background:#34d399;box-shadow:0 
 .card .k{{color:#a3b2c7;font-size:11px;letter-spacing:.5px;}}
 .card .topline{{display:flex;justify-content:space-between;align-items:baseline;}}
 .card .v{{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums;}}
-.card .d{{color:#a3b2c7;font-size:11px;margin-top:3px;line-height:1.5;}}
+.card .d{{color:#a3b2c7;font-size:11px;margin-top:3px;line-height:1.5;word-break:break-all;}}
 .card .spark{{position:absolute;right:10px;bottom:8px;width:44%;height:26px;opacity:.85;}}
 .card .spark svg{{width:100%;height:100%;display:block;}}
 .card.errbox{{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),#1e293b;border-left:3px solid #f87171;}}

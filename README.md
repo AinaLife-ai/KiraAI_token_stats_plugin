@@ -365,6 +365,12 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 <details>
 <summary>点击展开</summary>
 
+### v1.3.10（2026-09-02）
+
+- **渲染图截断修复**：内容超高时（如错误卡多、历史数据多）页面被截断——flex/min-height 布局下 Playwright `full_page` 的 scrollHeight 计算不可靠；改为先按内容实际高度动态设置视口再截图（内容超高自动撑高视口，完整不截断）
+- **工具结果失败误报修复**：渲染图返回文本以「已发送渲染概览图到会话。」开头，`_SELF_TOOL_RE` 未覆盖 → 摘要里的「工具结果失败：N 次」被 `on.tool_result` 误判自增；前缀排除规则补上渲染图返回
+- **文字溢出修复**：错误日志长路径（如 `C:\Users\...\SKILL.md not found`）溢出卡片，`.card .d` 加 `word-break:break-all`
+
 ### v1.3.9（2026-09-02）
 
 - **内容面板居中**：body 改 flex 布局（`align-items:center;justify-content:center`），面板水平+垂直双居中；body 100% 宽 + 背景图 `position:absolute` 全屏铺满（`object-fit:cover` 缩放居中），任何宽高下背景完整无空隙
