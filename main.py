@@ -2334,16 +2334,17 @@ class TokenStatsPlugin(BasePlugin):
         if bg:
             bg_layer = f'<img class="bg" src="{_esc(bg)}" alt="">'
             bg_style = (
-                ".bg{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;width:100%;height:100%;"
+                ".bg{position:fixed;top:0;left:0;right:0;bottom:0;z-index:-1;width:100%;height:100%;"
                 "object-fit:cover;opacity:.92;}"
             )
 
         return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><style>
 h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
-body{{margin:0;width:1160px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
+body{{margin:0 auto;width:1400px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
 font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:14px;padding:20px;}}
-.bg{{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;}}
-.wrap{{position:relative;z-index:1;}}
+.bg{{position:fixed;top:0;left:0;right:0;bottom:0;z-index:-1;}}
+.wrap{{position:relative;z-index:1;background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+border-radius:16px;padding:20px;border:1px solid rgba(51,65,85,.5);box-shadow:0 8px 32px rgba(0,0,0,.35);}}
 h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
 h1 .dot{{width:9px;height:9px;border-radius:50%;background:#34d399;box-shadow:0 0 8px #34d399;}}
 .sub{{color:#a3b2c7;font-size:12px;margin-bottom:16px;word-break:break-all;}}
