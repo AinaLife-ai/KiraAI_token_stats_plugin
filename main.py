@@ -97,20 +97,20 @@ LOG_ERR_CATS = ("xml", "model", "tool", "net", "traceback", "other")
 LOG_ERR_LABELS = {"xml": "XML解析", "model": "模型调用", "tool": "工具执行", "net": "网络/超时", "traceback": "异常堆栈", "other": "其他"}
 
 # ── 工具结果失败判定（on.tool_result 钩子）──
-# tool 返回 error / 权限 denied / 超时 / 调用失败等——LLM 白烧 token 的典型
+# 框架（core/agent/func_tool_manager.py）执行工具失败时必包成 {"error": ...} JSON：
+#   超时 → {"error": "Tool 'x' timed out after Ns"}
+#   异常 → {"error": "Failed to call tool 'x': ..."}
+#   未实现 → {"error": "Tool x not implemented"}
+# 因此主判定 = {"error": ...} JSON 结构（100% 可靠，非字符串猜测）。
+# 补充：工具自身返回的权限类错误（正常回答开头不会出现）与 "Error:" 前缀。
 # 注意：error 字段值须为非零数字（含负数/小数）/非空字符串/true 才算失败
-# （{"error": 0} 是很多 API 的成功约定）；不匹配裸 403（"第403条"会误报）
-# 只匹配"动词+失败/超时"的明确失败模式，不匹配裸"超时/失败"（bot 正常回答里
-# 提到"如果响应超时/可能失败"等说明文字会误判）；且只检查文本开头 200 字符
-# （真实工具失败几乎总是以错误信息开头，长文本中间提到失败词是正常说明）
+# （{"error": 0} 是很多 API 的成功约定）；不匹配裸 403（"第403条"会误报）。
+# 不再匹配裸"超时/失败"或"动词+失败词"——bot 正常回答里提到
+# "如果响应超时/查询失败会怎样"等说明文字会误判；框架失败已由 JSON 覆盖。
 TOOL_ERR_RE = re.compile(
-    r"\{['\"]?error['\"]?\s*:\s*(?:-?(?:[1-9]\d*(?:\.\d+)?|0\.\d*[1-9]\d*)|['\"](?![+-]?0+(?:\.0+)?['\"])[^'\"]+['\"]|true|True)\s*[,}]|"
+    r"\{['\"]?error['\"]?\s*:\s*(?:-?(?:[1-9]\d*(?:\.\d+)?|0\.\d*[1-9]\d*)|['\"](?![+-]?0+(?:\.0+)?['\"])[^\"\\]+['\"]|true|True)\s*[,}]|"
     r"Error\s*:|Permission denied|Access denied|权限不足|无权限|拒绝访问|"
-    r"Forbidden|HTTP\s*403|status\s*[=:]\s*403|not allowed|timed out|"
-    r"请求超时|连接超时|调用超时|读取超时|响应超时|"
-    r"Failed to call tool|not implemented|"
-    r"调用失败|执行失败|查询失败|获取失败|生成失败|发送失败|上传失败|下载失败|删除失败|保存失败|"
-    r"失败[：:，。]|失败$",
+    r"Forbidden|HTTP\s*403|status\s*[=:]\s*403|not allowed",
     re.IGNORECASE)
 
 # 本插件自身工具的正常输出前缀：摘要/聚合/明细文本里含"失败/出错"字样
@@ -1205,7 +1205,8 @@ class TokenStatsPlugin(BasePlugin):
 
     @on.tool_result(priority=Priority.LOW)
     async def on_tool_result(self, event, result: ToolResult, *_):
-        """工具结果失败统计：error/权限denied/超时/调用失败等——LLM 白烧 token 的典型"""
+        """工具结果失败统计：框架失败（超时/异常/未实现，必包 {"error": ...} JSON）
+        或工具返回的权限类错误——LLM 白烧 token 的典型"""
         if not self.enabled:
             return
         text = (getattr(result, "text", "") or "") or ""
