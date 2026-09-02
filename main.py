@@ -2330,20 +2330,18 @@ class TokenStatsPlugin(BasePlugin):
 
         bg = self._render_bg_url()
         bg_layer = ""
-        bg_style = ""
         if bg:
             bg_layer = f'<img class="bg" src="{_esc(bg)}" alt="">'
-            bg_style = (
-                ".bg{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;width:100%;height:100%;"
-                "object-fit:cover;opacity:.92;}"
-            )
 
         return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+html{{height:100%;}}
 h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
-body{{margin:0;width:1160px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
-font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:14px;padding:20px;}}
-.bg{{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;}}
-.wrap{{position:relative;z-index:1;}}
+body{{margin:0;width:100%;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
+font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:14px;
+display:flex;align-items:center;justify-content:center;}}
+.bg{{position:absolute;top:0;left:0;right:0;bottom:0;z-index:0;width:100%;height:100%;object-fit:cover;object-position:center;opacity:.92;}}
+.wrap{{position:relative;z-index:1;width:1200px;background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+border-radius:16px;padding:20px;border:1px solid rgba(51,65,85,.5);box-shadow:0 8px 32px rgba(0,0,0,.35);}}
 h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
 h1 .dot{{width:9px;height:9px;border-radius:50%;background:#34d399;box-shadow:0 0 8px #34d399;}}
 .sub{{color:#a3b2c7;font-size:12px;margin-bottom:16px;word-break:break-all;}}
@@ -2419,6 +2417,13 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             await render_html(html, str(png), self._browser, wait_js=wait_js)
             # 直发图片
             await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
+            # 清理旧渲染图：只保留最近 20 张（按文件名时间戳排序，最旧先删）
+            try:
+                old = sorted(out_dir.glob("summary_*.png"), key=lambda p: p.name)
+                for p in old[:-20]:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
             # 文本摘要（bot 自行组织语言转述）
             text = self._build_summary_text(range_key)
             return f"已发送渲染概览图到会话。数据摘要：\n{text}"
