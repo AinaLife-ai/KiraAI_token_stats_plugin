@@ -28,6 +28,8 @@
 """
 
 import asyncio
+import base64
+import html
 import json
 import os
 import re
@@ -48,8 +50,10 @@ from core.plugin import BasePlugin, logger, on, Priority, register
 from core.plugin.plugin_registry import PluginPage, PageMenu
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import MessageChain
-from core.chat.message_elements import Text
+from core.chat.message_elements import Text, Image
 from core.provider import LLMResponse, ToolResult
+
+from .html_render import BrowserManager, render_html
 
 try:
     from core.utils.path_utils import get_data_path
@@ -214,6 +218,11 @@ def _fmt_dur(v):
     if v < 3600:
         return f"{int(v // 60)}m{int(v % 60):02d}s"
     return f"{int(v // 3600)}h{int(v % 3600 // 60):02d}m"
+
+
+def _esc(s) -> str:
+    """HTML 转义（渲染图模板用）"""
+    return html.escape(str(s or ""), quote=False)
 
 
 def _rec_dur(rec: dict):
@@ -547,6 +556,9 @@ class TokenStatsPlugin(BasePlugin):
         tool = cfg.get("section_tool", {})
         self.enable_tool = bool(tool.get("enable_tool", True))
         self.tool_include_balance = bool(tool.get("tool_include_balance", True))
+        # 渲染图模式：默认关（LLM 显式要求才发图）；开启后 query_token_stats 默认发渲染图
+        self.tool_render_image = bool(tool.get("tool_render_image", False))
+        self._browser = BrowserManager()
 
         # ── 价格规则 ──
         pr = cfg.get("section_pricing", {})
@@ -761,6 +773,10 @@ class TokenStatsPlugin(BasePlugin):
         self._load_history()
         self._load_bal_states()
         self._load_err_stats()
+
+        # 渲染图模式：后台检测浏览器（系统 Chrome/Edge → 内置 Chromium → 自动下载），不阻塞加载
+        asyncio.ensure_future(self._browser.initialize())
+        logger.info("[token_stats] 渲染图浏览器检测已在后台启动")
 
         # 后台日志 ERROR 扫描：扫描 data 目录下 log.log*（含轮转文件），按 ino 增量
         self._log_err_task = asyncio.create_task(self._log_err_loop())
@@ -2173,6 +2189,254 @@ class TokenStatsPlugin(BasePlugin):
             sb.append(tool_err)
         return "\n".join(sb)
 
+    # ── 渲染图模式：查加发一体（LLM 工具触发 → 查数据 → 渲染 HTML → 截图 → 直发图片+文本摘要）──
+
+    def _render_bg_b64(self) -> str:
+        """渲染图背景：优先用户自定义背景（前端同步到插件数据目录 bg_custom.jpg），
+        否则线上随机图（data URI 内联，避免 Playwright 外网加载失败）。"""
+        try:
+            p = self._data_dir / "bg_custom.jpg"
+            if p.exists() and p.stat().st_size > 0:
+                return base64.b64encode(p.read_bytes()).decode()
+        except Exception:
+            pass
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=" + str(int(time.time())),
+                headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = r.read()
+            if data and len(data) > 1000:
+                return base64.b64encode(data).decode()
+        except Exception:
+            pass
+        return ""
+
+    def _render_spark_svg(self, vols) -> str:
+        """迷你走势线（与 WebUI sparkHtml 一致：44x26 折线+面积）"""
+        arr = [v for v in (vols or []) if v is not None]
+        if not arr:
+            return ""
+        mx = max(arr) or 1
+        n = len(arr)
+        pts = " ".join(f"{i / (n - 1 or 1) * 44:.1f},{26 - (v / mx * 24):.1f}" for i, v in enumerate(arr))
+        return ('<svg viewBox="0 0 44 26" preserveAspectRatio="none">'
+                f'<polyline points="{pts}" fill="none" stroke="rgba(56,189,248,.85)" stroke-width="1.4"/>'
+                f'<polygon points="0,26 {pts} 44,26" fill="rgba(56,189,248,.13)"/></svg>')
+
+    def _render_cost_bits(self, units: dict) -> str:
+        """费用片段：按 (币种, 显示单位) 分桶 → HTML span"""
+        bits = []
+        for key, amt in units.items():
+            if not amt:
+                continue
+            _, _, unit = key.partition("|")
+            if unit:
+                bits.append(f'<span class="pts">{amt:,.4f} {_esc(unit)}</span>')
+            else:
+                bits.append(f'<span class="pts">{amt:,.4f}</span>')
+        return " + ".join(bits) if bits else '<span class="cost">—</span>'
+
+    def _build_summary_html(self, range_key: str = "") -> str:
+        """构建概览首页完整 HTML（对齐 WebUI 概览页：快照栏 + 五范围卡 + 错误卡 + 按天历史 + 今日小时）。
+        数据全部来自插件内存聚合（与 /stats、/history 同源），不依赖 WebUI 前端。"""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        d7 = (now - timedelta(days=6)).strftime("%Y-%m-%d")
+        d30 = (now - timedelta(days=29)).strftime("%Y-%m-%d")
+        channel, model, _ = self._resolve_channel_model()
+        s = self._sess
+        sess_name = ""
+        if s.get("sid"):
+            try:
+                sess_name = self._resolve_sid_name(s["sid"])
+            except Exception:
+                sess_name = ""
+        elapsed = max(0, int(time.time() - s["start"]))
+
+        def _fmt_elapsed(sec):
+            sec = max(0, int(sec))
+            d, h, m, ss = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60, sec % 60
+            return (f"{d}天" if d else "") + (f"{h}时" if d or h else "") + (f"{m}分" if d or h or m else "") + f"{ss}秒"
+
+        def _dur_line(b):
+            a, mn, mx = _dur_stats(b)
+            if a is None:
+                return ""
+            return f'<div class="d">耗时 均{_fmt_dur(a)}·快{_fmt_dur(mn)}·慢{_fmt_dur(mx)}</div>'
+
+        # 五范围卡
+        cards = []
+        for k in RANGES:
+            if k == "session":
+                b = s
+                units, matched = self._session_cost_units()
+            else:
+                frm, to = {"today": (today, today), "d7": (d7, today),
+                           "d30": (d30, today), "total": ("0000-01-01", "9999-12-31")}[k]
+                b = self._range_agg(frm, to)
+                units, matched = self._range_cost_units(frm, to)
+            rate = f"{b['c'] / b['i'] * 100:.1f}%" if b["i"] > 0 else "—"
+            cost = self._render_cost_bits(units) if matched else '<span class="cost">—</span>'
+            errs = b.get("e", 0)
+            sp = "" if k == "session" else self._render_spark_svg(
+                [self._days.get(dk, {}).get("v", 0) for dk in sorted(self._days)[-14:]])
+            label = RANGE_LABELS[k]
+            cards.append(
+                f'<div class="card" data-k="{k}"><div class="k">{_esc(label)}</div>'
+                f'<div class="topline"><div class="v">{_fmt4(b["v"])}</div>{sp}</div>'
+                f'<div class="d">{_fmt_num(b["r"])} 轮 · 输入 {_fmt_num(b["i"])} · 输出 {_fmt_num(b["o"])} · 缓存 {_fmt_num(b["c"])} · 命中率 <span class="rate">{rate}</span></div>'
+                f'<div class="d">费用 {cost}' + (f' · 出错 <span class="bad">{errs}</span>' if errs else '') + '</div>'
+                + _dur_line(b) + '</div>')
+
+        # 错误卡
+        if self._last_err_text:
+            cards.append(f'<div class="card errbox"><div class="k">最近出错</div><div class="d">{_esc(self._last_err_text)}</div></div>')
+        log_err = self._log_err_summary(7)
+        if log_err:
+            cards.append(f'<div class="card errbox"><div class="k">后台日志 ERROR</div><div class="d">{_esc(log_err)}</div></div>')
+        tool_err = self._tool_err_summary(7)
+        if tool_err:
+            cards.append(f'<div class="card errbox"><div class="k">工具结果失败</div><div class="d">{_esc(tool_err)}</div></div>')
+
+        # 按天历史（近14天）
+        hist_rows = ""
+        day_keys = sorted(self._days)[-14:]
+        if day_keys:
+            mx = max((self._days[dk]["v"] for dk in day_keys), default=1) or 1
+            for dk in day_keys:
+                x = self._days[dk]
+                cur = ' class="cur"' if dk == today else ""
+                star = " ★" if dk == today else ""
+                hist_rows += (f'<tr{cur}><td>{dk}{star}</td><td>{_fmt4(x["v"])}</td><td>{x["r"]}</td>'
+                              f'<td>{_fmt_num(x["i"])}</td><td>{_fmt_num(x["o"])}</td><td>{_fmt_num(x["c"])}</td>'
+                              f'<td><div class="bar"><i style="width:{x["v"] / mx * 100:.1f}%"></i></div></td></tr>')
+        hist_html = (f'<table><thead><tr><th>日期</th><th>总量</th><th>轮数</th><th>输入</th><th>输出</th><th>缓存</th>'
+                     f'<th style="width:30%">分布</th></tr></thead><tbody>{hist_rows}</tbody></table>'
+                     if hist_rows else '<div class="note">暂无历史数据</div>')
+
+        # 今日按小时
+        hour_cells = ""
+        hs = self._hours.get(today, []) or []
+        hmx = max((h["v"] for h in hs if h), default=1) or 1
+        for h in range(24):
+            x = hs[h] if h < len(hs) else None
+            if x:
+                hour_cells += (f'<div class="h"><span class="hl">{h}时</span><i><b style="height:{max(4, x["v"] / hmx * 100):.1f}%"></b></i>'
+                               f'<span class="hv">{_fmt4(x["v"])}</span></div>')
+            else:
+                hour_cells += f'<div class="h"><span class="hl">{h}时</span><i></i><span class="hv">—</span></div>'
+        hours_html = f'<div class="hours">{hour_cells}</div>'
+
+        # 余额
+        bal_bits = []
+        for src in self.balance_sources:
+            if not src.get("enabled", True):
+                continue
+            st = self._resolve_balance_state(src)
+            name = src.get("name", "")
+            if st["ok"]:
+                unit = self._src_unit(src)
+                bal_bits.append(f'<span class="bal-ok">● {_esc(name)} {st["balance"]:.4f}' + (f" {_esc(unit)}" if unit else "") + '</span>')
+            else:
+                bal_bits.append(f'<span class="bal-bad">● {_esc(name)} 探测失败</span>')
+        bal_html = '<div class="bal">' + "".join(bal_bits) + '</div>' if bal_bits else ""
+
+        bg = self._render_bg_b64()
+        bg_layer = ""
+        bg_style = ""
+        if bg:
+            bg_layer = '<div class="bg"></div>'
+            bg_style = (
+                ".bg{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;"
+                "background:"
+                "linear-gradient(180deg, rgba(15,23,42,0.25) 0%, rgba(15,23,42,0.2) 16%, rgba(15,23,42,0.5) 24%, rgba(15,23,42,0.75) 34%, rgba(15,23,42,0.6) 70%, rgba(11,18,32,0.96) 100%),"
+                f"url('data:image/jpeg;base64,{bg}') center/cover no-repeat;}}"
+            )
+
+        sess_label = sess_name or (s.get("sid") or "本次会话")
+        return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+html{{height:100%;}}
+body{{margin:0;width:800px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
+font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:14px;padding:20px;}}
+.bg{{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;}}
+.wrap{{position:relative;z-index:1;}}
+h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
+h1 .dot{{width:9px;height:9px;border-radius:50%;background:#34d399;box-shadow:0 0 8px #34d399;}}
+.sub{{color:#a3b2c7;font-size:12px;margin-bottom:16px;word-break:break-all;}}
+.snap{{display:flex;gap:16px;align-items:center;flex-wrap:wrap;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:12px 16px;margin-bottom:16px;font-size:12.5px;}}
+.snap .dot{{width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block;margin-right:6px;box-shadow:0 0 6px #34d399;}}
+.snap .st{{color:#a3b2c7;}}
+.snap b{{color:#e2e8f0;}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-bottom:16px;}}
+.card{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;}}
+.card[data-k="session"],.card[data-k="today"]{{grid-column:span 2;}}
+.card .k{{color:#a3b2c7;font-size:11px;letter-spacing:.5px;}}
+.card .topline{{display:flex;justify-content:space-between;align-items:baseline;}}
+.card .v{{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums;}}
+.card .d{{color:#a3b2c7;font-size:11px;margin-top:3px;line-height:1.5;}}
+.card .spark{{position:absolute;right:10px;bottom:8px;width:44%;height:26px;opacity:.85;}}
+.card .spark svg{{width:100%;height:100%;display:block;}}
+.card.errbox{{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),#1e293b;border-left:3px solid #f87171;}}
+.rate{{color:#a78bfa;}}.cost{{color:#a3b2c7;}}.pts{{color:#c084fc;}}.bad{{color:#f87171;}}
+.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}}
+.box{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px 16px;}}
+.box h3{{font-size:14px;margin:0 0 10px;color:#e2e8f0;}}
+table{{width:100%;border-collapse:collapse;font-size:12.5px;}}
+th{{color:#a3b2c7;text-align:left;font-weight:500;padding:6px 8px;border-bottom:1px solid #334155;font-size:11px;letter-spacing:.5px;}}
+td{{padding:6px 8px;border-bottom:1px solid rgba(51,65,85,.4);font-variant-numeric:tabular-nums;}}
+tr.cur td{{background:rgba(52,211,153,.07);}}
+.bar{{height:8px;border-radius:4px;background:#0b1220;overflow:hidden;margin-top:4px;}}
+.bar i{{display:block;height:100%;background:linear-gradient(90deg,#38bdf8,#a78bfa);border-radius:4px;}}
+.hours{{display:grid;grid-template-columns:repeat(12,1fr);gap:6px;}}
+.hours .h{{background:#0b1220;border-radius:6px;padding:6px;text-align:center;font-size:10px;color:#a3b2c7;}}
+.hours .h i{{display:block;height:46px;background:#0b1220;border-radius:3px;margin:4px 0 2px;position:relative;overflow:hidden;}}
+.hours .h i b{{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(180deg,#38bdf8,#6366f1);border-radius:3px 3px 0 0;}}
+.hours .h .hl{{display:block;}}
+.hours .h .hv{{display:block;font-variant-numeric:tabular-nums;}}
+.bal{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;font-size:12px;}}
+.bal-ok{{color:#34d399;}}.bal-bad{{color:#f87171;}}
+.note{{color:#a3b2c7;font-size:11.5px;margin-top:8px;line-height:1.6;}}
+.footer{{margin-top:14px;padding:10px 0 4px;text-align:center;font-size:12px;color:#8f97ab;line-height:1.7;}}
+</style></head><body>
+{bg_layer}
+<div class="wrap">
+<h1><span class="dot"></span>Token 用量统计</h1>
+<div class="sub">模型 {_esc(model)} · 渠道 {_esc(channel)} · 日志 {_esc(str(self._log_path))}</div>
+<div class="snap"><span><span class="dot"></span>{_esc(self._cur_source)}</span>
+<span class="st">会话 <b>{s["r"]}</b> 轮 · <b>{_fmt4(s["v"])}</b> Token · 已进行 <b>{_fmt_elapsed(elapsed)}</b></span>
+<span class="st">最近一轮：输入 <b>{_fmt_num(self._last_round["i"])}</b> · 输出 <b>{_fmt_num(self._last_round["o"])}</b>{f' · 缓存 <b>{_fmt_num(self._last_round["c"])}</b>' if self._last_round["c"] else ''}</span></div>
+<div class="cards">{''.join(cards)}</div>
+{bal_html}
+<div class="grid2">
+<div class="box"><h3>按天历史</h3>{hist_html}</div>
+<div class="box"><h3>今日按小时</h3>{hours_html}</div>
+</div>
+<div class="footer">Token 用量统计 · {_esc(sess_label)} · 生成于 {now.strftime("%Y-%m-%d %H:%M:%S")}</div>
+</div>
+</body></html>"""
+
+    async def _build_summary_image(self, event: KiraMessageBatchEvent, range_key: str = "") -> str:
+        """查加发一体：查数据 → 渲染 HTML → Playwright 截图 → 直发图片 + 文本摘要。
+        渲染失败自动降级纯文本（不吞消息）。"""
+        sid = event.sid
+        try:
+            html = self._build_summary_html(range_key)
+            out_dir = self._data_dir / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            png = out_dir / f"summary_{int(time.time() * 1000)}.png"
+            wait_js = "document.querySelectorAll('.bg').length===0 || getComputedStyle(document.querySelector('.bg')).backgroundImage !== 'none'"
+            await render_html(html, str(png), self._browser, wait_js=wait_js)
+            # 直发图片
+            await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
+            # 文本摘要（bot 自行组织语言转述）
+            text = self._build_summary_text(range_key)
+            return f"已发送渲染概览图到会话。数据摘要：\n{text}"
+        except Exception as e:
+            logger.warning(f"[token_stats] 渲染图失败，降级纯文本: {e}")
+            return self._build_summary_text(range_key)
+
     async def _build_query_reply(self, arg: str) -> str:
         arg = arg.strip().lower()
         aliases = {"本次": "session", "今天": "today", "7天": "d7", "近7天": "d7",
@@ -2378,7 +2642,7 @@ class TokenStatsPlugin(BasePlugin):
 
     @register.tool(
         name="query_token_stats",
-        description="查询 Token 用量统计：本次会话/今天/近7天/近30天/累计的 tokens、轮数、估算费用、出错次数，以及已配置的 API 账户余额。用户问到\"用了多少 token / 花了多少钱 / 余额还剩多少 / 出错了吗\"等时调用。",
+        description="查询 Token 用量统计：本次会话/今天/近7天/近30天/累计的 tokens、轮数、估算费用、出错次数，以及已配置的 API 账户余额。用户问到\"用了多少 token / 花了多少钱 / 余额还剩多少 / 出错了吗\"等时调用。render=image 时会把统计结果渲染成一张好看的概览图片直接发送到会话（查加发一体），用户想要\"图片/卡片/截图/好看的形式\"时用 image。",
         params={
             "type": "object",
             "properties": {
@@ -2387,18 +2651,27 @@ class TokenStatsPlugin(BasePlugin):
                     "enum": ["", "session", "today", "d7", "d30", "total"],
                     "description": "统计范围：留空返回全部概览，session=本次会话，today=今天，d7=近7天，d30=近30天，total=累计",
                     "default": "",
-                }
+                },
+                "render": {
+                    "type": "string",
+                    "enum": ["", "image", "text"],
+                    "description": "输出形式：留空=跟随插件配置（默认纯文本），image=渲染成概览图片并直接发送到会话，text=纯文本。用户想要图片/卡片/好看的形式时传 image",
+                    "default": "",
+                },
             },
             "required": [],
         },
     )
-    async def query_token_stats(self, event: KiraMessageBatchEvent, range: str = "") -> str:
+    async def query_token_stats(self, event: KiraMessageBatchEvent, range: str = "", render: str = "") -> str:
         if not self.enabled:
             return "Token 统计未启用（插件配置页 → 基础设置）"
         try:
             # 工具查询余额时先即时探测，保证拿到最新值（与 api-balance 插件行为一致）
             if self.tool_include_balance and self.enable_balance and self.balance_sources:
                 await self._probe_all(wait=True)
+            effective = render if render in ("image", "text") else ("image" if self.tool_render_image else "text")
+            if effective == "image":
+                return await self._build_summary_image(event, range or "")
             return self._build_summary_text(range or "")
         except Exception as e:
             logger.exception("[token_stats] tool query failed")
@@ -3183,6 +3456,29 @@ class TokenStatsPlugin(BasePlugin):
             sources.append(item)
         return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
 
+    @register.api(method="POST", path="/bg-sync", auth=True)
+    async def api_bg_sync(self, request: Request):
+        """前端把自定义背景图（data URL）同步到服务端，供渲染图模式使用。
+        body: {"data": "data:image/jpeg;base64,..."} 或 {"data": ""} 清除。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        data = body.get("data") or ""
+        try:
+            if data.startswith("data:image/"):
+                b64 = data.split(",", 1)[1] if "," in data else ""
+                raw = base64.b64decode(b64)
+                if len(raw) > 2_000_000:
+                    return {"ok": False, "msg": "图片超过 2MB 限制"}
+                (self._data_dir / "bg_custom.jpg").write_bytes(raw)
+                return {"ok": True, "msg": "背景已同步"}
+            (self._data_dir / "bg_custom.jpg").unlink(missing_ok=True)
+            return {"ok": True, "msg": "背景已清除"}
+        except Exception as e:
+            logger.warning(f"[token_stats] 背景同步失败: {e}")
+            return {"ok": False, "msg": f"背景同步失败：{e}"}
+
     @register.api(method="POST", path="/balance-config", auth=True)
     async def api_balance_config(self, request: Request):
         """保存余额监测源（WebUI 可视化编辑器）：整体替换 balance_sources 并热重载"""
@@ -3614,7 +3910,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="recRefresh">刷新</button>
       <span style="color:var(--dim);font-size:12px">最近 <span id="recCount">15</span> 轮（含工具步），费用按当前价格规则即时计算</span>
     </div>
-    <table><thead><tr><th>时间</th><th>模型</th><th>来源</th><th>渠道</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th>费用</th></tr></thead><tbody id="recBody"></tbody></table>
+    <table><thead><tr><th>时间</th><th>模型</th><th>来源</th><th>渠道</th><th>输入</th><th>输出</th><th>缓存</th><th>耗时</th><th>总量</th><th>费用</th></tr></thead><tbody id="recBody"></tbody></table>
   </div>
 </div>
 
@@ -3926,19 +4222,28 @@ async function loadTrend(r){
     const rate = x.i>0 ? (x.c/x.i*100) : 0;
     return ((xi+0.5)/N*100).toFixed(2)+','+(100-Math.min(100,rate)).toFixed(2);
   }).join(' ');
-  const hitSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+hitPts+'" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 2" vector-effect="non-scaling-stroke" opacity=".85"/></svg>';
+  // 命中率节点（单点/多点都可见；SVG attribute 不支持 var()，颜色必须走 style）
+  const hitDots = days.map((x,xi)=>{
+    if(x.i<=0) return '';
+    const rate = Math.min(100, x.c/x.i*100);
+    return '<circle cx="'+((xi+0.5)/N*100).toFixed(2)+'" cy="'+(100-rate).toFixed(2)+'" r="1.6" style="fill:var(--purple)"/>';
+  }).join('');
+  const hitSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+hitPts+'" fill="none" style="stroke:var(--purple)" stroke-width="1.5" stroke-dasharray="3 2" vector-effect="non-scaling-stroke" opacity=".85"/>'+hitDots+'</svg>';
   // 单轮平均耗时折线（橙色实线，右轴 秒，独立量纲；无耗时数据的桶断开不连线）
   let durMax = 0;
   days.forEach(x=>{ if(x.da!=null && x.da>durMax) durMax=x.da; });
   let durSvg = '', durAxisHtml = '';
   if(durMax>0){
-    let path = '', pen = false;
+    let path = '', pen = false, dots = '';
     days.forEach((x,xi)=>{
       if(x.da==null){ pen=false; return; }
-      path += (pen?'L':'M')+((xi+0.5)/N*100).toFixed(2)+' '+(100-Math.min(96,x.da/durMax*96)).toFixed(2);
+      const px = ((xi+0.5)/N*100).toFixed(2);
+      const py = (100-Math.min(96,x.da/durMax*96)).toFixed(2);
+      path += (pen?'L':'M')+px+' '+py;
       pen = true;
+      dots += '<circle cx="'+px+'" cy="'+py+'" r="1.8" style="fill:var(--warn)"/>';
     });
-    durSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><path d="'+path+'" fill="none" stroke="var(--warn)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity=".9"/></svg>';
+    durSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><path d="'+path+'" fill="none" style="stroke:var(--warn)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity=".9"/>'+dots+'</svg>';
     // 右轴刻度标签（柱子右侧小字）：0 / 半值 / 峰值；CSS 不支持 calc 乘法，换算为 px+% 组合
     durAxisHtml = [0, 0.5, 1].map(f=>{
       const top = 'calc('+(6-22*(1-f))+'px + '+((1-f)*100)+'%)';
@@ -4407,6 +4712,12 @@ setInterval(loadOv, 4000);
   document.body.appendChild(fileIn);
   const bgOn = ()=>localStorage.getItem(BG_KEY) !== '0';
   const trySave = arr => { try{ localStorage.setItem(CBG_KEY, JSON.stringify(arr)); return true; }catch(e){ return false; } };
+  // 把当前生效背景同步到服务端（渲染图模式用；data URL 直接 POST）
+  const syncBgToServer = url => {
+    try{
+      fetch(API+'/bg-sync', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({data:url||''})}).catch(()=>{});
+    }catch(e){}
+  };
   fileIn.onchange = async ()=>{
     const files = Array.from(fileIn.files||[]);
     fileIn.value = '';
@@ -4425,6 +4736,8 @@ setInterval(loadOv, 4000);
     }
     if(saved){
       applyBg(bgOn());
+      const pool = customPool();
+      if(pool.length) syncBgToServer(pool[Math.floor(Math.random()*pool.length)]);
       toast('自定义背景已保存（'+saved+' 张）' + (saved < list.length ? '，图片过大仅保存前 '+saved+' 张' : ''));
     }else{
       toast('图片过大，无法保存自定义背景');
@@ -4436,6 +4749,7 @@ setInterval(loadOv, 4000);
     clearTimeout(clickTm);
     localStorage.removeItem(CBG_KEY);
     applyBg(bgOn());
+    syncBgToServer('');
     toast('已清除自定义背景，恢复线上随机图');
   };
   applyBg(bgOn());
@@ -4681,6 +4995,12 @@ function compressImg(file, maxSide, q){
   document.body.appendChild(fileIn);
   const bgOn = ()=>localStorage.getItem(BG_KEY) !== '0';
   const trySave = arr => { try{ localStorage.setItem(CBG_KEY, JSON.stringify(arr)); return true; }catch(e){ return false; } };
+  // 把当前生效背景同步到服务端（渲染图模式用；data URL 直接 POST）
+  const syncBgToServer = url => {
+    try{
+      fetch(API+'/bg-sync', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({data:url||''})}).catch(()=>{});
+    }catch(e){}
+  };
   fileIn.onchange = async ()=>{
     const files = Array.from(fileIn.files||[]);
     fileIn.value = '';
@@ -4699,6 +5019,8 @@ function compressImg(file, maxSide, q){
     }
     if(saved){
       applyBg(bgOn());
+      const pool = customPool();
+      if(pool.length) syncBgToServer(pool[Math.floor(Math.random()*pool.length)]);
       toast('自定义背景已保存（'+saved+' 张）' + (saved < list.length ? '，图片过大仅保存前 '+saved+' 张' : ''));
     }else{
       toast('图片过大，无法保存自定义背景');
@@ -4710,6 +5032,7 @@ function compressImg(file, maxSide, q){
     clearTimeout(clickTm);
     localStorage.removeItem(CBG_KEY);
     applyBg(bgOn());
+    syncBgToServer('');
     toast('已清除自定义背景，恢复线上随机图');
   };
 })();
