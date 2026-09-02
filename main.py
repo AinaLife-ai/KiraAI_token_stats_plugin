@@ -2191,27 +2191,17 @@ class TokenStatsPlugin(BasePlugin):
 
     # ── 渲染图模式：查加发一体（LLM 工具触发 → 查数据 → 渲染 HTML → 截图 → 直发图片+文本摘要）──
 
-    def _render_bg_b64(self) -> str:
-        """渲染图背景：优先用户自定义背景（前端同步到插件数据目录 bg_custom.jpg），
-        否则线上随机图（data URI 内联，避免 Playwright 外网加载失败）。"""
+    def _render_bg_url(self) -> str:
+        """渲染图背景 URL：优先用户自定义背景（前端同步到插件数据目录 bg_custom.jpg，
+        转 data URI 内联，渲染不依赖外网）；否则返回线上随机图 URL（由 Playwright
+        浏览器加载，与 WebUI 看板同源）。两种都没有 → 空串 = 纯色背景。"""
         try:
             p = self._data_dir / "bg_custom.jpg"
             if p.exists() and p.stat().st_size > 0:
-                return base64.b64encode(p.read_bytes()).decode()
+                return "data:image/jpeg;base64," + base64.b64encode(p.read_bytes()).decode()
         except Exception:
             pass
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                "https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=" + str(int(time.time())),
-                headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as r:
-                data = r.read()
-            if data and len(data) > 1000:
-                return base64.b64encode(data).decode()
-        except Exception:
-            pass
-        return ""
+        return "https://image.astrdark.cyou/random?type=img&dir=image&orientation=auto&t=" + str(int(time.time()))
 
     def _render_spark_svg(self, vols) -> str:
         """迷你走势线（与 WebUI sparkHtml 一致：44x26 折线+面积）"""
@@ -2238,21 +2228,16 @@ class TokenStatsPlugin(BasePlugin):
                 bits.append(f'<span class="pts">{amt:,.4f}</span>')
         return " + ".join(bits) if bits else '<span class="cost">—</span>'
 
-    def _build_summary_html(self, range_key: str = "") -> str:
+    def _build_summary_html(self, range_key: str = "", sess_name: str = "") -> str:
         """构建概览首页完整 HTML（对齐 WebUI 概览页：快照栏 + 五范围卡 + 错误卡 + 按天历史 + 今日小时）。
-        数据全部来自插件内存聚合（与 /stats、/history 同源），不依赖 WebUI 前端。"""
+        数据全部来自插件内存聚合（与 /stats、/history 同源），不依赖 WebUI 前端。
+        sess_name：会话显示名（由调用方在 async 上下文 await _resolve_sid_name 后传入）。"""
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
         d7 = (now - timedelta(days=6)).strftime("%Y-%m-%d")
         d30 = (now - timedelta(days=29)).strftime("%Y-%m-%d")
         channel, model, _ = self._resolve_channel_model()
         s = self._sess
-        sess_name = ""
-        if s.get("sid"):
-            try:
-                sess_name = self._resolve_sid_name(s["sid"])
-            except Exception:
-                sess_name = ""
         elapsed = max(0, int(time.time() - s["start"]))
 
         def _fmt_elapsed(sec):
@@ -2343,22 +2328,19 @@ class TokenStatsPlugin(BasePlugin):
                 bal_bits.append(f'<span class="bal-bad">● {_esc(name)} 探测失败</span>')
         bal_html = '<div class="bal">' + "".join(bal_bits) + '</div>' if bal_bits else ""
 
-        bg = self._render_bg_b64()
+        bg = self._render_bg_url()
         bg_layer = ""
         bg_style = ""
         if bg:
-            bg_layer = '<div class="bg"></div>'
+            bg_layer = f'<img class="bg" src="{_esc(bg)}" alt="">'
             bg_style = (
-                ".bg{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;"
-                "background:"
-                "linear-gradient(180deg, rgba(15,23,42,0.25) 0%, rgba(15,23,42,0.2) 16%, rgba(15,23,42,0.5) 24%, rgba(15,23,42,0.75) 34%, rgba(15,23,42,0.6) 70%, rgba(11,18,32,0.96) 100%),"
-                f"url('data:image/jpeg;base64,{bg}') center/cover no-repeat;}}"
+                ".bg{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;width:100%;height:100%;"
+                "object-fit:cover;opacity:.92;}"
             )
 
-        sess_label = sess_name or (s.get("sid") or "本次会话")
         return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><style>
-html{{height:100%;}}
-body{{margin:0;width:800px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
+h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
+body{{margin:0;width:1160px;min-height:100%;box-sizing:border-box;position:relative;background:#0f172a;color:#e2e8f0;
 font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:14px;padding:20px;}}
 .bg{{position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1;}}
 .wrap{{position:relative;z-index:1;}}
@@ -2369,9 +2351,8 @@ h1 .dot{{width:9px;height:9px;border-radius:50%;background:#34d399;box-shadow:0 
 .snap .dot{{width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block;margin-right:6px;box-shadow:0 0 6px #34d399;}}
 .snap .st{{color:#a3b2c7;}}
 .snap b{{color:#e2e8f0;}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-bottom:16px;}}
-.card{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;}}
-.card[data-k="session"],.card[data-k="today"]{{grid-column:span 2;}}
+.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px;}}
+.card{{background:rgba(30,41,59,.92);border:1px solid #334155;border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;}}
 .card .k{{color:#a3b2c7;font-size:11px;letter-spacing:.5px;}}
 .card .topline{{display:flex;justify-content:space-between;align-items:baseline;}}
 .card .v{{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums;}}
@@ -2381,7 +2362,7 @@ h1 .dot{{width:9px;height:9px;border-radius:50%;background:#34d399;box-shadow:0 
 .card.errbox{{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),#1e293b;border-left:3px solid #f87171;}}
 .rate{{color:#a78bfa;}}.cost{{color:#a3b2c7;}}.pts{{color:#c084fc;}}.bad{{color:#f87171;}}
 .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}}
-.box{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px 16px;}}
+.box{{background:rgba(30,41,59,.94);border:1px solid #334155;border-radius:12px;padding:14px 16px;}}
 .box h3{{font-size:14px;margin:0 0 10px;color:#e2e8f0;}}
 table{{width:100%;border-collapse:collapse;font-size:12.5px;}}
 th{{color:#a3b2c7;text-align:left;font-weight:500;padding:6px 8px;border-bottom:1px solid #334155;font-size:11px;letter-spacing:.5px;}}
@@ -2413,7 +2394,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
 <div class="box"><h3>按天历史</h3>{hist_html}</div>
 <div class="box"><h3>今日按小时</h3>{hours_html}</div>
 </div>
-<div class="footer">Token 用量统计 · {_esc(sess_label)} · 生成于 {now.strftime("%Y-%m-%d %H:%M:%S")}</div>
+<div class="footer">Token 用量统计 · provide by @znq19 · 生成于 {now.strftime("%Y-%m-%d %H:%M:%S")}</div>
 </div>
 </body></html>"""
 
@@ -2422,11 +2403,19 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         渲染失败自动降级纯文本（不吞消息）。"""
         sid = event.sid
         try:
-            html = self._build_summary_html(range_key)
+            # async 上下文 await 会话昵称（_build_summary_html 是同步方法，不能内部 await）
+            sess_name = ""
+            if self._sess.get("sid"):
+                try:
+                    sess_name = await self._resolve_sid_name(self._sess["sid"])
+                except Exception:
+                    sess_name = ""
+            html = self._build_summary_html(range_key, sess_name=sess_name)
             out_dir = self._data_dir / "output"
             out_dir.mkdir(parents=True, exist_ok=True)
             png = out_dir / f"summary_{int(time.time() * 1000)}.png"
-            wait_js = "document.querySelectorAll('.bg').length===0 || getComputedStyle(document.querySelector('.bg')).backgroundImage !== 'none'"
+            # 等待背景图（<img>）加载完成；无背景或加载失败直接继续
+            wait_js = "document.querySelectorAll('img.bg').length===0 || (document.querySelector('img.bg').complete && document.querySelector('img.bg').naturalWidth>0)"
             await render_html(html, str(png), self._browser, wait_js=wait_js)
             # 直发图片
             await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
