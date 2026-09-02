@@ -3614,7 +3614,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="recRefresh">刷新</button>
       <span style="color:var(--dim);font-size:12px">最近 <span id="recCount">15</span> 轮（含工具步），费用按当前价格规则即时计算</span>
     </div>
-    <table><thead><tr><th>时间</th><th>模型</th><th>来源</th><th>渠道</th><th>输入</th><th>输出</th><th>缓存</th><th>总量</th><th>费用</th></tr></thead><tbody id="recBody"></tbody></table>
+    <table><thead><tr><th>时间</th><th>模型</th><th>来源</th><th>渠道</th><th>输入</th><th>输出</th><th>缓存</th><th>耗时</th><th>总量</th><th>费用</th></tr></thead><tbody id="recBody"></tbody></table>
   </div>
 </div>
 
@@ -3926,19 +3926,28 @@ async function loadTrend(r){
     const rate = x.i>0 ? (x.c/x.i*100) : 0;
     return ((xi+0.5)/N*100).toFixed(2)+','+(100-Math.min(100,rate)).toFixed(2);
   }).join(' ');
-  const hitSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+hitPts+'" fill="none" stroke="var(--purple)" stroke-width="1.5" stroke-dasharray="3 2" vector-effect="non-scaling-stroke" opacity=".85"/></svg>';
+  // 命中率节点（单点/多点都可见；SVG attribute 不支持 var()，颜色必须走 style）
+  const hitDots = days.map((x,xi)=>{
+    if(x.i<=0) return '';
+    const rate = Math.min(100, x.c/x.i*100);
+    return '<circle cx="'+((xi+0.5)/N*100).toFixed(2)+'" cy="'+(100-rate).toFixed(2)+'" r="1.6" style="fill:var(--purple)"/>';
+  }).join('');
+  const hitSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+hitPts+'" fill="none" style="stroke:var(--purple)" stroke-width="1.5" stroke-dasharray="3 2" vector-effect="non-scaling-stroke" opacity=".85"/>'+hitDots+'</svg>';
   // 单轮平均耗时折线（橙色实线，右轴 秒，独立量纲；无耗时数据的桶断开不连线）
   let durMax = 0;
   days.forEach(x=>{ if(x.da!=null && x.da>durMax) durMax=x.da; });
   let durSvg = '', durAxisHtml = '';
   if(durMax>0){
-    let path = '', pen = false;
+    let path = '', pen = false, dots = '';
     days.forEach((x,xi)=>{
       if(x.da==null){ pen=false; return; }
-      path += (pen?'L':'M')+((xi+0.5)/N*100).toFixed(2)+' '+(100-Math.min(96,x.da/durMax*96)).toFixed(2);
+      const px = ((xi+0.5)/N*100).toFixed(2);
+      const py = (100-Math.min(96,x.da/durMax*96)).toFixed(2);
+      path += (pen?'L':'M')+px+' '+py;
       pen = true;
+      dots += '<circle cx="'+px+'" cy="'+py+'" r="1.8" style="fill:var(--warn)"/>';
     });
-    durSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><path d="'+path+'" fill="none" stroke="var(--warn)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity=".9"/></svg>';
+    durSvg = '<svg class="hitsvg" viewBox="0 0 100 100" preserveAspectRatio="none"><path d="'+path+'" fill="none" style="stroke:var(--warn)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity=".9"/>'+dots+'</svg>';
     // 右轴刻度标签（柱子右侧小字）：0 / 半值 / 峰值；CSS 不支持 calc 乘法，换算为 px+% 组合
     durAxisHtml = [0, 0.5, 1].map(f=>{
       const top = 'calc('+(6-22*(1-f))+'px + '+((1-f)*100)+'%)';
