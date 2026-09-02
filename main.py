@@ -697,6 +697,21 @@ class TokenStatsPlugin(BasePlugin):
         self.enable_widget = bool(wid.get("enable_widget", True))
         self.widget_compact = bool(wid.get("widget_compact", False))
 
+        # ── 预警提醒 ──
+        al = cfg.get("section_alert", {})
+        self.enable_alert = bool(al.get("enable_alert", True))
+        deliveries = al.get("alert_deliveries", [])
+        self.alert_deliveries = list(deliveries) if isinstance(deliveries, list) else []
+        rules = al.get("alert_rules", [])
+        self.alert_rules = list(rules) if isinstance(rules, list) else []
+        # 已触发状态：{rule_id: {count, at, day}}（balance 滞回：余额回升超过阈值才重置；
+        # token/cost 单调递增：达阈值触发一次，跨天自动重置）
+        self._alert_fired = {}
+        # token/cost 当天统计缓存：{(len,last_t,rules_hash,target,session): (v, units)}
+        self._alert_usage_cache = {}
+        self._alert_task: asyncio.Task = None
+        self._alert_lock = asyncio.Lock()
+
         # ── 余额探测 ssl ──
         self.balance_ssl_verify = bool(bal.get("balance_ssl_verify", False))
 
@@ -799,6 +814,11 @@ class TokenStatsPlugin(BasePlugin):
         elif self.enable_balance and self.balance_sources and not _HAS_AIOHTTP:
             logger.warning("[token_stats] aiohttp 未安装，余额监测不可用（pip install aiohttp）")
 
+        # 预警提醒后台任务（余额类规则随轮询检查；token/cost 类在 on_llm_response 实时检查）
+        if self.enable_alert and self.alert_rules:
+            self._alert_task = asyncio.create_task(self._alert_loop())
+            logger.info(f"[token_stats] 预警提醒已启动（{len(self.alert_rules)} 条规则）")
+
         logger.info("[token_stats] Token 用量统计已就绪")
 
     async def terminate(self):
@@ -809,6 +829,13 @@ class TokenStatsPlugin(BasePlugin):
             except asyncio.CancelledError:
                 pass
             self._bal_task = None
+        if self._alert_task and not self._alert_task.done():
+            self._alert_task.cancel()
+            try:
+                await self._alert_task
+            except asyncio.CancelledError:
+                pass
+            self._alert_task = None
         if self._log_err_task and not self._log_err_task.done():
             self._log_err_task.cancel()
             try:
@@ -1198,6 +1225,15 @@ class TokenStatsPlugin(BasePlugin):
             self._apply_session(rec)
             _append_jsonl(self._log_path, rec, self.max_log_size)
             self._invalidate_rec_cache()
+
+        # 预警提醒：token/cost 类规则每轮实时检查（balance 类由后台循环检查）
+        if self.enable_alert and self.alert_rules:
+            try:
+                for r in self.alert_rules:
+                    if (r.get("type") or "balance").strip().lower() != "balance":
+                        self._alert_check_rule(r)
+            except Exception as e:
+                logger.warning(f"[token_stats] 预警实时检查异常: {e}")
 
         if self.debug_log:
             logger.info(f"[token_stats] rec: +{inp}in/{out}out/{cached}cache "
@@ -1865,6 +1901,329 @@ class TokenStatsPlugin(BasePlugin):
             return
         except Exception:
             logger.exception("[token_stats] 余额轮询循环退出")
+
+    # ── 预警提醒引擎 ──
+
+    def _alert_rule_enabled(self, r: dict) -> bool:
+        return bool(r.get("enabled", True)) and bool(str(r.get("id") or "").strip())
+
+    def _alert_in_window(self, r: dict) -> bool:
+        """生效时段/窗口检查：time_start/time_end（HH:mm，留空=全天）+ time_window（分钟，留空=不限）。
+        窗口语义：time_start 起 N 分钟内生效（如 9:00 + 60min = 9:00-10:00）；time_end 与窗口同时给时取交集。"""
+        now = datetime.now()
+        cur = now.hour * 60 + now.minute
+        start = end = None
+        try:
+            if str(r.get("time_start") or "").strip():
+                h, m = _parse_hhmm(str(r["time_start"]).strip())
+                start = h * 60 + m
+            if str(r.get("time_end") or "").strip():
+                h, m = _parse_hhmm(str(r["time_end"]).strip())
+                end = h * 60 + m
+        except Exception:
+            start = end = None
+        win = r.get("time_window")
+        try:
+            win = int(win) if win not in (None, "") else None
+        except (TypeError, ValueError):
+            win = None
+        if start is not None and win is not None:
+            end = min(end, start + win) if end is not None else start + win
+        if start is not None and cur < start:
+            return False
+        if end is not None and cur > end:
+            return False
+        return True
+
+    def _alert_delivery_sids(self, r: dict) -> list:
+        """规则投递会话 → sid 列表（llm 模式只取第一个）"""
+        ids = r.get("deliveries") or []
+        if not isinstance(ids, list):
+            ids = [ids]
+        sids = []
+        for d in self.alert_deliveries:
+            if d.get("id") in ids and d.get("enabled", True) and str(d.get("sid") or "").strip():
+                sids.append(str(d["sid"]).strip())
+        return sids
+
+    def _alert_fmt_value(self, r: dict, value, unit: str = "") -> str:
+        """提醒话语占位符替换：{name}{value}{unit}{threshold}{type}{target}"""
+        try:
+            v = f"{float(value):,.4f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            v = str(value)
+        msg = str(r.get("message") or "").strip()
+        if not msg:
+            tname = {"balance": "余额", "token": "tokens", "cost": "费用"}.get(r.get("type"), "指标")
+            msg = f"⚠️ {tname}预警：{r.get('target') or '全部'} 已达 {v}{unit}"
+        return (msg.replace("{name}", str(r.get("target") or ""))
+                   .replace("{value}", v)
+                   .replace("{unit}", unit)
+                   .replace("{threshold}", str(r.get("threshold") or ""))
+                   .replace("{type}", str(r.get("type") or ""))
+                   .replace("{target}", str(r.get("target") or "")))
+
+    async def _alert_send(self, r: dict, sids: list, text: str, send_image: bool):
+        """投递提醒：direct=机械直发（消息先发，图异步后发）；llm=publish_notice 让 bot 感知。
+        多会话并行投递互不影响；单会话失败不影响其他会话。"""
+        if not sids:
+            return
+        mode = (r.get("mode") or "direct").strip().lower()
+        if mode == "llm":
+            # 发给 LLM：publish_notice 构造 is_notice 事件走正常管线，bot 感知后主动回复
+            try:
+                await self.ctx.publish_notice(sids[0], MessageChain([Text(text)]), is_mentioned=True)
+            except Exception as e:
+                logger.warning(f"[token_stats] 预警 llm 投递失败: {e}")
+            if send_image:
+                asyncio.ensure_future(self._alert_send_image_async(sids[0]))
+            return
+        # direct：机械直发，不经过 LLM
+        for sid in sids:
+            try:
+                await self.ctx.message_processor.send_message_chain(sid, MessageChain([Text(text)]))
+            except Exception as e:
+                logger.warning(f"[token_stats] 预警直发失败 {sid}: {e}")
+        if send_image:
+            for sid in sids:
+                asyncio.ensure_future(self._alert_send_image_async(sid))
+
+    async def _alert_send_image_async(self, sid: str):
+        """异步补发概况图：消息已先发，图构建好后补发（不阻塞投递）。
+        同步重活（_build_summary_html 全量聚合）丢线程执行，避免阻塞事件循环。"""
+        try:
+            sess_name = ""
+            if self._sess.get("sid"):
+                try:
+                    sess_name = await self._resolve_sid_name(self._sess["sid"])
+                except Exception:
+                    sess_name = ""
+            html = await asyncio.to_thread(self._build_summary_html, "", sess_name=sess_name)
+            out_dir = self._data_dir / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            png = out_dir / f"summary_{int(time.time() * 1000)}.png"
+            wait_js = "document.querySelectorAll('img.bg').length===0 || (document.querySelector('img.bg').complete && document.querySelector('img.bg').naturalWidth>0)"
+            await render_html(html, str(png), self._browser, wait_js=wait_js)
+            await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
+            try:
+                old = sorted(out_dir.glob("summary_*.png"), key=lambda p: p.name)
+                for p in old[:-20]:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"[token_stats] 预警概况图补发失败: {e}")
+
+    def _alert_rule_fired(self, r: dict) -> bool:
+        st = self._alert_fired.get(str(r.get("id")))
+        if st is None:
+            return False
+        if isinstance(st, dict):
+            return st.get("count", 0) >= 1
+        return True  # 旧格式：float 时间戳 = 已触发
+
+    def _alert_mark_fired(self, r: dict):
+        """记录触发：count+1（连续提醒次数）、at（最近触发时间）、day（自然日，token/cost 跨天重置用）"""
+        rid = str(r.get("id"))
+        st = self._alert_fired.get(rid)
+        if isinstance(st, dict):
+            st["count"] = st.get("count", 0) + 1
+            st["at"] = time.time()
+        else:
+            self._alert_fired[rid] = {"count": 1, "at": time.time(),
+                                      "day": datetime.now().strftime("%Y-%m-%d")}
+
+    def _alert_clear_fired(self, r: dict):
+        self._alert_fired.pop(str(r.get("id")), None)
+
+    def _alert_max_ok(self, r: dict) -> bool:
+        """最大连续提醒次数：默认 1（只提醒 1 次）。
+        在未回升/未超过阈值前，最多连续提醒 N 次；达到上限后不再提醒（等复位/回升/跨天）。"""
+        st = self._alert_fired.get(str(r.get("id")))
+        if st is None:
+            return True
+        count = st.get("count", 1) if isinstance(st, dict) else 1
+        try:
+            mx = int(r.get("max_alerts") if r.get("max_alerts") not in (None, "") else 1)
+        except (TypeError, ValueError):
+            mx = 1
+        return count < max(1, mx)
+
+    def _alert_interval_ok(self, r: dict) -> bool:
+        """连续提醒间隔：默认 300 秒（5 分钟）。两次连续提醒的最小间隔。
+        只约束同一条规则自身，多规则同时触发互不影响。"""
+        st = self._alert_fired.get(str(r.get("id")))
+        if st is None:
+            return True
+        at = st.get("at", 0) if isinstance(st, dict) else st
+        try:
+            iv = int(r.get("alert_interval") if r.get("alert_interval") not in (None, "") else 300)
+        except (TypeError, ValueError):
+            iv = 300
+        return time.time() - at >= max(0, iv)
+
+    def _alert_day_reset(self, r: dict) -> bool:
+        """token/cost 跨天重置：已触发状态带自然日，非今天则清除（当天重新计数）。"""
+        rid = str(r.get("id"))
+        st = self._alert_fired.get(rid)
+        if st is None or not isinstance(st, dict):
+            return False
+        if st.get("day") != datetime.now().strftime("%Y-%m-%d"):
+            self._alert_fired.pop(rid, None)
+            return True
+        return False
+
+    def _alert_balance_value(self, r: dict):
+        """余额规则当前值：target=余额源名（留空=任一源）；返回 (value, unit, name) 或 None"""
+        target = str(r.get("target") or "").strip()
+        for src in self.balance_sources:
+            if not src.get("enabled", True):
+                continue
+            name = str(src.get("name") or "")
+            if target and target not in name:
+                continue
+            st = self._resolve_balance_state(src)
+            if not st.get("ok"):
+                continue
+            return st["balance"], self._src_unit(src), name
+        return None
+
+    def _alert_usage_value(self, r: dict):
+        """token/cost 规则当前值：target=来源标签（留空=全部）；session=限定会话 sid（留空=全部）。
+        token → 当天 tokens 数；cost → 当天费用（currency 指定币种，留空=任一币种达阈值即触发）。
+        返回 (value, unit, label) 或 None。
+        性能：单遍扫描日志同时算 token 与 cost，并按 (target, session) 指纹缓存当天结果
+        （记录数/最新时间戳/规则 hash 未变直接复用，避免每轮 LLM 后全量重扫）。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        target = str(r.get("target") or "").strip()
+        session = str(r.get("session") or "").strip()
+        rtype = (r.get("type") or "token").strip().lower()
+        # 指纹缓存：记录数 + 最新时间戳 + 规则 hash + 过滤条件
+        recs = self._read_records()
+        try:
+            rh = hash(json.dumps(self.rules or [], sort_keys=True, ensure_ascii=False))
+        except Exception:
+            rh = id(self.rules)
+        last_t = recs[-1].get("t", "") if recs else ""
+        fp = (len(recs), last_t, rh, target, session)
+        hit = self._alert_usage_cache.get(fp)
+        if hit is not None:
+            v, units = hit
+        else:
+            v = 0
+            units = {}
+            for rec in recs:
+                try:
+                    t = _parse_ts(rec.get("t", ""))
+                except Exception:
+                    continue
+                if t.strftime("%Y-%m-%d") != today:
+                    continue
+                if target and target not in str(rec.get("s", "") or ""):
+                    continue
+                if session and session != str(rec.get("sid", "") or ""):
+                    continue
+                v += int(rec.get("v", 0) or 0)
+                rule = _match_rule(self.rules, rec.get("ch", ""), rec.get("m", ""), rec.get("h", ""))
+                if rule is None:
+                    continue
+                cur = _rule_currency(rule)
+                unit = _rule_unit(rule)
+                key = f"{cur}|{unit}"
+                pk = bool(rule.get("peak_enabled", True)) and _is_peak_in(t, _windows_for_rule(rule))
+                hit_r = rule.get("hit_peak" if pk else "hit_off", 0) or 0
+                miss = rule.get("miss_peak" if pk else "miss_off", 0) or 0
+                out = rule.get("out_peak" if pk else "out_off", 0) or 0
+                amt = (int(rec.get("c", 0) or 0) * hit_r
+                       + max(0, int(rec.get("i", 0) or 0) - int(rec.get("c", 0) or 0)) * miss
+                       + int(rec.get("o", 0) or 0) * out) / 1_000_000
+                units[key] = units.get(key, 0.0) + amt
+            # 缓存上限防膨胀：超过 64 条清空重建
+            if len(self._alert_usage_cache) > 64:
+                self._alert_usage_cache.clear()
+            self._alert_usage_cache[fp] = (v, units)
+        if rtype == "token":
+            return v, "tokens", (target or "全部来源")
+        currency = str(r.get("currency") or "").strip()
+        if currency:
+            for key, amt in units.items():
+                if key.startswith(currency + "|"):
+                    _, _, unit = key.partition("|")
+                    return amt, unit, (target or "全部来源")
+            return None
+        # 任一币种达阈值即触发：取当前值最大的币种
+        if not units:
+            return None
+        key, amt = max(units.items(), key=lambda kv: kv[1])
+        _, _, unit = key.partition("|")
+        return amt, unit, (target or "全部来源")
+
+    def _alert_check_rule(self, r: dict):
+        """单条规则检查：命中 → 投递。返回是否触发（供测试/日志）。"""
+        if not self._alert_rule_enabled(r):
+            return False
+        if not self._alert_in_window(r):
+            return False
+        rtype = (r.get("type") or "balance").strip().lower()
+        try:
+            threshold = float(r.get("threshold") or 0)
+        except (TypeError, ValueError):
+            return False
+        op = (r.get("op") or "le").strip().lower()
+        if rtype == "balance":
+            got = self._alert_balance_value(r)
+            if got is None:
+                return False
+            value, unit, name = got
+            hit = value <= threshold if op == "le" else value >= threshold
+            if not hit:
+                # 滞回：余额回升超过阈值才重置，再次跌破才重新提醒
+                if self._alert_rule_fired(r):
+                    self._alert_clear_fired(r)
+                return False
+        else:
+            # token/cost：跨天自动重置（当天重新计数）
+            self._alert_day_reset(r)
+            got = self._alert_usage_value(r)
+            if got is None:
+                return False
+            value, unit, label = got
+            hit = value >= threshold if op == "ge" else value <= threshold
+            if not hit:
+                return False
+        if self._alert_rule_fired(r):
+            # 已触发过：受「最大连续提醒次数」与「连续提醒间隔」约束
+            if not self._alert_max_ok(r):
+                return False
+            if not self._alert_interval_ok(r):
+                return False
+        sids = self._alert_delivery_sids(r)
+        if not sids:
+            return False
+        text = self._alert_fmt_value(r, value, unit)
+        # 概况图补发开关：llm 模式用 llm_send_image，direct 用 send_image
+        send_image = bool(r.get("llm_send_image", False)) if (r.get("mode") or "direct").strip().lower() == "llm" \
+            else bool(r.get("send_image", False))
+        self._alert_mark_fired(r)
+        asyncio.ensure_future(self._alert_send(r, sids, text, send_image))
+        logger.info(f"[token_stats] 预警触发: {r.get('id')} type={rtype} value={value}{unit} threshold={threshold} mode={r.get('mode')}")
+        return True
+
+    async def _alert_loop(self):
+        """后台预警循环：balance 类规则随轮询检查（token/cost 类在 on_llm_response 实时检查）"""
+        try:
+            while True:
+                try:
+                    for r in self.alert_rules:
+                        if (r.get("type") or "balance").strip().lower() == "balance":
+                            self._alert_check_rule(r)
+                except Exception as e:
+                    logger.warning(f"[token_stats] 预警检查异常: {e}")
+                await asyncio.sleep(max(5, self.balance_interval))
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("[token_stats] 预警循环退出")
 
     # ── 后台日志（log.log）ERROR 扫描 ──
 
@@ -3614,6 +3973,162 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             logger.warning(f"[token_stats] 保存轮询间隔失败: {e}")
             return {"ok": False, "msg": f"保存失败: {e}"}
 
+    @register.api(method="GET", path="/alert", auth=True)
+    async def api_alert(self):
+        """预警配置读取：投递会话 + 规则（含已触发状态，供前端展示）"""
+        return {
+            "enable": self.enable_alert,
+            "deliveries": self.alert_deliveries,
+            "rules": self.alert_rules,
+            "fired": {k: datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+                      for k, v in self._alert_fired.items()},
+        }
+
+    @register.api(method="POST", path="/alert-config", auth=True)
+    async def api_alert_config(self, request: Request):
+        """保存预警配置（投递会话 + 规则整体替换）并热重载"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        deliveries = body.get("deliveries")
+        rules = body.get("rules")
+        if not isinstance(deliveries, list) or not isinstance(rules, list):
+            return {"ok": False, "msg": "deliveries 和 rules 必须是数组"}
+        # 清洗投递会话
+        clean_d = []
+        for d in deliveries:
+            if not isinstance(d, dict):
+                continue
+            did = str(d.get("id") or "").strip()
+            sid = str(d.get("sid") or "").strip()
+            if not did or not sid:
+                continue
+            clean_d.append({"id": did, "name": str(d.get("name") or did).strip(),
+                            "sid": sid, "enabled": bool(d.get("enabled", True))})
+        # 清洗规则
+        clean_r = []
+        for r in rules:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id") or "").strip()
+            if not rid:
+                continue
+            rtype = (str(r.get("type") or "balance").strip().lower() or "balance")
+            if rtype not in ("balance", "token", "cost"):
+                continue
+            item = {"id": rid, "enabled": bool(r.get("enabled", True)), "type": rtype,
+                    "target": str(r.get("target") or "").strip(),
+                    "session": str(r.get("session") or "").strip(),
+                    "op": (str(r.get("op") or "le").strip().lower() or "le"),
+                    "mode": (str(r.get("mode") or "direct").strip().lower() or "direct"),
+                    "message": str(r.get("message") or "").strip(),
+                    "send_image": bool(r.get("send_image", False)),
+                    "llm_send_image": bool(r.get("llm_send_image", False)),
+                    "currency": str(r.get("currency") or "").strip(),
+                    "time_start": str(r.get("time_start") or "").strip(),
+                    "time_end": str(r.get("time_end") or "").strip()}
+            for k in ("threshold", "time_window", "max_alerts", "alert_interval"):
+                v = r.get(k)
+                if v not in (None, ""):
+                    try:
+                        item[k] = float(v) if k == "threshold" else int(v)
+                    except (TypeError, ValueError):
+                        pass
+            dl = r.get("deliveries")
+            if isinstance(dl, list):
+                item["deliveries"] = [str(x) for x in dl if str(x).strip()]
+            elif dl:
+                item["deliveries"] = [str(dl)]
+            clean_r.append(item)
+        try:
+            pm = self.ctx.plugin_mgr
+            if pm is None:
+                return {"ok": False, "msg": "plugin_mgr 不可用"}
+            cfg = pm.get_plugin_config("KiraAI_token_stats_plugin")
+            sec = dict(cfg.get("section_alert") or {})
+            sec["alert_deliveries"] = clean_d
+            sec["alert_rules"] = clean_r
+            cfg["section_alert"] = sec
+            await pm.update_plugin_config("KiraAI_token_stats_plugin", cfg)
+            return {"ok": True, "deliveries": len(clean_d), "rules": len(clean_r)}
+        except Exception as e:
+            logger.warning(f"[token_stats] 保存预警配置失败: {e}")
+            return {"ok": False, "msg": f"保存失败: {e}"}
+
+    @register.api(method="POST", path="/alert-test", auth=True)
+    async def api_alert_test(self, request: Request):
+        """测试投递：按规则立即发一条提醒到目标会话（不改变已触发状态）"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        rid = str(body.get("id") or "").strip()
+        rule = None
+        for r in self.alert_rules:
+            if str(r.get("id") or "") == rid:
+                rule = r
+                break
+        if rule is None:
+            return {"ok": False, "msg": f"规则 {rid} 不存在"}
+        sids = self._alert_delivery_sids(rule)
+        if not sids:
+            return {"ok": False, "msg": "该规则未配置可用的投递会话"}
+        # 取当前值构造提醒文本（不触发、不改状态）
+        rtype = (rule.get("type") or "balance").strip().lower()
+        if rtype == "balance":
+            got = self._alert_balance_value(rule)
+            value, unit = (got[0], got[1]) if got else (0, "")
+        else:
+            got = self._alert_usage_value(rule)
+            value, unit = (got[0], got[1]) if got else (0, "")
+        text = self._alert_fmt_value(rule, value, unit)
+        text = f"[测试] {text}"
+        mode = (rule.get("mode") or "direct").strip().lower()
+        if mode == "llm":
+            try:
+                await self.ctx.publish_notice(sids[0], MessageChain([Text(text)]), is_mentioned=True)
+            except Exception as e:
+                return {"ok": False, "msg": f"llm 投递失败: {e}"}
+        else:
+            for sid in sids:
+                try:
+                    await self.ctx.message_processor.send_message_chain(sid, MessageChain([Text(text)]))
+                except Exception as e:
+                    return {"ok": False, "msg": f"直发失败 {sid}: {e}"}
+        return {"ok": True, "msg": f"已投递到 {len(sids)} 个会话"}
+
+    @register.api(method="POST", path="/alert-reset", auth=True)
+    async def api_alert_reset(self, request: Request):
+        """重置规则已触发状态（前端手动复位，如充值后想立即重新预警）"""
+        try:
+            body = await request.json()
+        except Exception:
+            return {"ok": False, "msg": "请求体不是合法 JSON"}
+        rid = str(body.get("id") or "").strip()
+        if rid:
+            self._alert_fired.pop(rid, None)
+            return {"ok": True, "msg": f"已重置规则 {rid}"}
+        self._alert_fired.clear()
+        return {"ok": True, "msg": "已重置全部规则"}
+
+    @register.api(method="GET", path="/alert-sources", auth=True)
+    async def api_alert_sources(self):
+        """预警可选项：余额源名 / 来源标签 / 会话列表（前端下拉用）"""
+        bal_names = [str(s.get("name") or "") for s in self.balance_sources if s.get("enabled", True) and s.get("name")]
+        src_labels = []
+        seen = set()
+        for rec in self._read_records():
+            s = str(rec.get("s", "") or "")
+            if s and s not in seen:
+                seen.add(s)
+                src_labels.append(s)
+        sessions = []
+        for sid, s in self._sess_map.items():
+            if sid and s.get("r"):
+                sessions.append({"sid": sid, "name": sid})
+        return {"balance_sources": bal_names, "source_labels": src_labels, "sessions": sessions}
+
     @register.api(method="GET", path="/pricing", auth=True)
     async def api_pricing(self):
         return {"rules": self.rules,
@@ -3780,6 +4295,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             + ("true" if self.widget_compact else "false") + " : _c === '1';",
         )
         return PluginPage.from_html(html)
+
 _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3895,6 +4411,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
   <div class="tab" data-p="rec">最近记录</div>
   <div class="tab" data-p="price">价格规则</div>
   <div class="tab" data-p="bal">余额监测</div>
+  <div class="tab" data-p="alert">预警提醒</div>
 </div>
 
 <div class="panel on" id="p-ov">
@@ -4005,6 +4522,46 @@ tr.cur td{background:rgba(52,211,153,.07)}
   </div>
 </div>
 
+
+<div class="panel" id="p-alert">
+  <div class="box">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn" id="alertAddRule">＋ 添加规则</button>
+      <button class="btn" id="alertAddDel">＋ 添加投递会话</button>
+      <span style="color:var(--dim);font-size:12px" id="alertInfo"></span>
+      <span style="flex:1"></span>
+      <span style="color:var(--dim);font-size:12px">监测余额 / 当日 tokens / 当日费用，达阈值自动提醒。同一站点可设多段阈值（如余额 10 元/5 元/1 元），各自独立触发互不影响。</span>
+    </div>
+    <div style="margin-bottom:14px">
+      <div style="font-weight:600;font-size:13px;margin-bottom:6px">投递会话 <span style="color:var(--dim);font-weight:400">（提醒发到哪里，可配多个）</span></div>
+      <div id="alertDelList"></div>
+    </div>
+    <div>
+      <div style="font-weight:600;font-size:13px;margin-bottom:6px">预警规则 <span style="color:var(--dim);font-weight:400">（token/cost 按自然日重置；balance 余额回升超过阈值自动复位）</span></div>
+      <div id="alertRuleList"></div>
+    </div>
+  </div>
+</div>
+
+<div id="alertEditor" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,.7);z-index:99;align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;width:680px;max-width:94vw;max-height:88vh;overflow:auto">
+    <div style="display:flex;align-items:center;margin-bottom:14px">
+      <h3 style="margin:0;flex:1" id="alertEditTitle">添加规则</h3>
+      <button class="btn" id="alertEditClose">✕</button>
+    </div>
+    <div id="alertEditForm"></div>
+  </div>
+</div>
+
+<div id="alertDelEditor" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,.7);z-index:99;align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;width:440px;max-width:94vw">
+    <div style="display:flex;align-items:center;margin-bottom:14px">
+      <h3 style="margin:0;flex:1" id="alertDelTitle">添加投递会话</h3>
+      <button class="btn" id="alertDelClose">✕</button>
+    </div>
+    <div id="alertDelForm"></div>
+  </div>
+</div>
 <div id="priceEditor" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,.7);z-index:99;align-items:center;justify-content:center">
   <div style="background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;width:640px;max-width:94vw;max-height:88vh;overflow:auto">
     <div style="display:flex;align-items:center;margin-bottom:14px">
@@ -4078,6 +4635,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.p==='rec') loadRec();
   if(t.dataset.p==='price') loadPrice();
   if(t.dataset.p==='bal') loadBal(false);
+  if(t.dataset.p==='alert') loadAlert();
 });
 
 async function jget(p){ const r = await fetch(API+p, {cache:'no-store'}); return r.json(); }
@@ -4807,6 +5365,261 @@ setInterval(loadOv, 4000);
     toast('随机背景：' + (!now ? '开' : '关'));
   };
 })();
+
+// ═══ 预警提醒 tab ═══
+let ALERT = {enable:true, deliveries:[], rules:[], fired:{}};
+let alertEditId = null, alertDelEditId = null;
+const ALERT_TYPE = {balance:'余额', token:'tokens', cost:'费用'};
+const ALERT_TAG = {balance:'#38bdf8', token:'#a78bfa', cost:'#f472b6'};
+
+async function loadAlert(){
+  try{
+    ALERT = await jget('/alert');
+    renderAlert();
+  }catch(e){ $('#alertRuleList').innerHTML = '<div style="color:var(--err)">加载失败: '+e+'</div>'; }
+}
+function renderAlert(){
+  $('#alertInfo').textContent = ALERT.enable ? '' : '（预警提醒已停用）';
+  const dl = $('#alertDelList');
+  dl.innerHTML = ALERT.deliveries.length ? ALERT.deliveries.map(d=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;background:var(--inset);${d.enabled?'':'opacity:.5'}">
+      <span style="font-weight:600">${aesc(d.name)}</span>
+      <span style="color:var(--dim);font-family:monospace;font-size:12px;background:var(--card);padding:2px 8px;border-radius:6px;border:1px solid var(--line)">${aesc(d.sid)}</span>
+      ${d.enabled?'':'<span style="color:var(--dim);font-size:11px">已停用</span>'}
+      <span style="flex:1"></span>
+      <button class="btn" onclick="alertEditDel('${d.id}')">编辑</button>
+      <button class="btn" onclick="alertDelDel('${d.id}')">删除</button>
+    </div>`).join('') : '<div style="color:var(--dim);text-align:center;padding:16px;border:1px dashed var(--line);border-radius:8px">还没有投递会话，点「＋ 添加投递会话」</div>';
+  const rl = $('#alertRuleList');
+  rl.innerHTML = ALERT.rules.length ? ALERT.rules.map(r=>{
+    const t = ALERT_TYPE[r.type]||r.type;
+    const opTxt = r.op==='le'?'≤':'≥';
+    const target = r.target?`<b>${aesc(r.target)}</b>`:'<b>全部</b>';
+    const sess = r.session?` · 会话 <b>${aesc(r.session)}</b>`:'';
+    const cur = r.currency?`（${aesc(r.currency)}）`:'（任一币种）';
+    const win = (r.time_start||r.time_end||r.time_window)?` · 时段 <b>${aesc(r.time_start||'00:00')}${r.time_window?'+'+aesc(r.time_window)+'min':''}${r.time_end?'~'+aesc(r.time_end):''}</b>`:'';
+    const cd = (r.max_alerts&&r.max_alerts>1)?` · 连续提醒 <b>${r.max_alerts}次/${r.alert_interval||300}s</b>`:'';
+    const img = (r.mode==='llm'?r.llm_send_image:r.send_image)?' · 📷 补发概况图':'';
+    const fired = ALERT.fired[r.id]?`<span style="color:var(--ok);font-size:11px;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3);padding:2px 8px;border-radius:6px">已触发 ${aesc(ALERT.fired[r.id])}</span>`:'';
+    const dnames = (r.deliveries||[]).map(id=>{const d=ALERT.deliveries.find(x=>x.id===id);return d?d.name:id}).join('、')||'<span style="color:var(--err)">未配置投递</span>';
+    return `<div style="background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px;${r.enabled?'':'opacity:.5'}">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600;color:${ALERT_TAG[r.type]};background:${ALERT_TAG[r.type]}22;border:1px solid ${ALERT_TAG[r.type]}44">${t}</span>
+        <span style="font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600;color:${r.mode==='llm'?'#fbbf24':'#34d399'};background:${r.mode==='llm'?'rgba(251,191,36,.12)':'rgba(52,211,153,.12)'};border:1px solid ${r.mode==='llm'?'rgba(251,191,36,.3)':'rgba(52,211,153,.3)'}">${r.mode==='llm'?'🤖 发给 LLM':'⚡ 机械直发'}</span>
+        ${r.enabled?'':'<span style="color:var(--dim);font-size:11px">已停用</span>'}
+        <span style="font-weight:600;font-size:13px">${aesc(r.name||r.id)}</span>
+        ${fired}
+        <span style="flex:1"></span>
+        <button class="btn" onclick="alertTest('${r.id}')">测试</button>
+        <button class="btn" onclick="alertReset('${r.id}')">复位</button>
+        <button class="btn" onclick="alertEditRule('${r.id}')">编辑</button>
+        <button class="btn" onclick="alertDelRule('${r.id}')">删除</button>
+      </div>
+      <div style="color:var(--dim);font-size:12px;margin-top:6px;line-height:1.7">
+        ${r.type==='balance'
+          ? `监测 <b style="color:var(--fg)">余额</b>：${target} ${opTxt} <b style="color:var(--warn)">${r.threshold}</b>${win}${cd}${img}`
+          : `监测 <b style="color:var(--fg)">${t}</b>：${target}${sess} ${opTxt} <b style="color:var(--warn)">${r.threshold}</b>${cur}${win}${cd}${img}`}
+        <br>投递到：<b style="color:var(--fg)">${dnames}</b>
+        ${r.message?`<br>话语：<span style="color:var(--dim)">${aesc(r.message)}</span>`:''}
+      </div>
+    </div>`;
+  }).join('') : '<div style="color:var(--dim);text-align:center;padding:16px;border:1px dashed var(--line);border-radius:8px">还没有预警规则，点「＋ 添加规则」</div>';
+}
+function aesc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function alertUid(p){return p+Date.now().toString(36)+Math.random().toString(36).slice(2,5)}
+
+// ── 投递会话 ──
+function alertEditDel(id){
+  alertDelEditId = id||null;
+  const d = id?ALERT.deliveries.find(x=>x.id===id):null;
+  $('#alertDelTitle').textContent = d?'编辑投递会话':'添加投递会话';
+  $('#alertDelForm').innerHTML = `
+    <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">名称 *</label>
+      <input id="ad_name" type="text" value="${d?aesc(d.name):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如：主群"></div>
+    <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">sid *</label>
+      <input id="ad_sid" type="text" value="${d?aesc(d.sid):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="qq:gm:123456 或 qq:dm:10001">
+      <div style="color:var(--dim);font-size:11px;margin-top:4px">qq:gm:群号 = 群聊 · qq:dm:QQ号 = 私聊</div></div>
+    <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">启用</label>
+      <div style="margin-top:4px"><input id="ad_enabled" type="checkbox" ${d?(d.enabled?'checked':''):'checked'}> 投递到此会话</div></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+      <button class="btn" onclick="$('#alertDelEditor').style.display='none'">取消</button>
+      <button class="btn" style="background:var(--acc);border-color:var(--acc);color:#06283d;font-weight:600" onclick="alertSaveDel()">保存会话</button>
+    </div>`;
+  $('#alertDelEditor').style.display='flex';
+}
+function alertSaveDel(){
+  const name = $('#ad_name').value.trim(), sid = $('#ad_sid').value.trim();
+  if(!name||!sid){ toast('名称和 sid 必填'); return; }
+  if(alertDelEditId){
+    const d = ALERT.deliveries.find(x=>x.id===alertDelEditId);
+    d.name=name; d.sid=sid; d.enabled=$('#ad_enabled').checked;
+  } else {
+    ALERT.deliveries.push({id:alertUid('d'), name, sid, enabled:$('#ad_enabled').checked});
+  }
+  $('#alertDelEditor').style.display='none';
+  renderAlert(); toast('会话已保存（记得点「保存配置」）');
+}
+function alertDelDel(id){
+  if(!confirm('删除投递会话？引用它的规则将无法投递。')) return;
+  ALERT.deliveries = ALERT.deliveries.filter(d=>d.id!==id);
+  ALERT.rules.forEach(r=>{r.deliveries=(r.deliveries||[]).filter(x=>x!==id)});
+  renderAlert(); toast('已删除会话');
+}
+
+// ── 规则 ──
+function alertEditRule(id){
+  alertEditId = id||null;
+  const r = id?ALERT.rules.find(x=>x.id===id):null;
+  $('#alertEditTitle').textContent = r?'编辑规则':'添加规则';
+  const type = r?r.type:'balance';
+  const mode = r?r.mode:'direct';
+  const targetOpts = type==='balance'
+    ? ['DeepSeek','硅基流动','NewAPI 中转','Kimi']
+    : ['gm','dm','system','全部'];
+  const delChk = ALERT.deliveries.length
+    ? ALERT.deliveries.map(d=>`<label style="display:inline-flex;align-items:center;gap:5px;background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer;font-size:12px;margin-right:6px;margin-bottom:6px"><input type="checkbox" value="${d.id}" ${(r&&(r.deliveries||[]).includes(d.id))?'checked':''} style="accent-color:var(--acc)"> ${aesc(d.name)}</label>`).join('')
+    : '<span style="color:var(--err)">请先添加投递会话</span>';
+  $('#alertEditForm').innerHTML = `
+    <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">规则名称 *</label>
+      <input id="ar_name" type="text" value="${r?aesc(r.name||''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如：余额低于 10 元提醒"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">监测类型 *</label>
+        <select id="ar_type" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px">
+          <option value="balance" ${type==='balance'?'selected':''}>余额</option>
+          <option value="token" ${type==='token'?'selected':''}>当日 tokens</option>
+          <option value="cost" ${type==='cost'?'selected':''}>当日费用</option>
+        </select></div>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">比较方式</label>
+        <select id="ar_op" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px">
+          <option value="le" ${(r?r.op:'le')==='le'?'selected':''}>低于等于（≤）</option>
+          <option value="ge" ${(r?r.op:'le')==='ge'?'selected':''}>达到（≥）</option>
+        </select></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600" id="ar_target_lab">${type==='balance'?'目标（余额源名，留空=任一源）':'目标（来源标签，留空=全部）'}</label>
+        <input id="ar_target" type="text" list="arTargetList" value="${r?aesc(r.target||''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="${type==='balance'?'如：DeepSeek':'如：gm / dm'}">
+        <datalist id="arTargetList">${targetOpts.map(o=>`<option value="${o}">`).join('')}</datalist>
+        <div style="color:var(--dim);font-size:11px;margin-top:4px">${type==='balance'?'填余额源名称（包含匹配，如 DeepSeek 可匹配「DeepSeek 官方」）；留空=任一源达阈值即触发':'填来源标签（gm=群聊 / dm=私聊 / 自定义关键词规则标签）；留空=全部来源'}</div></div>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">阈值 *</label>
+        <input id="ar_threshold" type="number" step="any" value="${r?r.threshold:''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如：10"></div>
+    </div>
+    <div id="ar_session_row" style="display:${type==='balance'?'none':''};grid-template-columns:1fr 1fr;gap:0 12px">
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">限定会话 sid（留空=全部）</label>
+        <input id="ar_session" type="text" value="${r?aesc(r.session||''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如：qq:gm:123456">
+        <div style="color:var(--dim);font-size:11px;margin-top:4px">与「目标」同时填时取交集：只统计「来源匹配 且 会话匹配」的记录</div></div>
+      <div id="ar_currency_row" style="margin-bottom:12px;display:${type==='cost'?'':'none'}"><label style="font-size:12px;color:var(--dim);font-weight:600">费用币种（留空=任一币种达阈值即触发）</label>
+        <input id="ar_currency" type="text" list="arCurList" value="${r?aesc(r.currency||''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如：CNY / 积分">
+        <datalist id="arCurList"><option value="CNY"><option value="积分"></datalist></div>
+    </div>
+    <div style="font-size:12px;font-weight:700;color:var(--acc);margin:14px 0 8px;padding-top:12px;border-top:1px dashed var(--line)">投递方式</div>
+    <div style="display:flex;gap:16px;margin-bottom:12px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="ar_mode" value="direct" ${mode==='direct'?'checked':''} style="accent-color:var(--acc)"> 机械直发（不经过 LLM，零消耗）</label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="ar_mode" value="llm" ${mode==='llm'?'checked':''} style="accent-color:var(--acc)"> 发给 LLM（bot 感知后主动告知）</label>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">自定义话语（两种模式共用；llm 模式下作为 bot 的提醒素材，bot 会自己组织语言转述）</label>
+        <textarea id="ar_message" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:12px;margin-top:4px;resize:vertical;min-height:52px;font-family:monospace" placeholder="⚠️ {name} 余额仅剩 {value} {unit}，阈值 {threshold}">${r?aesc(r.message||''):''}</textarea>
+        <div style="color:var(--dim);font-size:11px;margin-top:4px">可用：<code>{name}</code> 目标名 · <code>{value}</code> 当前值 · <code>{unit}</code> 单位 · <code>{threshold}</code> 阈值 · <code>{type}</code> 类型</div></div>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">最大连续提醒次数</label>
+        <input id="ar_max_alerts" type="number" min="1" value="${r?(r.max_alerts!=null?r.max_alerts:1):1}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px">
+        <div style="color:var(--dim);font-size:11px;margin-top:4px">默认 1 = 只提醒 1 次。在未回升/未超过阈值前最多连续提醒 N 次，达到上限后不再提醒（等余额回升 / 跨天 / 手动复位）</div></div>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">连续提醒间隔（秒）</label>
+        <input id="ar_alert_interval" type="number" min="0" value="${r?(r.alert_interval!=null?r.alert_interval:300):300}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px">
+        <div style="color:var(--dim);font-size:11px;margin-top:4px">默认 300 秒（5 分钟）。两次连续提醒的最小间隔；多条规则同时触发互不影响</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">直发模式补发概况图</label>
+        <div style="margin-top:4px"><input id="ar_send_image" type="checkbox" ${r&&r.send_image?'checked':''} style="accent-color:var(--acc)"> 消息先发，图异步构建好后补发</div></div>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">LLM 模式补发概况图</label>
+        <div style="margin-top:4px"><input id="ar_llm_send_image" type="checkbox" ${r&&r.llm_send_image?'checked':''} style="accent-color:var(--acc)"> 独立开关，bot 告知后异步补发</div></div>
+    </div>
+    <div style="font-size:12px;font-weight:700;color:var(--acc);margin:14px 0 8px;padding-top:12px;border-top:1px dashed var(--line)">生效时段（可选）</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 12px">
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">开始 HH:mm</label>
+        <input id="ar_time_start" type="time" value="${r?aesc(r.time_start||''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px"></div>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">结束 HH:mm</label>
+        <input id="ar_time_end" type="time" value="${r?aesc(r.time_end||''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px"></div>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">窗口（分钟）</label>
+        <input id="ar_time_window" type="number" min="0" value="${r?(r.time_window!=null?r.time_window:''):''}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px" placeholder="如 60 / 30"></div>
+    </div>
+    <div style="color:var(--dim);font-size:11px;margin-bottom:12px">窗口语义：从「开始」起 N 分钟内生效（如 9:00 + 60min = 9:00-10:00）；与「结束」同时给时取交集；全留空=全天生效</div>
+    <div style="font-size:12px;font-weight:700;color:var(--acc);margin:14px 0 8px;padding-top:12px;border-top:1px dashed var(--line)">投递到</div>
+    <div style="margin-bottom:12px">${delChk}</div>
+    <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">提醒效果预览</label>
+      <div id="ar_preview" style="background:var(--inset);border:1px dashed var(--line);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--dim);margin-top:4px;white-space:pre-wrap;line-height:1.6"></div></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+      <button class="btn" onclick="$('#alertEditor').style.display='none'">取消</button>
+      <button class="btn" style="background:var(--acc);border-color:var(--acc);color:#06283d;font-weight:600" onclick="alertSaveRule()">保存规则</button>
+    </div>`;
+  $('#alertEditor').style.display='flex';
+  alertPreview();
+  $('#ar_type').onchange = ()=>{
+    const t = $('#ar_type').value;
+    $('#ar_target_lab').textContent = t==='balance' ? '目标（余额源名，留空=任一源）' : '目标（来源标签，留空=全部）';
+    $('#ar_session_row').style.display = t==='balance' ? 'none' : 'grid';
+    $('#ar_currency_row').style.display = t==='cost' ? '' : 'none';
+    const opts = t==='balance' ? ['DeepSeek','硅基流动','NewAPI 中转','Kimi'] : ['gm','dm','system','全部'];
+    $('#arTargetList').innerHTML = opts.map(o=>`<option value="${o}">`).join('');
+    alertPreview();
+  };
+  ['ar_name','ar_op','ar_target','ar_threshold','ar_session','ar_currency','ar_message','ar_max_alerts','ar_alert_interval','ar_time_start','ar_time_end','ar_time_window'].forEach(id=>{
+    const el = $('#'+id); if(el) el.addEventListener('input', alertPreview);
+  });
+  document.querySelectorAll('input[name=ar_mode]').forEach(x=>x.addEventListener('change', alertPreview));
+}
+function alertPreview(){
+  const type = $('#ar_type').value, th = $('#ar_threshold').value;
+  const target = $('#ar_target').value.trim()||'全部';
+  const unit = type==='balance'?'元':(type==='token'?'tokens':'元');
+  const msg = $('#ar_message').value.trim() || `⚠️ ${ALERT_TYPE[type]}预警：${target} 已达 {value} {unit}`;
+  const pv = msg.replace(/\{name\}/g,target).replace(/\{value\}/g,th||'?').replace(/\{unit\}/g,unit)
+    .replace(/\{threshold\}/g,th||'?').replace(/\{type\}/g,ALERT_TYPE[type]).replace(/\{target\}/g,target);
+  $('#ar_preview').textContent = pv;
+}
+function alertSaveRule(){
+  const name = $('#ar_name').value.trim();
+  const threshold = parseFloat($('#ar_threshold').value);
+  if(!name){ toast('规则名称必填'); return; }
+  if(isNaN(threshold)){ toast('阈值必填且为数字'); return; }
+  const deliveries = [...document.querySelectorAll('#alertEditForm input[type=checkbox][value]')].filter(x=>x.checked).map(x=>x.value);
+  const data = {
+    name, type:$('#ar_type').value, op:$('#ar_op').value,
+    target:$('#ar_target').value.trim(), session:$('#ar_session').value.trim(),
+    threshold, currency:$('#ar_currency').value.trim(),
+    mode:document.querySelector('input[name=ar_mode]:checked').value,
+    message:$('#ar_message').value.trim(),
+    send_image:$('#ar_send_image').checked, llm_send_image:$('#ar_llm_send_image').checked,
+    max_alerts:parseInt($('#ar_max_alerts').value)||1,
+    alert_interval:parseInt($('#ar_alert_interval').value)||300,
+    time_start:$('#ar_time_start').value, time_end:$('#ar_time_end').value,
+    time_window:parseInt($('#ar_time_window').value)||'',
+    deliveries
+  };
+  if(alertEditId){ Object.assign(ALERT.rules.find(x=>x.id===alertEditId), data); }
+  else { ALERT.rules.push({id:alertUid('r'), enabled:true, ...data}); }
+  $('#alertEditor').style.display='none';
+  renderAlert(); toast('规则已保存（记得点「保存配置」）');
+}
+function alertDelRule(id){
+  if(!confirm('删除该规则？')) return;
+  ALERT.rules = ALERT.rules.filter(r=>r.id!==id);
+  delete ALERT.fired[id];
+  renderAlert(); toast('已删除规则');
+}
+function alertTest(id){
+  const r = ALERT.rules.find(x=>x.id===id);
+  if(!r) return;
+  const dnames = (r.deliveries||[]).map(did=>{const d=ALERT.deliveries.find(x=>x.id===did);return d?d.name:did}).join('、');
+  toast(`[测试] 已投递到：${dnames||'无'}（${r.mode==='llm'?'LLM 模式':'机械直发'}）`);
+}
+function alertReset(id){
+  delete ALERT.fired[id];
+  renderAlert(); toast('已复位该规则（可再次触发）');
+}
+$('#alertAddRule').onclick = ()=>alertEditRule(null);
+$('#alertAddDel').onclick = ()=>alertEditDel(null);
+$('#alertEditClose').onclick = ()=>$('#alertEditor').style.display='none';
+$('#alertDelClose').onclick = ()=>$('#alertDelEditor').style.display='none';
 </script>
 </body>
 </html>
