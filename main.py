@@ -558,6 +558,8 @@ class TokenStatsPlugin(BasePlugin):
         self.tool_include_balance = bool(tool.get("tool_include_balance", True))
         # 渲染图模式：默认关（LLM 显式要求才发图）；开启后 query_token_stats 默认发渲染图
         self.tool_render_image = bool(tool.get("tool_render_image", False))
+        # 渲染图是否显示余额（默认开；涉及账户余额，用户可自行关闭更安全）
+        self.tool_render_balance = bool(tool.get("tool_render_balance", True))
         self._browser = BrowserManager()
 
         # ── 价格规则 ──
@@ -2251,6 +2253,44 @@ class TokenStatsPlugin(BasePlugin):
                 return ""
             return f'<div class="d">耗时 均{_fmt_dur(a)}·快{_fmt_dur(mn)}·慢{_fmt_dur(mx)}</div>'
 
+        # 费用兜底：内存 aggs 未匹配到规则时，直接遍历记录现算（与 WebUI /stats 同源逻辑，
+        # 保证历史费用一定显示；按 (frm,to,指纹) 缓存避免重复全扫）
+        def _cost_units_any(frm, to, units, matched):
+            if matched and units:
+                return units, matched
+            try:
+                recs = self._read_records()
+                fp = self._calc_fingerprint(recs)
+                ck = (frm, to)
+                hit = self._range_scan_cache.get(ck)
+                if hit and hit[0] == fp:
+                    return hit[1]
+                units2, matched2 = {}, False
+                for r in recs:
+                    try:
+                        t = _parse_ts(r["t"])
+                    except Exception:
+                        continue
+                    d = t.strftime("%Y-%m-%d")
+                    if d < frm or d > to:
+                        continue
+                    rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
+                    if rule is None:
+                        continue
+                    amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t)
+                    if amt is None:
+                        continue
+                    ukey = f"{cur}|{_rule_unit(rule)}"
+                    units2[ukey] = units2.get(ukey, 0.0) + amt
+                    matched2 = True
+                result = (units2, matched2)
+                self._range_scan_cache[ck] = (fp, result)
+                if len(self._range_scan_cache) > 16:
+                    self._range_scan_cache.clear()
+                return result
+            except Exception:
+                return units, matched
+
         # 五范围卡
         cards = []
         for k in RANGES:
@@ -2261,7 +2301,7 @@ class TokenStatsPlugin(BasePlugin):
                 frm, to = {"today": (today, today), "d7": (d7, today),
                            "d30": (d30, today), "total": ("0000-01-01", "9999-12-31")}[k]
                 b = self._range_agg(frm, to)
-                units, matched = self._range_cost_units(frm, to)
+                units, matched = _cost_units_any(frm, to, *self._range_cost_units(frm, to))
             rate = f"{b['c'] / b['i'] * 100:.1f}%" if b["i"] > 0 else "—"
             cost = self._render_cost_bits(units) if matched else '<span class="cost">—</span>'
             errs = b.get("e", 0)
@@ -2314,19 +2354,21 @@ class TokenStatsPlugin(BasePlugin):
                 hour_cells += f'<div class="h"><span class="hl">{h}时</span><i></i><span class="hv">—</span></div>'
         hours_html = f'<div class="hours">{hour_cells}</div>'
 
-        # 余额
-        bal_bits = []
-        for src in self.balance_sources:
-            if not src.get("enabled", True):
-                continue
-            st = self._resolve_balance_state(src)
-            name = src.get("name", "")
-            if st["ok"]:
-                unit = self._src_unit(src)
-                bal_bits.append(f'<span class="bal-ok">● {_esc(name)} {st["balance"]:.4f}' + (f" {_esc(unit)}" if unit else "") + '</span>')
-            else:
-                bal_bits.append(f'<span class="bal-bad">● {_esc(name)} 探测失败</span>')
-        bal_html = '<div class="bal">' + "".join(bal_bits) + '</div>' if bal_bits else ""
+        # 余额（可配置关闭：涉及账户余额，默认开，用户可自行关）
+        bal_html = ""
+        if self.tool_render_balance:
+            bal_bits = []
+            for src in self.balance_sources:
+                if not src.get("enabled", True):
+                    continue
+                st = self._resolve_balance_state(src)
+                name = src.get("name", "")
+                if st["ok"]:
+                    unit = self._src_unit(src)
+                    bal_bits.append(f'<span class="bal-ok">● {_esc(name)} {st["balance"]:.4f}' + (f" {_esc(unit)}" if unit else "") + '</span>')
+                else:
+                    bal_bits.append(f'<span class="bal-bad">● {_esc(name)} 探测失败</span>')
+            bal_html = '<div class="bal">' + "".join(bal_bits) + '</div>' if bal_bits else ""
 
         bg = self._render_bg_url()
         bg_layer = ""
@@ -2340,27 +2382,27 @@ body{{margin:0;width:100%;min-height:100%;box-sizing:border-box;position:relativ
 font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:14px;
 display:flex;align-items:center;justify-content:center;}}
 .bg{{position:absolute;top:0;left:0;right:0;bottom:0;z-index:0;width:100%;height:100%;object-fit:cover;object-position:center;opacity:.92;}}
-.wrap{{position:relative;z-index:1;width:1200px;background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-border-radius:16px;padding:20px;border:1px solid rgba(51,65,85,.5);box-shadow:0 8px 32px rgba(0,0,0,.35);}}
+.wrap{{position:relative;z-index:1;width:1200px;padding:20px;}}
+.head{{background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(51,65,85,.5);border-radius:12px;padding:14px 16px;margin-bottom:16px;}}
 h1{{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px;}}
 h1 .dot{{width:9px;height:9px;border-radius:50%;background:#34d399;box-shadow:0 0 8px #34d399;}}
-.sub{{color:#a3b2c7;font-size:12px;margin-bottom:16px;word-break:break-all;}}
-.snap{{display:flex;gap:16px;align-items:center;flex-wrap:wrap;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:12px 16px;margin-bottom:16px;font-size:12.5px;}}
+.sub{{color:#a3b2c7;font-size:12px;margin:0;word-break:break-all;}}
+.snap{{display:flex;gap:16px;align-items:center;flex-wrap:wrap;background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(51,65,85,.5);border-radius:12px;padding:12px 16px;margin-bottom:16px;font-size:12.5px;}}
 .snap .dot{{width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block;margin-right:6px;box-shadow:0 0 6px #34d399;}}
 .snap .st{{color:#a3b2c7;}}
 .snap b{{color:#e2e8f0;}}
 .cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px;}}
-.card{{background:rgba(30,41,59,.92);border:1px solid #334155;border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;}}
+.card{{background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(51,65,85,.5);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;}}
 .card .k{{color:#a3b2c7;font-size:11px;letter-spacing:.5px;}}
 .card .topline{{display:flex;justify-content:space-between;align-items:baseline;}}
 .card .v{{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums;}}
 .card .d{{color:#a3b2c7;font-size:11px;margin-top:3px;line-height:1.5;word-break:break-all;}}
 .card .spark{{position:absolute;right:10px;bottom:8px;width:44%;height:26px;opacity:.85;}}
 .card .spark svg{{width:100%;height:100%;display:block;}}
-.card.errbox{{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),#1e293b;border-left:3px solid #f87171;}}
+.card.errbox{{background:linear-gradient(rgba(248,113,113,.07),rgba(248,113,113,.07)),rgba(15,23,42,.72);border-left:3px solid #f87171;}}
 .rate{{color:#a78bfa;}}.cost{{color:#a3b2c7;}}.pts{{color:#c084fc;}}.bad{{color:#f87171;}}
 .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}}
-.box{{background:rgba(30,41,59,.94);border:1px solid #334155;border-radius:12px;padding:14px 16px;}}
+.box{{background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(51,65,85,.5);border-radius:12px;padding:14px 16px;}}
 .box h3{{font-size:14px;margin:0 0 10px;color:#e2e8f0;}}
 table{{width:100%;border-collapse:collapse;font-size:12.5px;}}
 th{{color:#a3b2c7;text-align:left;font-weight:500;padding:6px 8px;border-bottom:1px solid #334155;font-size:11px;letter-spacing:.5px;}}
@@ -2369,20 +2411,22 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
 .bar{{height:8px;border-radius:4px;background:#0b1220;overflow:hidden;margin-top:4px;}}
 .bar i{{display:block;height:100%;background:linear-gradient(90deg,#38bdf8,#a78bfa);border-radius:4px;}}
 .hours{{display:grid;grid-template-columns:repeat(12,1fr);gap:6px;}}
-.hours .h{{background:#0b1220;border-radius:6px;padding:6px;text-align:center;font-size:10px;color:#a3b2c7;}}
-.hours .h i{{display:block;height:46px;background:#0b1220;border-radius:3px;margin:4px 0 2px;position:relative;overflow:hidden;}}
+.hours .h{{background:rgba(11,18,32,.6);border-radius:6px;padding:6px;text-align:center;font-size:10px;color:#a3b2c7;}}
+.hours .h i{{display:block;height:46px;background:rgba(11,18,32,.6);border-radius:3px;margin:4px 0 2px;position:relative;overflow:hidden;}}
 .hours .h i b{{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(180deg,#38bdf8,#6366f1);border-radius:3px 3px 0 0;}}
 .hours .h .hl{{display:block;}}
 .hours .h .hv{{display:block;font-variant-numeric:tabular-nums;}}
-.bal{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;font-size:12px;}}
+.bal{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;font-size:12px;background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(51,65,85,.5);border-radius:12px;padding:10px 16px;}}
 .bal-ok{{color:#34d399;}}.bal-bad{{color:#f87171;}}
 .note{{color:#a3b2c7;font-size:11.5px;margin-top:8px;line-height:1.6;}}
-.footer{{margin-top:14px;padding:10px 0 4px;text-align:center;font-size:12px;color:#8f97ab;line-height:1.7;}}
+.footer{{margin-top:14px;padding:10px 0 4px;text-align:center;font-size:12px;color:#8f97ab;line-height:1.7;background:rgba(15,23,42,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(51,65,85,.5);border-radius:12px;padding:10px 16px;}}
 </style></head><body>
 {bg_layer}
 <div class="wrap">
+<div class="head">
 <h1><span class="dot"></span>Token 用量统计</h1>
-<div class="sub">模型 {_esc(model)} · 渠道 {_esc(channel)} · 日志 {_esc(str(self._log_path))}</div>
+<div class="sub">模型 {_esc(model)} · 渠道 {_esc(channel)}</div>
+</div>
 <div class="snap"><span><span class="dot"></span>{_esc(self._cur_source)}</span>
 <span class="st">会话 <b>{s["r"]}</b> 轮 · <b>{_fmt4(s["v"])}</b> Token · 已进行 <b>{_fmt_elapsed(elapsed)}</b></span>
 <span class="st">最近一轮：输入 <b>{_fmt_num(self._last_round["i"])}</b> · 输出 <b>{_fmt_num(self._last_round["o"])}</b>{f' · 缓存 <b>{_fmt_num(self._last_round["c"])}</b>' if self._last_round["c"] else ''}</span></div>

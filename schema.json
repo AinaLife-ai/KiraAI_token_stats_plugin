@@ -129,6 +129,12 @@
         "name": "默认渲染图发送",
         "default": false,
         "hint": "默认关：query_token_stats 默认返回纯文本，LLM 显式要求（用户想要图片/卡片）时才渲染概览图发送。开启后：LLM 一查用量就自动渲染概览图并直接发送到会话（查加发一体）。渲染依赖 Playwright（系统 Chrome/Edge 或自动下载内置 Chromium），失败自动降级纯文本。背景优先用你在 WebUI 设置的自定义背景图"
+      },
+      "tool_render_balance": {
+        "type": "switch",
+        "name": "渲染图显示余额",
+        "default": true,
+        "hint": "渲染概览图时是否显示 API 账户余额（涉及账户信息，默认开；如不想让余额出现在发给用户的图片里可关闭）"
       }
     }
   },
