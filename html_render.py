@@ -24,6 +24,10 @@ _BROWSER_CANDIDATES = (
 
 SCREENSHOT_WIDTH = 1400
 
+# 渲染并发信号量：限制同时最多 1 个浏览器实例（多规则同时补发概况图时排队，
+# 避免并发启动多个 Chromium 实例吃满内存/CPU）
+_RENDER_SEM = asyncio.Semaphore(1)
+
 
 async def _install_chromium() -> bool:
     """下载并安装 Playwright 内置 Chromium，返回是否成功。"""
@@ -127,29 +131,30 @@ async def render_html(html: str, output_path: str, browser: BrowserManager, wait
     if browser is not None and browser.channel:
         launch_kwargs["channel"] = browser.channel
 
-    async with async_playwright() as p:
-        b = await p.chromium.launch(**launch_kwargs)
-        try:
-            page = await b.new_page(viewport={"width": SCREENSHOT_WIDTH, "height": 800})
-            await page.set_content(html, wait_until="domcontentloaded", timeout=10000)
-            if wait_js:
-                try:
-                    await page.wait_for_function(wait_js, timeout=8000)
-                except Exception:
-                    pass  # 超时忽略，继续截图
-            await page.wait_for_timeout(800)
-            # 按内容实际高度动态设置视口（flex 布局下 full_page scrollHeight 不可靠）
+    async with _RENDER_SEM:
+        async with async_playwright() as p:
+            b = await p.chromium.launch(**launch_kwargs)
             try:
-                h = await page.evaluate("Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
-                h = max(800, int(h) + 2)
-                await page.set_viewport_size({"width": SCREENSHOT_WIDTH, "height": h})
-                await page.wait_for_timeout(200)
-                await page.screenshot(path=output_path, full_page=False)
-            except Exception:
+                page = await b.new_page(viewport={"width": SCREENSHOT_WIDTH, "height": 800})
+                await page.set_content(html, wait_until="domcontentloaded", timeout=10000)
+                if wait_js:
+                    try:
+                        await page.wait_for_function(wait_js, timeout=8000)
+                    except Exception:
+                        pass  # 超时忽略，继续截图
+                await page.wait_for_timeout(800)
+                # 按内容实际高度动态设置视口（flex 布局下 full_page scrollHeight 不可靠）
                 try:
-                    await page.screenshot(path=output_path, full_page=True)
-                except Exception:
+                    h = await page.evaluate("Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
+                    h = max(800, int(h) + 2)
+                    await page.set_viewport_size({"width": SCREENSHOT_WIDTH, "height": h})
+                    await page.wait_for_timeout(200)
                     await page.screenshot(path=output_path, full_page=False)
-        finally:
-            await b.close()
+                except Exception:
+                    try:
+                        await page.screenshot(path=output_path, full_page=True)
+                    except Exception:
+                        await page.screenshot(path=output_path, full_page=False)
+            finally:
+                await b.close()
     return output_path
