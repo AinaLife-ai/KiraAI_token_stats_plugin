@@ -1,5 +1,6 @@
 # KiraAI Token 用量统计（Token Stats）
 
+> **v1.3.8**：渲染概览图调整——横屏宽幅（1200px，五范围卡一行横排、历史/小时并排）；随机背景改为 Playwright 浏览器加载（之前 Python 端下载失败导致纯色，现在与 WebUI 同源、加载失败自动纯色降级）；修复 footer 显示 coroutine 对象（async 昵称解析移到 async 调用方 await 后传入）；footer 改为「Token 用量统计 · provide by @znq19 · 生成时间」
 > **v1.3.7**：bot 渲染概览图发送（查加发一体）——`query_token_stats` 工具新增 `render=image` 模式，把完整概览首页（快照栏+五范围卡+错误卡+按天历史+今日小时+余额）渲染成图片直接发送到会话；背景优先用 WebUI 自定义背景图（自动同步服务端），无自定义时用线上随机图；渲染失败自动降级纯文本；默认关，LLM 显式要求才发图
 > **v1.3.6**：修复最近记录表格列错位（表头补「耗时」列，与数据行 10 列对齐）+ 时间趋势橙色耗时线不显示（SVG 颜色改 style 支持 CSS 变量、单数据点补圆点标记，紫色命中率线同步修复）
 > **v1.3.5**：新增「耗时」统计全链路——记录每轮 LLM 响应耗时（time_consumed），最近记录逐轮显示、概览五卡与维度分析/会话统计显示均/快/慢、时间趋势叠加平均耗时橙色右轴折线、挂件显示轮均耗时、bot 三工具均带耗时
@@ -257,7 +258,7 @@ bot 会自动调用对应工具返回结果。三个工具：
 | `query_token_usage` | 维度聚合：`dim=channel/model/source/day`，支持 `range/from/to` 时间区间、`model/channel/source` 关键字过滤、`top` 行数上限（默认8，最大20） |
 | `query_token_records` | 最近 N 轮逐轮明细（倒序），支持过滤 + `minInput`（只看输入超过某 token 数的轮次，定位大上下文） |
 
-> **渲染图模式**：`query_token_stats` 的 `render=image` 会渲染一张与 WebUI 概览页一致的图片（快照栏 + 五范围卡 + 错误卡 + 按天历史 + 今日按小时 + 余额源）直接发送。背景优先用 WebUI 🖼 自定义背景图（自动同步服务端），无自定义时用线上随机图。渲染依赖 Playwright（系统 Chrome/Edge → 内置 Chromium 自动下载），失败自动降级纯文本。默认关（LLM 显式要求才发图），可在配置页 **Bot 工具 → 默认渲染图发送** 开启。
+> **渲染图模式**：`query_token_stats` 的 `render=image` 会渲染一张**横屏宽幅**概览图（1200px：快照栏 + 五范围卡一行横排 + 错误卡 + 按天历史/今日按小时并排 + 余额源）直接发送。背景优先用 WebUI 🖼 自定义背景图（自动同步服务端），无自定义时用线上随机图（浏览器加载，失败自动纯色降级）。渲染依赖 Playwright（系统 Chrome/Edge → 内置 Chromium 自动下载），失败自动降级纯文本。默认关（LLM 显式要求才发图），可在配置页 **Bot 工具 → 默认渲染图发送** 开启。
 
 ### 5. 自定义命令（可选，默认关闭）
 
@@ -380,6 +381,12 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 
 <details>
 <summary>点击展开</summary>
+
+### v1.3.8（2026-09-02）
+
+- **横屏宽幅**：渲染视口 800px → 1200px，五范围卡一行横排（grid 5 列），按天历史与今日按小时两栏并排，整体横向宽幅布局
+- **随机背景修复**：之前用 Python `urllib.request` 同步下载随机图，在部分环境失败 → 纯色背景；改为 Playwright 浏览器加载随机图 URL（与 WebUI 看板同源，能显示），`<img>` 加载完成才截图，失败自动纯色降级；自定义背景图仍 data URI 内联
+- **footer 修复**：`_build_summary_html` 是同步方法却调用 async `_resolve_sid_name`（未 await）→ footer 显示 `<coroutine object ...>`；会话昵称解析移到 async 调用方 `_build_summary_image` await 后传入；footer 按反馈改为「Token 用量统计 · provide by @znq19 · 生成于 YYYY-MM-DD HH:MM:SS」（保留标题与生成时间）
 
 ### v1.3.7（2026-09-02）
 
