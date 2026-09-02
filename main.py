@@ -1947,7 +1947,7 @@ class TokenStatsPlugin(BasePlugin):
         return sids
 
     def _alert_fmt_value(self, r: dict, value, unit: str = "") -> str:
-        """提醒话语占位符替换：{name}{value}{unit}{threshold}{type}{target}"""
+        """提醒话语占位符替换：{name}{value}{unit}{threshold}{type}{target}{step}"""
         try:
             v = f"{float(value):,.4f}".rstrip("0").rstrip(".")
         except (TypeError, ValueError):
@@ -1955,13 +1955,18 @@ class TokenStatsPlugin(BasePlugin):
         msg = str(r.get("message") or "").strip()
         if not msg:
             tname = {"balance": "余额", "token": "tokens", "cost": "费用"}.get(r.get("type"), "指标")
-            msg = f"⚠️ {tname}预警：{r.get('target') or '全部'} 已达 {v}{unit}"
+            if (r.get("trigger") or "once").strip().lower() == "step":
+                # step 模式默认话语：体现「每新增 N 提醒一次」
+                msg = f"📈 {tname}预警：{r.get('target') or '全部'} 每新增 {r.get('threshold')} 提醒一次，当前已达 {v}{unit}"
+            else:
+                msg = f"⚠️ {tname}预警：{r.get('target') or '全部'} 已达 {v}{unit}"
         return (msg.replace("{name}", str(r.get("target") or ""))
                    .replace("{value}", v)
                    .replace("{unit}", unit)
                    .replace("{threshold}", str(r.get("threshold") or ""))
                    .replace("{type}", str(r.get("type") or ""))
-                   .replace("{target}", str(r.get("target") or "")))
+                   .replace("{target}", str(r.get("target") or ""))
+                   .replace("{step}", str(r.get("threshold") or "")))
 
     async def _alert_send(self, r: dict, sids: list, text: str, send_image: bool):
         """投递提醒：direct=机械直发（消息先发，图异步后发）；llm=publish_notice 让 bot 感知。
@@ -4006,13 +4011,23 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
 
     @register.api(method="GET", path="/alert", auth=True)
     async def api_alert(self):
-        """预警配置读取：投递会话 + 规则（含已触发状态，供前端展示）"""
+        """预警配置读取：投递会话 + 规则（含已触发状态，供前端展示）。
+        _alert_fired 值为 dict {count, at, day}（v1.4.2+）或旧格式 float 时间戳，兼容两者"""
+        fired = {}
+        for k, v in self._alert_fired.items():
+            if isinstance(v, dict):
+                at = v.get("at", 0)
+            else:
+                at = v
+            try:
+                fired[k] = datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError, OSError):
+                fired[k] = ""
         return {
             "enable": self.enable_alert,
             "deliveries": self.alert_deliveries,
             "rules": self.alert_rules,
-            "fired": {k: datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
-                      for k, v in self._alert_fired.items()},
+            "fired": fired,
         }
 
     @register.api(method="POST", path="/alert-config", auth=True)
@@ -5436,7 +5451,7 @@ function renderAlert(){
     const trg = r.trigger==='step' ? ` · 每新增 <b>${r.threshold}</b> 提醒一次` : '';
     const img = (r.mode==='llm'?r.llm_send_image:r.send_image)?' · 📷 补发概况图':'';
     const fired = ALERT.fired[r.id]?`<span style="color:var(--ok);font-size:11px;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3);padding:2px 8px;border-radius:6px">已触发 ${aesc(ALERT.fired[r.id])}</span>`:'';
-    const dnames = (r.deliveries||[]).map(id=>{const d=ALERT.deliveries.find(x=>x.id===id);return d?d.name:id}).join('、')||'<span style="color:var(--err)">未配置投递</span>';
+    const dnames = (r.deliveries||[]).map(id=>{const d=ALERT.deliveries.find(x=>x.id===id);return d?(d.enabled?d.name:`<span style="color:var(--dim);text-decoration:line-through">${d.name}</span>`):id}).join('、')||'<span style="color:var(--err)">未配置投递</span>';
     return `<div style="background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px;${r.enabled?'':'opacity:.5'}">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span style="font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600;color:${ALERT_TAG[r.type]};background:${ALERT_TAG[r.type]}22;border:1px solid ${ALERT_TAG[r.type]}44">${t}</span>
@@ -5521,7 +5536,10 @@ function alertEditRule(id){
     ? ['DeepSeek','硅基流动','NewAPI 中转','Kimi']
     : ['gm','dm','system','全部'];
   const delChk = ALERT.deliveries.length
-    ? ALERT.deliveries.map(d=>`<label style="display:inline-flex;align-items:center;gap:5px;background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer;font-size:12px;margin-right:6px;margin-bottom:6px"><input type="checkbox" value="${d.id}" ${(r&&(r.deliveries||[]).includes(d.id))?'checked':''} style="accent-color:var(--acc)"> ${aesc(d.name)}</label>`).join('')
+    ? ALERT.deliveries.map(d=>{
+        const disabled = !d.enabled;
+        return `<label style="display:inline-flex;align-items:center;gap:5px;background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:${disabled?'not-allowed':'pointer'};font-size:12px;margin-right:6px;margin-bottom:6px;${disabled?'opacity:.45':''}"><input type="checkbox" value="${d.id}" ${(r&&(r.deliveries||[]).includes(d.id))?'checked':''} ${disabled?'disabled':''} style="accent-color:var(--acc)"> ${aesc(d.name)}${disabled?' <span style="color:var(--dim);font-size:10px">(已停用)</span>':''}</label>`;
+      }).join('')
     : '<span style="color:var(--err)">请先添加投递会话</span>';
   $('#alertEditForm').innerHTML = `
     <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">规则名称 *</label>
