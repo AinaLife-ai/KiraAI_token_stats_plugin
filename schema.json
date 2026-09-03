@@ -395,7 +395,7 @@
     "type": "json",
     "name": "预警规则（高级/自定义）",
     "default": [],
-    "hint": "推荐在 WebUI 侧边栏「Token 用量 → 预警提醒」页可视化编辑。规则字段：type=balance|token|cost；trigger=once|step（once=当天累计达阈值提醒一次，step=每新增达阈值提醒一次如每10M，仅 token/cost 有效）；target=余额源名/来源标签（留空=全部）；session=限定会话 sid（留空=全部）；op=le|ge；threshold=阈值；currency=费用币种（CNY/积分，留空=任一币种达阈值即触发）；mode=direct|llm；message=自定义话语（支持 {name}{value}{unit}{threshold}{type} 占位符）；send_image=direct 模式异步补发概况图；llm_send_image=llm 模式异步补发概况图；max_alerts=最大连续提醒次数（默认 1=只提醒1次，未回升/未超过阈值前最多连续提醒N次）；alert_interval=连续提醒间隔秒数（默认 300=5分钟）；time_start/time_end=生效时段 HH:mm（留空=全天）；time_window=生效窗口分钟（如 60/30，留空=不限）；deliveries=投递会话 id 列表（llm 模式只取第一个）"
+    "hint": "推荐在 WebUI 侧边栏「Token 用量 → 预警提醒」页可视化编辑。规则字段：type=balance|token|cost；trigger=once|step（once=当天累计达阈值提醒一次，step=每新增达阈值提醒一次如每10M，仅 token/cost 有效）；target=余额源名/来源标签（留空=全部）；session=限定会话 sid（留空=全部）；op=le|ge；threshold=阈值；currency=费用币种（CNY/积分，留空=任一币种达阈值即触发）；mode=direct|llm；message=机械直发话语（支持 {name}{value}{unit}{threshold}{type} 占位符）；llm_message=LLM 提醒素材（llm 模式专用，留空=默认带「请告知用户情况」）；send_image=direct 模式异步补发概况图；llm_send_image=llm 模式异步补发概况图；max_alerts=最大连续提醒次数（默认 1=只提醒1次，未回升/未超过阈值前最多连续提醒N次）；alert_interval=连续提醒间隔秒数（默认 300=5分钟）；time_start/time_end=生效时段 HH:mm（留空=全天）；time_window=生效窗口分钟（如 60/30，留空=不限）；deliveries=投递会话 id 列表（llm 模式只取第一个）"
    }
   }
  }
