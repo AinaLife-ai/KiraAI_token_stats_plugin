@@ -704,6 +704,16 @@ class TokenStatsPlugin(BasePlugin):
         self.alert_deliveries = list(deliveries) if isinstance(deliveries, list) else []
         rules = al.get("alert_rules", [])
         self.alert_rules = list(rules) if isinstance(rules, list) else []
+        # 旧版默认话语自动迁移：v1.4.2 前默认模板（"⚠️ xxx预警：xxx 已达 xxx" / "📊 今日 tokens 已达 xxx"）
+        # 被用户手动保存过的话，清空让新版默认生效（step 带「每新增 N 提醒一次」、llm 带「请告知用户情况」）；
+        # 自定义话语（不含"预警："格式）保留
+        for _r in self.alert_rules:
+            if isinstance(_r, dict):
+                _m = str(_r.get("message") or "").strip()
+                if not _m or "每新增" in _m or "请告知用户情况" in _m:
+                    continue
+                if ("预警：" in _m and "已达" in _m) or "今日 tokens 已达" in _m:
+                    _r["message"] = "" 
         # 已触发状态：{rule_id: {count, at, day}}（balance 滞回：余额回升超过阈值才重置；
         # token/cost 单调递增：达阈值触发一次，跨天自动重置）
         self._alert_fired = {}
@@ -1946,13 +1956,15 @@ class TokenStatsPlugin(BasePlugin):
                 sids.append(str(d["sid"]).strip())
         return sids
 
-    def _alert_fmt_value(self, r: dict, value, unit: str = "") -> str:
-        """提醒话语占位符替换：{name}{value}{unit}{threshold}{type}{target}{step}"""
+    def _alert_fmt_value(self, r: dict, value, unit: str = "", mode: str = "") -> str:
+        """提醒话语占位符替换：{name}{value}{unit}{threshold}{type}{target}{step}
+        mode=llm 时用 llm_message（默认带「请告知用户情况」），否则用 message"""
         try:
             v = f"{float(value):,.4f}".rstrip("0").rstrip(".")
         except (TypeError, ValueError):
             v = str(value)
-        msg = str(r.get("message") or "").strip()
+        is_llm = (mode or r.get("mode") or "direct").strip().lower() == "llm"
+        msg = str(r.get("llm_message") if is_llm else r.get("message") or "").strip()
         if not msg:
             tname = {"balance": "余额", "token": "tokens", "cost": "费用"}.get(r.get("type"), "指标")
             if (r.get("trigger") or "once").strip().lower() == "step":
@@ -1960,6 +1972,9 @@ class TokenStatsPlugin(BasePlugin):
                 msg = f"📈 {tname}预警：{r.get('target') or '全部'} 每新增 {r.get('threshold')} 提醒一次，当前已达 {v}{unit}"
             else:
                 msg = f"⚠️ {tname}预警：{r.get('target') or '全部'} 已达 {v}{unit}"
+            if is_llm:
+                # llm 模式：bot 感知后主动告知用户
+                msg += "。请告知用户情况"
         return (msg.replace("{name}", str(r.get("target") or ""))
                    .replace("{value}", v)
                    .replace("{unit}", unit)
@@ -2006,7 +2021,7 @@ class TokenStatsPlugin(BasePlugin):
             html = await asyncio.to_thread(self._build_summary_html, "", sess_name=sess_name)
             out_dir = self._data_dir / "output"
             out_dir.mkdir(parents=True, exist_ok=True)
-            png = out_dir / f"summary_{int(time.time() * 1000)}.png"
+            png = out_dir / f"summary_{int(time.time() * 1000)}_{os.urandom(3).hex()}.png"
             wait_js = "document.querySelectorAll('img.bg').length===0 || (document.querySelector('img.bg').complete && document.querySelector('img.bg').naturalWidth>0)"
             await render_html(html, str(png), self._browser, wait_js=wait_js)
             await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
@@ -2235,7 +2250,7 @@ class TokenStatsPlugin(BasePlugin):
         sids = self._alert_delivery_sids(r)
         if not sids:
             return False
-        text = self._alert_fmt_value(r, value, unit)
+        text = self._alert_fmt_value(r, value, unit, mode=(r.get('mode') or 'direct'))
         # 概况图补发开关：llm 模式用 llm_send_image，direct 用 send_image
         send_image = bool(r.get("llm_send_image", False)) if (r.get("mode") or "direct").strip().lower() == "llm" \
             else bool(r.get("send_image", False))
@@ -2857,7 +2872,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             html = self._build_summary_html(range_key, sess_name=sess_name)
             out_dir = self._data_dir / "output"
             out_dir.mkdir(parents=True, exist_ok=True)
-            png = out_dir / f"summary_{int(time.time() * 1000)}.png"
+            png = out_dir / f"summary_{int(time.time() * 1000)}_{os.urandom(3).hex()}.png"
             # 等待背景图（<img>）加载完成；无背景或加载失败直接继续
             wait_js = "document.querySelectorAll('img.bg').length===0 || (document.querySelector('img.bg').complete && document.querySelector('img.bg').naturalWidth>0)"
             await render_html(html, str(png), self._browser, wait_js=wait_js)
@@ -4071,6 +4086,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
                     "op": (str(r.get("op") or "le").strip().lower() or "le"),
                     "mode": (str(r.get("mode") or "direct").strip().lower() or "direct"),
                     "message": str(r.get("message") or "").strip(),
+                    "llm_message": str(r.get("llm_message") or "").strip(),
                     "send_image": bool(r.get("send_image", False)),
                     "llm_send_image": bool(r.get("llm_send_image", False)),
                     "currency": str(r.get("currency") or "").strip(),
@@ -4130,7 +4146,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         else:
             got = self._alert_usage_value(rule)
             value, unit = (got[0], got[1]) if got else (0, "")
-        text = self._alert_fmt_value(rule, value, unit)
+        text = self._alert_fmt_value(rule, value, unit, mode=(rule.get('mode') or 'direct'))
         text = f"[测试] {text}"
         mode = (rule.get("mode") or "direct").strip().lower()
         if mode == "llm":
@@ -5470,7 +5486,7 @@ function renderAlert(){
           ? `监测 <b style="color:var(--fg)">余额</b>：${target} ${opTxt} <b style="color:var(--warn)">${r.threshold}</b>${win}${cd}${img}`
           : `监测 <b style="color:var(--fg)">${t}</b>：${target}${sess} ${opTxt} <b style="color:var(--warn)">${r.threshold}</b>${cur}${trg}${win}${cd}${img}`}
         <br>投递到：<b style="color:var(--fg)">${dnames}</b>
-        ${r.message?`<br>话语：<span style="color:var(--dim)">${aesc(r.message)}</span>`:''}
+        ${r.mode==='llm'?(r.llm_message?`<br>LLM 素材：<span style="color:var(--dim)">${aesc(r.llm_message)}</span>`:''):(r.message?`<br>话语：<span style="color:var(--dim)">${aesc(r.message)}</span>`:'')}
       </div>
     </div>`;
   }).join('') : '<div style="color:var(--dim);text-align:center;padding:16px;border:1px dashed var(--line);border-radius:8px">还没有预警规则，点「＋ 添加规则」</div>';
@@ -5593,9 +5609,12 @@ function alertEditRule(id){
       <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="ar_mode" value="llm" ${mode==='llm'?'checked':''} style="accent-color:var(--acc)"> 发给 LLM（bot 感知后主动告知）</label>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px">
-      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">自定义话语（两种模式共用；llm 模式下作为 bot 的提醒素材，bot 会自己组织语言转述）</label>
+      <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">机械直发话语（direct 模式）</label>
         <textarea id="ar_message" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:12px;margin-top:4px;resize:vertical;min-height:52px;font-family:monospace" placeholder="⚠️ {name} 余额仅剩 {value} {unit}，阈值 {threshold}">${r?aesc(r.message||''):''}</textarea>
         <div style="color:var(--dim);font-size:11px;margin-top:4px">可用：<code>{name}</code> 目标名 · <code>{value}</code> 当前值 · <code>{unit}</code> 单位 · <code>{threshold}</code> 阈值 · <code>{type}</code> 类型</div></div>
+      <div id="ar_llm_msg_row" style="margin-bottom:12px;display:${mode==='llm'?'':'none'}"><label style="font-size:12px;color:var(--dim);font-weight:600">LLM 提醒素材（llm 模式，bot 感知后主动告知用户）</label>
+        <textarea id="ar_llm_message" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:12px;margin-top:4px;resize:vertical;min-height:52px;font-family:monospace" placeholder="⚠️ {name} 余额仅剩 {value} {unit}。请告知用户情况">${r?aesc(r.llm_message||''):''}</textarea>
+        <div style="color:var(--dim);font-size:11px;margin-top:4px">留空=默认「…请告知用户情况」；可用占位符同上</div></div>
       <div style="margin-bottom:12px"><label style="font-size:12px;color:var(--dim);font-weight:600">最大连续提醒次数</label>
         <input id="ar_max_alerts" type="number" min="1" value="${r?(r.max_alerts!=null?r.max_alerts:1):1}" style="width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:4px">
         <div style="color:var(--dim);font-size:11px;margin-top:4px">默认 1 = 只提醒 1 次。在未回升/未超过阈值前最多连续提醒 N 次，达到上限后不再提醒（等余额回升 / 跨天 / 手动复位）</div></div>
@@ -5654,10 +5673,14 @@ function alertEditRule(id){
     $('#arTargetList').innerHTML = opts.map(o=>`<option value="${o}">`).join('');
     alertPreview();
   };
-  ['ar_name','ar_op','ar_target','ar_threshold','ar_session','ar_currency','ar_message','ar_max_alerts','ar_alert_interval','ar_time_start','ar_time_end','ar_time_window'].forEach(id=>{
+  ['ar_name','ar_op','ar_target','ar_threshold','ar_session','ar_currency','ar_message','ar_llm_message','ar_max_alerts','ar_alert_interval','ar_time_start','ar_time_end','ar_time_window'].forEach(id=>{
     const el = $('#'+id); if(el) el.addEventListener('input', alertPreview);
   });
-  document.querySelectorAll('input[name=ar_mode]').forEach(x=>x.addEventListener('change', alertPreview));
+  document.querySelectorAll('input[name=ar_mode]').forEach(x=>x.addEventListener('change', ()=>{
+    const isLlm = document.querySelector('input[name=ar_mode]:checked').value==='llm';
+    $('#ar_llm_msg_row').style.display = isLlm ? '' : 'none';
+    alertPreview();
+  }));
 }
 function parseThreshold(v){
   if(v==null||String(v).trim()==='') return NaN;
@@ -5695,7 +5718,9 @@ function alertPreview(){
   const thDisp = isNaN(th) ? (thRaw||'?') : th;
   const target = $('#ar_target').value.trim()||'全部';
   const unit = type==='balance'?'元':(type==='token'?'tokens':'元');
-  const msg = $('#ar_message').value.trim() || `⚠️ ${ALERT_TYPE[type]}预警：${target} 已达 {value} {unit}`;
+  const isLlm = document.querySelector('input[name=ar_mode]:checked').value==='llm';
+  const msg = (isLlm ? $('#ar_llm_message').value.trim() : $('#ar_message').value.trim())
+    || `⚠️ ${ALERT_TYPE[type]}预警：${target} 已达 {value} {unit}` + (isLlm?'。请告知用户情况':'');
   const pv = msg.replace(/\{name\}/g,target).replace(/\{value\}/g,thDisp).replace(/\{unit\}/g,unit)
     .replace(/\{threshold\}/g,thDisp).replace(/\{type\}/g,ALERT_TYPE[type]).replace(/\{target\}/g,target);
   $('#ar_preview').textContent = pv;
@@ -5720,6 +5745,7 @@ function alertSaveRule(){
     threshold, currency:$('#ar_currency').value.trim(),
     mode:document.querySelector('input[name=ar_mode]:checked').value,
     message:$('#ar_message').value.trim(),
+    llm_message:$('#ar_llm_message').value.trim(),
     send_image:$('#ar_send_image').checked, llm_send_image:$('#ar_llm_send_image').checked,
     max_alerts:parseInt($('#ar_max_alerts').value)||1,
     alert_interval:parseInt($('#ar_alert_interval').value)||300,
