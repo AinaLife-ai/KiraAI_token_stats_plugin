@@ -379,6 +379,12 @@ A：统计/工具/页面全部正常，仅余额监测不可用（加载时日�
 <details>
 <summary>点击展开</summary>
 
+### v1.4.4（2026-09-03）
+
+- **修复删除规则/投递会话无效**：KiraAI WebUI iframe 里原生 `confirm()` 被拦截返回 false → 删除直接 return。改用余额监测同款 `confirmBtn`（点两下确认）
+- **修复测试按钮没用**：之前只弹 toast 提示"已投递到"，没真正发消息。现在调后端 `/alert-test` API 真实投递（direct 直发 / llm 发提醒事件）
+- **规则卡片加启停开关**：与余额监测一致的 `.sw` 开关，切换即保存（POST /alert-config）
+
 ### v1.4.3（2026-09-03）
 
 - **修复预警 tab 加载失败（500）**：v1.4.2 把 `_alert_fired` 从 float 时间戳改为 dict `{count,at,day}`，但 `api_alert` 仍用 `datetime.fromtimestamp(v)` 期望 float → TypeError → 500 → 前端 JSON.parse 报错、规则编辑不了。修复：兼容 dict/float 两种格式，异常值兜底空串
