@@ -5437,7 +5437,7 @@ function renderAlert(){
       ${d.enabled?'':'<span style="color:var(--dim);font-size:11px">已停用</span>'}
       <span style="flex:1"></span>
       <button class="btn" onclick="alertEditDel('${d.id}')">编辑</button>
-      <button class="btn" onclick="alertDelDel('${d.id}')">删除</button>
+      <button class="btn" onclick="alertDelDel('${d.id}', this)">删除</button>
     </div>`).join('') : '<div style="color:var(--dim);text-align:center;padding:16px;border:1px dashed var(--line);border-radius:8px">还没有投递会话，点「＋ 添加投递会话」</div>';
   const rl = $('#alertRuleList');
   rl.innerHTML = ALERT.rules.length ? ALERT.rules.map(r=>{
@@ -5456,14 +5456,14 @@ function renderAlert(){
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span style="font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600;color:${ALERT_TAG[r.type]};background:${ALERT_TAG[r.type]}22;border:1px solid ${ALERT_TAG[r.type]}44">${t}</span>
         <span style="font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600;color:${r.mode==='llm'?'#fbbf24':'#34d399'};background:${r.mode==='llm'?'rgba(251,191,36,.12)':'rgba(52,211,153,.12)'};border:1px solid ${r.mode==='llm'?'rgba(251,191,36,.3)':'rgba(52,211,153,.3)'}">${r.mode==='llm'?'🤖 发给 LLM':'⚡ 机械直发'}</span>
-        ${r.enabled?'':'<span style="color:var(--dim);font-size:11px">已停用</span>'}
+        <label class="sw" title="${r.enabled?'停用该规则':'启用该规则'}"><input type="checkbox" ${r.enabled?'checked':''} onchange="alertToggle('${r.id}',this.checked)"><i></i></label>
         <span style="font-weight:600;font-size:13px">${aesc(r.name||r.id)}</span>
         ${fired}
         <span style="flex:1"></span>
         <button class="btn" onclick="alertTest('${r.id}')">测试</button>
         <button class="btn" onclick="alertReset('${r.id}')">复位</button>
         <button class="btn" onclick="alertEditRule('${r.id}')">编辑</button>
-        <button class="btn" onclick="alertDelRule('${r.id}')">删除</button>
+        <button class="btn" onclick="alertDelRule('${r.id}', this)">删除</button>
       </div>
       <div style="color:var(--dim);font-size:12px;margin-top:6px;line-height:1.7">
         ${r.type==='balance'
@@ -5518,11 +5518,12 @@ function alertSaveDel(){
   $('#alertDelEditor').style.display='none';
   renderAlert(); saveAlertConfig();
 }
-function alertDelDel(id){
-  if(!confirm('删除投递会话？引用它的规则将无法投递。')) return;
-  ALERT.deliveries = ALERT.deliveries.filter(d=>d.id!==id);
-  ALERT.rules.forEach(r=>{r.deliveries=(r.deliveries||[]).filter(x=>x!==id)});
-  renderAlert(); saveAlertConfig();
+function alertDelDel(id, btn){
+  confirmBtn(btn, '确认删除？', async ()=>{
+    ALERT.deliveries = ALERT.deliveries.filter(d=>d.id!==id);
+    ALERT.rules.forEach(r=>{r.deliveries=(r.deliveries||[]).filter(x=>x!==id)});
+    renderAlert(); saveAlertConfig();
+  });
 }
 
 // ── 规则 ──
@@ -5731,17 +5732,28 @@ function alertSaveRule(){
   $('#alertEditor').style.display='none';
   renderAlert(); saveAlertConfig();
 }
-function alertDelRule(id){
-  if(!confirm('删除该规则？')) return;
-  ALERT.rules = ALERT.rules.filter(r=>r.id!==id);
-  delete ALERT.fired[id];
-  renderAlert(); saveAlertConfig();
-}
-function alertTest(id){
+function alertToggle(id, on){
   const r = ALERT.rules.find(x=>x.id===id);
   if(!r) return;
-  const dnames = (r.deliveries||[]).map(did=>{const d=ALERT.deliveries.find(x=>x.id===did);return d?d.name:did}).join('、');
-  toast(`[测试] 已投递到：${dnames||'无'}（${r.mode==='llm'?'LLM 模式':'机械直发'}）`);
+  r.enabled = on;
+  renderAlert(); saveAlertConfig();
+}
+function alertDelRule(id, btn){
+  confirmBtn(btn, '确认删除？', async ()=>{
+    ALERT.rules = ALERT.rules.filter(r=>r.id!==id);
+    delete ALERT.fired[id];
+    renderAlert(); saveAlertConfig();
+  });
+}
+async function alertTest(id){
+  const r = ALERT.rules.find(x=>x.id===id);
+  if(!r) return;
+  try{
+    const resp = await fetch(API+'/alert-test', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+    const d = await resp.json();
+    if(d.ok) toast('测试投递成功：'+d.msg);
+    else toast('测试投递失败：'+(d.msg||'未知错误'));
+  }catch(e){ toast('测试投递失败：'+e); }
 }
 async function alertReset(id){
   delete ALERT.fired[id];
