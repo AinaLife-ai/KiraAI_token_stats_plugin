@@ -773,7 +773,7 @@ class TokenStatsPlugin(BasePlugin):
         # 费用/估算计算缓存：记录数+最大时间戳+规则 hash 未变则直接复用（H1/H3）
         self._rules_hash = ""
         self._since_cost_cache = {}   # (url,name,model_ref,since_iso) → (fingerprint, cny, pts, matched)
-        self._range_scan_cache = {}   # (frm,to) → (fingerprint, result)
+        self._range_scan_cache = {}   # (frm,to) → (fingerprint, (units, matched))；只由 _range_scan_cost_units 写
 
         # 出错统计游标（errScanPos）：{sid: (prev_text, prev_end)}，工具循环续轮不重复计数
         self._err_cursor = {}
@@ -1348,6 +1348,48 @@ class TokenStatsPlugin(BasePlugin):
     def _range_cost_units(self, from_date: str, to_date: str):
         return self._aggs_cost_units({k: v["aggs"] for k, v in self._days.items()
                                       if from_date <= k <= to_date})
+
+    def _range_scan_cost_units(self, from_date: str, to_date: str):
+        """全量扫日志现算区间费用 → ({f"{cur}|{unit}": amt}, matched)。
+        内存 aggs 未匹配到价格规则时的兜底（保证历史费用一定显示）。
+
+        _range_scan_cache 由本方法**独占写入**，缓存值形状固定为 (fingerprint, (units, matched))。
+        WebUI /stats 与渲染图共用这一份结果，各自再转成自己的展示形状——此前两处各写一份
+        形状不同的值到同一个 (from,to) 键，互相读到对方的形状导致渲染图崩、看板费用显示 —。
+        """
+        recs = self._read_records()
+        fp = self._calc_fingerprint(recs)
+        ck = (from_date, to_date)
+        hit = self._range_scan_cache.get(ck)
+        # 命中项形状校验：不符合 (fp, (dict, matched)) 一律视为未命中重算，
+        # 绝不把非法形状交给调用方（热重载残留 / 将来新增写入方写歪都能兜住）
+        if (isinstance(hit, tuple) and len(hit) == 2 and hit[0] == fp
+                and isinstance(hit[1], tuple) and len(hit[1]) == 2
+                and isinstance(hit[1][0], dict)):
+            return hit[1]
+        units, matched = {}, False
+        for r in recs:
+            try:
+                t = _parse_ts(r["t"])
+            except Exception:
+                continue
+            d = t.strftime("%Y-%m-%d")
+            if d < from_date or d > to_date:
+                continue
+            rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
+            if rule is None:
+                continue
+            amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t)
+            if amt is None:
+                continue
+            ukey = f"{cur}|{_rule_unit(rule)}"
+            units[ukey] = units.get(ukey, 0.0) + amt
+            matched = True
+        result = (units, matched)
+        self._range_scan_cache[ck] = (fp, result)
+        if len(self._range_scan_cache) > 16:
+            self._range_scan_cache.clear()  # 有界
+        return result
 
     def _range_cost(self, from_date: str, to_date: str):
         """旧接口兼容：仅 CNY"""
@@ -2016,7 +2058,8 @@ class TokenStatsPlugin(BasePlugin):
 
     async def _alert_send_image_async(self, sid: str):
         """异步补发概况图：消息已先发，图构建好后补发（不阻塞投递）。
-        同步重活（_build_summary_html 全量聚合）丢线程执行，避免阻塞事件循环。"""
+        同步重活（_build_summary_html 全量聚合）丢线程执行，避免阻塞事件循环；
+        构建/截图失败均有兜底（见 _summary_html_safe / _render_summary_png）。"""
         try:
             sess_name = ""
             if self._sess.get("sid"):
@@ -2024,21 +2067,17 @@ class TokenStatsPlugin(BasePlugin):
                     sess_name = await self._resolve_sid_name(self._sess["sid"])
                 except Exception:
                     sess_name = ""
-            html = await asyncio.to_thread(self._build_summary_html, "", sess_name=sess_name)
-            out_dir = self._data_dir / "output"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            png = out_dir / f"summary_{int(time.time() * 1000)}_{os.urandom(3).hex()}.png"
-            wait_js = "document.querySelectorAll('img.bg').length===0 || (document.querySelector('img.bg').complete && document.querySelector('img.bg').naturalWidth>0)"
-            await render_html(html, str(png), self._browser, wait_js=wait_js)
-            await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
+            png = await self._render_summary_png("", sess_name=sess_name, use_thread=True)
             try:
-                old = sorted(out_dir.glob("summary_*.png"), key=lambda p: p.name)
-                for p in old[:-20]:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                pass
+                await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
+            except Exception as se:
+                logger.warning(f"[token_stats] 预警概况图发送失败，重试一次: {se}")
+                await asyncio.sleep(1)
+                await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
         except Exception as e:
             logger.warning(f"[token_stats] 预警概况图补发失败: {e}")
+            if self.debug_log:
+                logger.exception("[token_stats] 预警概况图补发失败详情")
 
     def _alert_rule_fired(self, r: dict) -> bool:
         st = self._alert_fired.get(str(r.get("id")))
@@ -2530,13 +2569,16 @@ class TokenStatsPlugin(BasePlugin):
 
     # ── 查询回复构建（命令 / 工具共用）──
 
-    def _fmt_cost_units(self, units: dict) -> str:
-        """按 (币种, 显示单位) 分桶的费用文本：单位留空=只显示数字"""
+    def _fmt_cost_units(self, units) -> str:
+        """按 (币种, 显示单位) 分桶的费用文本：单位留空=只显示数字。
+        非 dict 入参（缓存形状异常等）按无费用处理，不抛异常"""
+        if not isinstance(units, dict):
+            return ""
         parts = []
         for key, amt in units.items():
             if not amt:
                 continue
-            _, _, unit = key.partition("|")
+            _, _, unit = str(key).partition("|")
             parts.append(f"{unit} {amt:,.4f}" if unit else f"{amt:,.4f}")
         return " · ".join(parts)
 
@@ -2616,6 +2658,90 @@ class TokenStatsPlugin(BasePlugin):
 
     # ── 渲染图模式：查加发一体（LLM 工具触发 → 查数据 → 渲染 HTML → 截图 → 直发图片+文本摘要）──
 
+    _BG_TAG_RE = re.compile(r'<img class="bg"[^>]*>')
+
+    @staticmethod
+    def _fallback_summary_html(text: str) -> str:
+        """极简纯文本版渲染图 HTML：聚合/模板构建失败时的最后兜底，
+        无外部资源（不加载背景图）、无复杂布局，保证仍能出一张图而不是完全没图。"""
+        return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><style>
+body{{margin:0;padding:28px;background:#0f172a;color:#e2e8f0;
+font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;font-size:15px;line-height:1.9;}}
+h1{{font-size:20px;margin:0 0 14px;}}
+pre{{margin:0;white-space:pre-wrap;word-break:break-all;font-family:inherit;}}
+.note{{margin-top:16px;color:#a3b2c7;font-size:12px;}}
+</style></head><body>
+<h1>Token 用量统计</h1>
+<pre>{_esc(text)}</pre>
+<div class="note">完整看板渲染失败，已退化为纯文本版概览（详见后台日志）</div>
+</body></html>"""
+
+    async def _summary_html_safe(self, range_key: str = "", sess_name: str = "",
+                                use_thread: bool = False) -> str:
+        """构建概览 HTML，**绝不抛异常**（渲染图不再因为聚合/模板出错而整个发不出去）：
+          1) 正常构建（use_thread=True 时丢线程，避免阻塞事件循环）
+          2) 线程构建失败 → 事件循环内同步重试一次
+             （排除「后台线程读聚合字典 / 主循环同时写入」这类并发改动引发的偶发失败）
+          3) 仍失败 → 退化成纯文本版极简 HTML，仍然出图
+        """
+        if use_thread:
+            try:
+                return await asyncio.to_thread(self._build_summary_html, range_key, sess_name=sess_name)
+            except Exception as e:
+                logger.warning(f"[token_stats] 概览 HTML 线程构建失败，事件循环内重试: {e}")
+        try:
+            return self._build_summary_html(range_key, sess_name=sess_name)
+        except Exception:
+            # exception 级别打完整堆栈：只打一行 message 的话这类问题很难定位
+            logger.exception("[token_stats] 概览 HTML 构建失败，退化为纯文本版渲染图")
+        try:
+            text = self._build_summary_text(range_key)
+        except Exception:
+            logger.exception("[token_stats] 纯文本概览也构建失败")
+            text = "统计数据暂不可用（详见后台日志）"
+        return self._fallback_summary_html(text)
+
+    async def _render_summary_png(self, range_key: str = "", sess_name: str = "",
+                                  use_thread: bool = False) -> Path:
+        """概览 HTML → PNG，成功返回文件路径，彻底失败才抛异常（浏览器不可用等环境问题）。
+        两次尝试：第 2 次剥掉背景图 <img class="bg">（外网随机图 / data URI 背景是渲染里
+        唯一的外部依赖，去掉后纯色背景一定能画出来）。截图产出空文件也算失败并重试。"""
+        html_doc = await self._summary_html_safe(range_key, sess_name=sess_name, use_thread=use_thread)
+        out_dir = self._data_dir / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        wait_js = ("document.querySelectorAll('img.bg').length===0 || "
+                   "(document.querySelector('img.bg').complete && document.querySelector('img.bg').naturalWidth>0)")
+        last_err = None
+        for attempt in (1, 2):
+            png = out_dir / f"summary_{int(time.time() * 1000)}_{os.urandom(3).hex()}.png"
+            try:
+                await render_html(html_doc, str(png), self._browser, wait_js=wait_js)
+                if png.exists() and png.stat().st_size > 0:
+                    self._prune_render_output(out_dir)
+                    return png
+                raise RuntimeError("截图产出空文件")
+            except Exception as e:
+                last_err = e
+                try:
+                    png.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if attempt == 1:
+                    stripped = self._BG_TAG_RE.sub("", html_doc)
+                    logger.warning(f"[token_stats] 渲染截图失败（第 1 次），去掉背景图重试: {e}")
+                    html_doc = stripped
+        raise RuntimeError(f"渲染截图两次均失败: {last_err}")
+
+    @staticmethod
+    def _prune_render_output(out_dir: Path):
+        """清理旧渲染图：只保留最近 20 张（按文件名时间戳排序，最旧先删）"""
+        try:
+            old = sorted(out_dir.glob("summary_*.png"), key=lambda p: p.name)
+            for p in old[:-20]:
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     def _render_bg_url(self) -> str:
         """渲染图背景 URL：优先用户自定义背景（前端同步到插件数据目录 bg_custom.jpg，
         转 data URI 内联，渲染不依赖外网）；否则返回线上随机图 URL（由 Playwright
@@ -2640,17 +2766,19 @@ class TokenStatsPlugin(BasePlugin):
                 f'<polyline points="{pts}" fill="none" stroke="rgba(56,189,248,.85)" stroke-width="1.4"/>'
                 f'<polygon points="0,26 {pts} 44,26" fill="rgba(56,189,248,.13)"/></svg>')
 
-    def _render_cost_bits(self, units: dict) -> str:
-        """费用片段：按 (币种, 显示单位) 分桶 → HTML span"""
+    def _render_cost_bits(self, units) -> str:
+        """费用片段：按 (币种, 显示单位) 分桶 → HTML span。
+        非 dict 入参（缓存形状异常等）按无费用处理，不抛异常"""
         bits = []
-        for key, amt in units.items():
-            if not amt:
-                continue
-            _, _, unit = key.partition("|")
-            if unit:
-                bits.append(f'<span class="pts">{amt:,.4f} {_esc(unit)}</span>')
-            else:
-                bits.append(f'<span class="pts">{amt:,.4f}</span>')
+        if isinstance(units, dict):
+            for key, amt in units.items():
+                if not amt:
+                    continue
+                _, _, unit = str(key).partition("|")
+                if unit:
+                    bits.append(f'<span class="pts">{amt:,.4f} {_esc(unit)}</span>')
+                else:
+                    bits.append(f'<span class="pts">{amt:,.4f}</span>')
         return " + ".join(bits) if bits else '<span class="cost">—</span>'
 
     def _build_summary_html(self, range_key: str = "", sess_name: str = "") -> str:
@@ -2676,41 +2804,13 @@ class TokenStatsPlugin(BasePlugin):
                 return ""
             return f'<div class="d">耗时 均{_fmt_dur(a)}·快{_fmt_dur(mn)}·慢{_fmt_dur(mx)}</div>'
 
-        # 费用兜底：内存 aggs 未匹配到规则时，直接遍历记录现算（与 WebUI /stats 同源逻辑，
-        # 保证历史费用一定显示；按 (frm,to,指纹) 缓存避免重复全扫）
+        # 费用兜底：内存 aggs 未匹配到规则时，走共享的全量扫描（_range_scan_cost_units
+        # 独占 _range_scan_cache，形状固定，与 /stats 复用同一份结果）
         def _cost_units_any(frm, to, units, matched):
             if matched and units:
                 return units, matched
             try:
-                recs = self._read_records()
-                fp = self._calc_fingerprint(recs)
-                ck = (frm, to)
-                hit = self._range_scan_cache.get(ck)
-                if hit and hit[0] == fp:
-                    return hit[1]
-                units2, matched2 = {}, False
-                for r in recs:
-                    try:
-                        t = _parse_ts(r["t"])
-                    except Exception:
-                        continue
-                    d = t.strftime("%Y-%m-%d")
-                    if d < frm or d > to:
-                        continue
-                    rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
-                    if rule is None:
-                        continue
-                    amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t)
-                    if amt is None:
-                        continue
-                    ukey = f"{cur}|{_rule_unit(rule)}"
-                    units2[ukey] = units2.get(ukey, 0.0) + amt
-                    matched2 = True
-                result = (units2, matched2)
-                self._range_scan_cache[ck] = (fp, result)
-                if len(self._range_scan_cache) > 16:
-                    self._range_scan_cache.clear()
-                return result
+                return self._range_scan_cost_units(frm, to)
             except Exception:
                 return units, matched
 
@@ -2865,7 +2965,13 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
 
     async def _build_summary_image(self, event: KiraMessageBatchEvent, range_key: str = "") -> str:
         """查加发一体：查数据 → 渲染 HTML → Playwright 截图 → 直发图片 + 文本摘要。
-        渲染失败自动降级纯文本（不吞消息）。"""
+
+        分层兜底，尽最大努力保证图一定发出去：
+          · HTML 构建出错 → 退化纯文本版 HTML（仍出图，见 _summary_html_safe）
+          · 截图出错 → 去掉背景图重试一次（见 _render_summary_png）
+          · 发送出错 → 重试一次，仍失败才降级纯文本
+          · 浏览器不可用等环境问题 → 降级纯文本（原行为，不吞消息）
+        """
         sid = event.sid
         try:
             # async 上下文 await 会话昵称（_build_summary_html 是同步方法，不能内部 await）
@@ -2875,27 +2981,21 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
                     sess_name = await self._resolve_sid_name(self._sess["sid"])
                 except Exception:
                     sess_name = ""
-            html = self._build_summary_html(range_key, sess_name=sess_name)
-            out_dir = self._data_dir / "output"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            png = out_dir / f"summary_{int(time.time() * 1000)}_{os.urandom(3).hex()}.png"
-            # 等待背景图（<img>）加载完成；无背景或加载失败直接继续
-            wait_js = "document.querySelectorAll('img.bg').length===0 || (document.querySelector('img.bg').complete && document.querySelector('img.bg').naturalWidth>0)"
-            await render_html(html, str(png), self._browser, wait_js=wait_js)
-            # 直发图片
-            await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
-            # 清理旧渲染图：只保留最近 20 张（按文件名时间戳排序，最旧先删）
+            png = await self._render_summary_png(range_key, sess_name=sess_name)
+            # 直发图片：偶发网络/适配器抖动重试一次（图已经渲染好了，白丢太可惜）
             try:
-                old = sorted(out_dir.glob("summary_*.png"), key=lambda p: p.name)
-                for p in old[:-20]:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                pass
+                await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
+            except Exception as se:
+                logger.warning(f"[token_stats] 概览图发送失败，重试一次: {se}")
+                await asyncio.sleep(1)
+                await self.ctx.message_processor.send_message_chain(sid, MessageChain([Image(image=str(png))]))
             # 文本摘要（bot 自行组织语言转述）
             text = self._build_summary_text(range_key)
             return f"已发送渲染概览图到会话。数据摘要：\n{text}"
         except Exception as e:
             logger.warning(f"[token_stats] 渲染图失败，降级纯文本: {e}")
+            if self.debug_log:
+                logger.exception("[token_stats] 渲染图失败详情")
             return self._build_summary_text(range_key)
 
     async def _build_query_reply(self, arg: str) -> str:
@@ -3265,46 +3365,19 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             _a = self._range_agg(_f, _t)
             ranges[_k] = _with_dur(_a, _a)
         # 费用：按 (币种, 显示单位) 分桶，前端按需展示
+        def _units_to_arr(units: dict):
+            return [{"unit": uu, "amt": f"{uamt:,.4f}"} for ukey, uamt in (units or {}).items() if uamt
+                    for uu in [ukey.partition("|")[2]]]
+
         def _cost_pair(k):
             units, matched = k
-            arr = [{"unit": uu, "amt": f"{uamt:,.4f}"} for ukey, uamt in units.items() if uamt
-                   for uu in [ukey.partition("|")[2]]]
-            return {"units": arr, "matched": matched}
+            return {"units": _units_to_arr(units), "matched": matched}
 
-        # 兜底：内存 aggs 未匹配到规则时，直接遍历记录现算（保证历史费用一定显示）
-        # H3：按 (frm,to,记录数,最新时间戳,规则hash) 缓存，轮询不再每秒全扫
+        # 兜底：内存 aggs 未匹配到规则时，走共享的全量扫描（_range_scan_cost_units
+        # 独占 _range_scan_cache，与渲染图复用同一份结果，各自再转展示形状）
         def _cost_pair_scan(frm, to):
-            recs = self._read_records()
-            fp = self._calc_fingerprint(recs)
-            ck = (frm, to)
-            hit = self._range_scan_cache.get(ck)
-            if hit and hit[0] == fp:
-                return hit[1]
-            units, matched = {}, False
-            for r in recs:
-                try:
-                    t = _parse_ts(r["t"])
-                except Exception:
-                    continue
-                d = t.strftime("%Y-%m-%d")
-                if d < frm or d > to:
-                    continue
-                rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
-                if rule is None:
-                    continue
-                amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t)
-                if amt is None:
-                    continue
-                ukey = f"{cur}|{_rule_unit(rule)}"
-                units[ukey] = units.get(ukey, 0.0) + amt
-                matched = True
-            arr = [{"unit": uu, "amt": f"{uamt:,.4f}"} for ukey, uamt in units.items() if uamt
-                   for uu in [ukey.partition("|")[2]]]
-            result = {"units": arr, "matched": matched}
-            self._range_scan_cache[ck] = (fp, result)
-            if len(self._range_scan_cache) > 16:
-                self._range_scan_cache.clear()  # 有界
-            return result
+            units, matched = self._range_scan_cost_units(frm, to)
+            return {"units": _units_to_arr(units), "matched": matched}
 
         def _cost_any(k, frm, to):
             cp = _cost_pair(k)
