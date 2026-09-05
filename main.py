@@ -612,14 +612,8 @@ class TokenStatsPlugin(BasePlugin):
         # ── 余额监测 ──
         bal = cfg.get("section_balance", {})
         self.enable_balance = bool(bal.get("enable_balance", True))
-        interval = bal.get("balance_interval", 600)
-        self.balance_interval = max(60, int(interval) if interval is not None else 600)
-        # 旧版默认 10 秒轮询自动迁移：10 秒是对第三方站点的持续负载（多实例聚合不小），
-        # 且余额是慢变量，600 秒检测零感知损失。未主动改过的（配置里还是旧默认 10）统一迁到 600；
-        # 主动设置的其他值保留。bot 主动/用户立即检测仍即时探测，不受轮询间隔影响
-        if interval == 10:
-            self.balance_interval = 600
-            logger.info("[token_stats] 余额轮询默认间隔已从 10s 自动迁移到 600s（良性轮询）")
+        interval = bal.get("balance_interval", 10)
+        self.balance_interval = max(5, int(interval) if interval is not None else 10)
         # 会话昵称解析（OneBot）缓存与适配器
         self._ada_obj = None
         self._name_cache = {}
@@ -1912,7 +1906,7 @@ class TokenStatsPlugin(BasePlugin):
         try:
             while True:
                 await self._probe_all()
-                await asyncio.sleep(max(60, self.balance_interval))
+                await asyncio.sleep(max(5, self.balance_interval))
         except asyncio.CancelledError:
             return
         except Exception:
@@ -2276,7 +2270,7 @@ class TokenStatsPlugin(BasePlugin):
                             self._alert_check_rule(r)
                 except Exception as e:
                     logger.warning(f"[token_stats] 预警检查异常: {e}")
-                await asyncio.sleep(max(60, self.balance_interval))
+                await asyncio.sleep(max(5, self.balance_interval))
         except asyncio.CancelledError:
             return
         except Exception:
@@ -3109,13 +3103,13 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             "properties": {
                 "range": {
                     "type": "string",
-                    "enum": ["", "session", "today", "d7", "d30", "total"],
+                    "enum": ["session", "today", "d7", "d30", "total"],
                     "description": "统计范围：留空返回全部概览，session=本次会话，today=今天，d7=近7天，d30=近30天，total=累计",
                     "default": "",
                 },
                 "render": {
                     "type": "string",
-                    "enum": ["", "image", "text"],
+                    "enum": ["image", "text"],
                     "description": "输出形式：留空=跟随插件配置（默认纯文本），image=渲染成概览图片并直接发送到会话，text=纯文本。用户想要图片/卡片/好看的形式时传 image",
                     "default": "",
                 },
@@ -3915,7 +3909,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
                         v = _mask_api_key(str(v))
                     item[k] = v
             sources.append(item)
-        return {"interval": max(60, self.balance_interval), "unit": self.balance_unit, "sources": sources}
+        return {"interval": max(5, self.balance_interval), "unit": self.balance_unit, "sources": sources}
 
     @register.api(method="POST", path="/bg-sync", auth=True)
     async def api_bg_sync(self, request: Request):
@@ -4013,7 +4007,7 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         except Exception:
             return {"ok": False, "msg": "请求体不是合法 JSON"}
         try:
-            interval = max(60, int(body.get("interval") or 600))
+            interval = max(5, int(body.get("interval") or 10))
         except (TypeError, ValueError):
             return {"ok": False, "msg": "间隔必须是正整数（秒）"}
         try:
@@ -4572,7 +4566,7 @@ tr.cur td{background:rgba(52,211,153,.07)}
       <button class="btn" id="balRefresh">立即探测</button>
       <button class="btn" id="balEdit">＋ 添加监测源</button>
       <span style="color:var(--dim);font-size:12px">轮询间隔</span>
-      <input id="balInterval" type="number" min="60" style="width:64px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px;font-size:12px" value="600">
+      <input id="balInterval" type="number" min="5" style="width:64px;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px;font-size:12px" value="10">
       <span style="color:var(--dim);font-size:12px">秒</span>
       <button class="btn" id="balIntervalSave">保存</button>
       <span style="color:var(--dim);font-size:12px" id="balInfo"></span>
