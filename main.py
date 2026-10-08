@@ -46,8 +46,7 @@ except Exception:  # pragma: no cover
 
 from fastapi import Request
 
-from core.plugin import BasePlugin, logger, on, Priority, register
-from core.plugin.plugin_registry import PluginPage, PageMenu
+from core.plugin import BasePlugin, logger, on, Priority, register, PluginPage, PageMenu
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import MessageChain
 from core.chat.message_elements import Text, Image
@@ -379,12 +378,6 @@ def _rule_cost_ex(r: dict, input_t: int, output_t: int, cached_t: int, t: dateti
     return amt, _rule_currency(r)
 
 
-def _rule_cost(r: dict, input_t: int, output_t: int, cached_t: int, t: datetime) -> float:
-    """单币种包装（仅 CNY 金额，用于旧接口兼容）"""
-    amt, _ = _rule_cost_ex(r, input_t, output_t, cached_t, t)
-    return amt
-
-
 # 文件 IO 线程锁（日志追加/裁剪/热读缓存并发保护）
 _IO_LOCK = threading.RLock()
 
@@ -424,11 +417,32 @@ _JSONL_LINES: dict = {}
 _LOG_TRIMMED: set = set()
 
 
+def _trim_jsonl(path: Path, max_size: int):
+    """后台线程裁剪日志：只保留尾部 max_size 行（_IO_LOCK 与追加/读取互斥）。
+    挪出写热路径：全量读+重写在 100k 行时约 100-300ms，此前在事件循环上同步执行。"""
+    try:
+        with _IO_LOCK:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if len(lines) > max_size:
+                lines = lines[-max_size:]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                _LOG_TRIMMED.add(str(path))
+            _JSONL_LINES[str(path)] = len(lines)
+    except Exception as e:
+        logger.warning(f"[token_stats] 日志裁剪失败: {e}")
+
+
 def _append_jsonl(path: Path, rec: dict, max_size: int = 0):
+    """追加一条记录；返回值约定：False=写入成功且未裁剪（调用方可增量更新缓存）；
+    True=已触发（异步）裁剪；None=写入失败——后两种调用方都必须让热读缓存整体失效，
+    避免缓存出现文件里没有的记录。"""
+    trim_pending = False
+    wrote = False
     try:
         with _IO_LOCK:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            wrote = True
             # 裁剪：超过 max_size 20% 才裁一次，只保留尾部（0 = 不裁剪）；
             # 行数走内存计数（首次读一次盘），避免每条都全量读盘 + O(N²) 重写
             if max_size and max_size > 0:
@@ -441,14 +455,13 @@ def _append_jsonl(path: Path, rec: dict, max_size: int = 0):
                         n = 0
                 n += 1
                 if n > max_size * 1.2:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-                    if len(lines) > max_size:
-                        path.write_text("\n".join(lines[-max_size:]) + "\n", encoding="utf-8")
-                        _LOG_TRIMMED.add(key)
-                        n = max_size
+                    trim_pending = True
+                    threading.Thread(target=_trim_jsonl, args=(path, max_size), daemon=True).start()
+                    n = max_size  # 预估裁剪后行数，线程完成后按实际校准
                 _JSONL_LINES[key] = n
     except Exception as e:
         logger.warning(f"[token_stats] 日志写入失败: {e}")
+    return trim_pending if wrote else None
 
 
 def _parse_ts(s: str):
@@ -565,6 +578,7 @@ class TokenStatsPlugin(BasePlugin):
         # 渲染图是否显示余额（默认开；涉及账户余额，用户可自行关闭更安全）
         self.tool_render_balance = bool(tool.get("tool_render_balance", True))
         self._browser = BrowserManager()
+        self._browser_task: asyncio.Task = None
 
         # ── 价格规则 ──
         pr = cfg.get("section_pricing", {})
@@ -723,6 +737,7 @@ class TokenStatsPlugin(BasePlugin):
         # 已触发状态：{rule_id: {count, at, day}}（balance 滞回：余额回升超过阈值才重置；
         # token/cost 单调递增：达阈值触发一次，跨天自动重置）
         self._alert_fired = {}
+        self._alert_save_at = 0.0      # 预警状态持久化节流时间戳
         # token/cost 当天统计缓存：{(len,last_t,rules_hash,target,session): (v, units)}
         self._alert_usage_cache = {}
         self._alert_task: asyncio.Task = None
@@ -810,9 +825,11 @@ class TokenStatsPlugin(BasePlugin):
         self._load_history()
         self._load_bal_states()
         self._load_err_stats()
+        self._load_alert_state()
 
         # 渲染图模式：后台检测浏览器（系统 Chrome/Edge → 内置 Chromium → 自动下载），不阻塞加载
-        asyncio.ensure_future(self._browser.initialize())
+        # 任务留引用，terminate 时取消（热重载不再遗留孤儿任务下载 Chromium）
+        self._browser_task = asyncio.ensure_future(self._browser.initialize())
         logger.info("[token_stats] 渲染图浏览器检测已在后台启动")
 
         # 后台日志 ERROR 扫描：扫描 data 目录下 log.log*（含轮转文件），按 ino 增量
@@ -838,6 +855,14 @@ class TokenStatsPlugin(BasePlugin):
         logger.info("[token_stats] Token 用量统计已就绪")
 
     async def terminate(self):
+        if self._browser_task:
+            if not self._browser_task.done():
+                self._browser_task.cancel()
+                try:
+                    await self._browser_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._browser_task = None
         if self._bal_task and not self._bal_task.done():
             self._bal_task.cancel()
             try:
@@ -859,8 +884,9 @@ class TokenStatsPlugin(BasePlugin):
             except asyncio.CancelledError:
                 pass
             self._log_err_task = None
-        # 退出前强制落盘错误统计（绕过节流，热重载/重启不丢）
+        # 退出前强制落盘错误统计与预警触发状态（绕过节流，热重载/重启不丢）
         self._maybe_save_err_stats(force=True)
+        self._save_alert_state(force=True)
 
     # ── 历史加载 ──
 
@@ -893,6 +919,26 @@ class TokenStatsPlugin(BasePlugin):
 
     def _invalidate_rec_cache(self):
         self._rec_cache["list"] = None
+
+    def _note_append(self, rec: dict, trim_pending: bool):
+        """新记录落盘后维护热读缓存：日志只有本插件这一个写者（_IO_LOCK 保护），
+        未裁剪时可安全把新记录直接追加进缓存——下次查询 O(1)，不再全量重读重解析；
+        裁剪/状态不符时整体失效回退全量重读。下游指纹 (len, last_t, rules_hash) 语义不变。"""
+        c = self._rec_cache
+        if trim_pending is not False or c["list"] is None or c["path"] != str(self._log_path):
+            # True=裁剪中（文件即将重写）；None=写入失败（记录没落盘）——都不能增量
+            self._invalidate_rec_cache()
+            return
+        try:
+            # _IO_LOCK 与裁剪线程互斥：stat+追加必须原子于裁剪重写，
+            # 否则缓存可能残留已被裁掉的旧记录（与文件分叉）
+            with _IO_LOCK:
+                st = self._log_path.stat()
+                c["list"].append(rec)
+                c["mtime"] = st.st_mtime
+                c["len"] = st.st_size
+        except Exception:
+            self._invalidate_rec_cache()
 
     def _calc_fingerprint(self, recs=None):
         """计算结果缓存指纹：记录数 + 最新时间戳 + 规则内容 hash，任一变化即失效重算"""
@@ -1131,7 +1177,8 @@ class TokenStatsPlugin(BasePlugin):
             self._sweep_stale_sessions()
             self._pending[sid] = {"text": text, "source": None, "steps": 0, "at": time.time(), "new_msg": True}
 
-        if not self.enable_command:
+        # 总开关关闭时命令一并失效（schema 文档承诺「工具与命令全部失效」）
+        if not self.enabled or not self.enable_command:
             return
         if not text:
             return
@@ -1165,6 +1212,21 @@ class TokenStatsPlugin(BasePlugin):
         await self.ctx.message_processor.send_message_chain(sid, MessageChain([Text(reply)]))
         event.discard(force=True)
         event.stop()
+
+    # 本插件注册的全部工具名（enable_tool=False 时从每轮 tool_set 移除）
+    _TOOL_NAMES = ("query_token_stats", "query_token_usage", "query_token_records", "query_balance")
+
+    @on.llm_request(priority=Priority.LOW)
+    async def on_llm_request(self, event, req, tag_set, *_):
+        """工具开关落实：关闭时把本插件工具从本轮 tool_set 移除——
+        模型看不到就不会调，且 4 个工具 schema 不再注入 prompt（省 token）；
+        开启时零改动。ToolSet.remove 两世代（2.x/3.0）同签名。"""
+        if self.enable_tool:
+            return
+        try:
+            req.tool_set.remove(*self._TOOL_NAMES)
+        except Exception:
+            pass
 
     @on.llm_response(priority=Priority.LOW)
     async def on_llm_response(self, event, resp: LLMResponse, *_):
@@ -1239,8 +1301,8 @@ class TokenStatsPlugin(BasePlugin):
         async with self._lock:
             self._apply_rec(rec)
             self._apply_session(rec)
-            _append_jsonl(self._log_path, rec, self.max_log_size)
-            self._invalidate_rec_cache()
+            trim_pending = _append_jsonl(self._log_path, rec, self.max_log_size)
+            self._note_append(rec, trim_pending)
 
         # 预警提醒：token/cost 类规则每轮实时检查（balance 类由后台循环检查）
         if self.enable_alert and self.alert_rules:
@@ -1341,13 +1403,31 @@ class TokenStatsPlugin(BasePlugin):
         pts = sum(v for k, v in units.items() if k.startswith("积分|"))
         return cny, pts, matched
 
+    def _merge_range_aggs(self, from_date: str, to_date: str) -> dict:
+        """合并区间内各天的 aggs 桶 → {mkey: [off, peak]}（_aggs_cost_* 期望的形状）。
+        修复：此前 _range_cost_* 直接把 {day: aggs} 传给 _aggs_cost_*（期望 {mkey: slots}），
+        内存快路径永远匹配不到规则 → 恒 matched=False，四区间费用全部退化为全量扫日志兜底，
+        且无兜底的文本概览（_build_summary_text）静默丢费用。"""
+        merged = {}
+        for k, v in self._days.items():
+            if from_date <= k <= to_date:
+                for mkey, slots in v["aggs"].items():
+                    s2 = merged.setdefault(mkey, [None, None])
+                    for i in (0, 1):
+                        if slots[i] is None:
+                            continue
+                        if s2[i] is None:
+                            s2[i] = {"i": 0, "o": 0, "c": 0}
+                        s2[i]["i"] += slots[i]["i"]
+                        s2[i]["o"] += slots[i]["o"]
+                        s2[i]["c"] += slots[i]["c"]
+        return merged
+
     def _range_cost_ex(self, from_date: str, to_date: str):
-        return self._aggs_cost_ex({k: v["aggs"] for k, v in self._days.items()
-                                   if from_date <= k <= to_date})
+        return self._aggs_cost_ex(self._merge_range_aggs(from_date, to_date))
 
     def _range_cost_units(self, from_date: str, to_date: str):
-        return self._aggs_cost_units({k: v["aggs"] for k, v in self._days.items()
-                                      if from_date <= k <= to_date})
+        return self._aggs_cost_units(self._merge_range_aggs(from_date, to_date))
 
     def _range_scan_cost_units(self, from_date: str, to_date: str):
         """全量扫日志现算区间费用 → ({f"{cur}|{unit}": amt}, matched)。
@@ -1369,12 +1449,13 @@ class TokenStatsPlugin(BasePlugin):
             return hit[1]
         units, matched = {}, False
         for r in recs:
+            # 日前缀预筛（ISO 前 10 字符即日期，与解析后按日过滤等价），解析只用于命中记录
+            d = str(r.get("t", ""))[:10]
+            if d < from_date or d > to_date:
+                continue
             try:
                 t = _parse_ts(r["t"])
             except Exception:
-                continue
-            d = t.strftime("%Y-%m-%d")
-            if d < from_date or d > to_date:
                 continue
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
             if rule is None:
@@ -1391,20 +1472,11 @@ class TokenStatsPlugin(BasePlugin):
             self._range_scan_cache.clear()  # 有界
         return result
 
-    def _range_cost(self, from_date: str, to_date: str):
-        """旧接口兼容：仅 CNY"""
-        cny, _, matched = self._range_cost_ex(from_date, to_date)
-        return cny if matched else None
-
     def _session_cost_ex(self):
         return self._aggs_cost_ex(self._sess["aggs"])
 
     def _session_cost_units(self):
         return self._aggs_cost_units(self._sess["aggs"])
-
-    def _session_cost(self):
-        cny, _, matched = self._session_cost_ex()
-        return cny if matched else None
 
     def _channel_cost_ex(self, url: str, name: str, model_ref: str = ""):
         """某渠道（URL/渠道名包含匹配）在全部历史里的计费 → (cny, pts, matched)；
@@ -1442,11 +1514,6 @@ class TokenStatsPlugin(BasePlugin):
         self._since_cost_cache[ckey] = (fp, cny, pts, matched)
         return cny, pts, matched
 
-    def _channel_cost(self, url: str, name: str) -> float:
-        """旧接口兼容：仅 CNY（preset 旧模型扣减用）"""
-        cny, _, matched = self._channel_cost_ex(url, name)
-        return cny if matched else 0.0
-
     def _channel_cost_since_ex(self, url: str, name: str, since: datetime, model_ref: str = ""):
         """自 since 时刻以来（含）的渠道计费 → (cny, pts, matched)。
         逐条扫日志，按 t >= since 过滤；双币种分开累计。
@@ -1458,7 +1525,11 @@ class TokenStatsPlugin(BasePlugin):
         if hit and hit[0] == fp:
             return hit[1], hit[2], hit[3]
         cny, pts, matched = 0.0, 0.0, False
+        since_day = since.strftime("%Y-%m-%d")
         for r in recs:
+            # 日前缀预筛：早于 since 当天的记录必早于 since，直接跳过不解析
+            if str(r.get("t", ""))[:10] < since_day:
+                continue
             try:
                 t = _parse_ts(r["t"])
             except Exception:
@@ -2098,6 +2169,7 @@ class TokenStatsPlugin(BasePlugin):
         else:
             self._alert_fired[rid] = {"count": 1, "at": time.time(),
                                       "day": datetime.now().strftime("%Y-%m-%d")}
+        self._save_alert_state()
 
     def _alert_step_ok(self, r: dict, value: float, threshold: float) -> bool:
         """step 模式（每新增 ≥N 提醒一次）：当前档位 = floor(value/threshold)，
@@ -2122,9 +2194,11 @@ class TokenStatsPlugin(BasePlugin):
         st = self._alert_fired.get(rid)
         if isinstance(st, dict):
             st["step"] = int(value // threshold)
+            self._save_alert_state()
 
     def _alert_clear_fired(self, r: dict):
         self._alert_fired.pop(str(r.get("id")), None)
+        self._save_alert_state()
 
     def _alert_max_ok(self, r: dict) -> bool:
         """最大连续提醒次数：默认 1（只提醒 1 次）。
@@ -2160,6 +2234,7 @@ class TokenStatsPlugin(BasePlugin):
             return False
         if st.get("day") != datetime.now().strftime("%Y-%m-%d"):
             self._alert_fired.pop(rid, None)
+            self._save_alert_state()
             return True
         return False
 
@@ -2203,11 +2278,13 @@ class TokenStatsPlugin(BasePlugin):
             v = 0
             units = {}
             for rec in recs:
+                # 日前缀预筛：_fmt_ts 统一写 ISO，前 10 字符即日期，与解析后按日过滤等价；
+                # 非 ISO 的坏记录前缀必不匹配今天（匹配则 _parse_ts 仍可解析），语义不变
+                if str(rec.get("t", ""))[:10] != today:
+                    continue
                 try:
                     t = _parse_ts(rec.get("t", ""))
                 except Exception:
-                    continue
-                if t.strftime("%Y-%m-%d") != today:
                     continue
                 if target and target not in str(rec.get("s", "") or ""):
                     continue
@@ -2497,6 +2574,39 @@ class TokenStatsPlugin(BasePlugin):
             p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
+
+    def _alert_state_path(self):
+        return (self._data_dir / "alert_state.json") if self._data_dir else None
+
+    def _save_alert_state(self, force: bool = False):
+        """预警已触发状态持久化（节流 30s，force 绕过节流）：
+        热重载/重启后 once/step 规则不重复提醒（此前保存配置触发热重载即丢失状态）"""
+        now = time.time()
+        if not force and now - self._alert_save_at < 30:
+            return
+        self._alert_save_at = now
+        p = self._alert_state_path()
+        if p is None:
+            return
+        try:
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._alert_fired, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)  # 原子写
+        except Exception:
+            pass
+
+    def _load_alert_state(self):
+        """加载持久化的预警触发状态；兼容旧格式 float 时间戳"""
+        p = self._alert_state_path()
+        if p is None:
+            return
+        try:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._alert_fired = data
+        except Exception:
+            self._alert_fired = {}
 
     def _load_err_stats(self):
         """加载持久化的错误统计与扫描游标（热重载/重启恢复）"""
@@ -3075,12 +3185,13 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
             any_matched = False
 
             for r in self._read_records():
+                # 日前缀预筛（ISO 前 10 字符即日期，与解析后按日过滤等价），解析只用于命中记录
+                day = str(r.get("t", ""))[:10]
+                if day < f or day > t:
+                    continue
                 try:
                     t_dt = _parse_ts(r["t"])
                 except Exception:
-                    continue
-                day = t_dt.strftime("%Y-%m-%d")
-                if day < f or day > t:
                     continue
                 if not (self._ai_filter_hit(r.get("m", ""), model)
                         and self._ai_filter_hit(r.get("ch", ""), channel)
@@ -3224,8 +3335,8 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         },
     )
     async def query_token_stats(self, event: KiraMessageBatchEvent, range: str = "all", render: str = "auto") -> str:
-        if not self.enabled:
-            return "Token 统计未启用（插件配置页 → 基础设置）"
+        if not self.enabled or not self.enable_tool:
+            return "Token 统计工具未启用（插件配置页 → 基础设置 / Bot 工具）"
         try:
             # 工具查询余额时先即时探测，保证拿到最新值（与 api-balance 插件行为一致）
             if self.tool_include_balance and self.enable_balance and self.balance_sources:
@@ -3276,8 +3387,8 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
     async def query_token_usage(self, event: KiraMessageBatchEvent, dim: str = "", range: str = "",
                                 from_date: str = "", to_date: str = "", model: str = "", channel: str = "",
                                 source: str = "", top: int = 0) -> str:
-        if not self.enabled:
-            return "Token 统计未启用（插件配置页 → 基础设置）"
+        if not self.enabled or not self.enable_tool:
+            return "Token 统计工具未启用（插件配置页 → 基础设置 / Bot 工具）"
         try:
             return self._build_ai_usage(dim, range, from_date, to_date, model, channel, source, top)
         except Exception as e:
@@ -3301,8 +3412,8 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
     )
     async def query_token_records(self, event: KiraMessageBatchEvent, n: int = 0, model: str = "",
                                   channel: str = "", source: str = "", minInput: int = 0) -> str:
-        if not self.enabled:
-            return "Token 统计未启用（插件配置页 → 基础设置）"
+        if not self.enabled or not self.enable_tool:
+            return "Token 统计工具未启用（插件配置页 → 基础设置 / Bot 工具）"
         try:
             return self._build_ai_records(n or None, model, channel, source, minInput or None)
         except Exception as e:
@@ -3319,8 +3430,8 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         },
     )
     async def query_balance(self, event: KiraMessageBatchEvent) -> str:
-        if not self.enabled:
-            return "Token 统计未启用（插件配置页 → 基础设置）"
+        if not self.enabled or not self.enable_tool:
+            return "Token 统计工具未启用（插件配置页 → 基础设置 / Bot 工具）"
         if not self.enable_balance or not self.balance_sources:
             return "未启用余额监测或未配置余额源（插件配置页 → 余额监测）"
         try:
@@ -3516,12 +3627,13 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         by_source, by_channel, by_model, by_sid = {}, {}, {}, {}
         total = {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False}
         for r in self._read_records():
+            # 日前缀预筛（ISO 前 10 字符即日期，与解析后按日过滤等价），解析只用于命中记录
+            day = str(r.get("t", ""))[:10]
+            if day < frm or day > to:
+                continue
             try:
                 t = _parse_ts(r["t"])
             except Exception:
-                continue
-            day = t.strftime("%Y-%m-%d")
-            if day < frm or day > to:
                 continue
             i, o, c, v = r.get("i", 0), r.get("o", 0), r.get("c", 0), r.get("v", 0)
             dval = _rec_dur(r)
@@ -3677,12 +3789,13 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
 
         sessions = {}
         for r in self._read_records():
+            # 日前缀预筛（ISO 前 10 字符即日期，与解析后按日过滤等价），解析只用于命中记录
+            day = str(r.get("t", ""))[:10]
+            if day < frm or day > to:
+                continue
             try:
                 t = _parse_ts(r["t"])
             except Exception:
-                continue
-            day = t.strftime("%Y-%m-%d")
-            if day < frm or day > to:
                 continue
             sid = r.get("sid", "") or "未知"
             a = sessions.setdefault(sid, {"r": 0, "i": 0, "o": 0, "c": 0, "v": 0, "units": {}, "matched": False, "last_at": "",
@@ -3910,14 +4023,15 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         """Top8 模型（费用分色图例用）；frm/to 非空时只统计该日期范围（按天）"""
         top = {}
         for r in self._read_records():
+            # 日前缀预筛（ISO 前 10 字符即日期，与解析后按日过滤等价），解析只用于命中记录
+            if frm or to:
+                d = str(r.get("t", ""))[:10]
+                if (frm and d < frm) or (to and d > to):
+                    continue
             try:
                 t = _parse_ts(r["t"])
             except Exception:
                 continue
-            if frm or to:
-                d = t.strftime("%Y-%m-%d")
-                if (frm and d < frm) or (to and d > to):
-                    continue
             rule = _match_rule(self.rules, r.get("ch", ""), r.get("m", ""), r.get("h", ""))
             amt, cur = _rule_cost_ex(rule, r.get("i", 0), r.get("o", 0), r.get("c", 0), t) if rule else (None, "CNY")
             if amt is None:
@@ -4258,8 +4372,10 @@ tr.cur td{{background:rgba(52,211,153,.07);}}
         rid = str(body.get("id") or "").strip()
         if rid:
             self._alert_fired.pop(rid, None)
+            self._save_alert_state()
             return {"ok": True, "msg": f"已重置规则 {rid}"}
         self._alert_fired.clear()
+        self._save_alert_state()
         return {"ok": True, "msg": "已重置全部规则"}
 
     @register.api(method="GET", path="/alert-sources", auth=True)
@@ -5396,7 +5512,7 @@ setInterval(()=>{
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadOv(); });
 
 loadOv();
-setInterval(loadOv, 4000);
+setInterval(()=>{ if(!document.hidden) loadOv(); }, 4000);
 // 随机背景（默认开，右下角 👕 点击关闭）+ 自定义背景池（🖼 单击选图、双击清除；与挂件共享 localStorage）
 (function(){
   const BG_KEY = 'tsWidgetSkinBg', CBG_KEY = 'tsWidgetCustomBg';
@@ -6037,7 +6153,8 @@ async function refresh(){
   }
 }
 refresh();
-setInterval(refresh, 5000);
+setInterval(()=>{ if(!document.hidden) refresh(); }, 5000);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) refresh(); });
 // 随机背景（默认开，右下角 👕 点击关闭）+ 自定义背景池（🖼 单击选图、双击清除；localStorage 共享，PiP 同步）
 const BG_KEY = 'tsWidgetSkinBg', CBG_KEY = 'tsWidgetCustomBg';
 let bgTimer = null;

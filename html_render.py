@@ -37,7 +37,15 @@ async def _install_chromium() -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        # 下载总体限时 10 分钟：烂网络下不再无限挂起（超时杀进程并放弃自动下载，渲染图降级不可用）
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError("Chromium 下载超时（600s）")
         if proc.returncode != 0:
             raise RuntimeError(stderr.decode(errors="replace") if stderr else f"退出码 {proc.returncode}")
         logger.info("[token_stats] Chromium 下载完成")
